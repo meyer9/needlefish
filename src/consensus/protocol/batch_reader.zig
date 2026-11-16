@@ -119,7 +119,8 @@ pub const BatchReader = struct {
 const testing = std.testing;
 const Prng = @import("../../testing/prng.zig").Prng;
 
-fn compress_zlib(allocator: Allocator, input: []const u8) ![]u8 {
+/// Test helper (also used by the derive tests): zlib-compresses `input`.
+pub fn compress_zlib(allocator: Allocator, input: []const u8) ![]u8 {
     var output: std.Io.Writer.Allocating = try .initCapacity(allocator, 64);
     defer output.deinit();
     const window = try allocator.alloc(u8, flate.max_window_len);

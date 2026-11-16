@@ -107,8 +107,8 @@ fn BodyEntry(comptime T: type) type {
     };
 }
 
-/// Least recently used slot, preferring empty ones.
-fn victim(comptime Entry: type, entries: []Entry) *Entry {
+/// Least recently used slot, preferring empty ones. Shared with `l2_provider`.
+pub fn victim(comptime Entry: type, entries: []Entry) *Entry {
     assert(entries.len > 0);
     var best = &entries[0];
     for (entries) |*entry| {

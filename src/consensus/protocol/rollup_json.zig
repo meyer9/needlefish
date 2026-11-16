@@ -242,7 +242,7 @@ pub fn parse(text: []const u8) Error!RollupConfig {
 
 // ------------------------------------------------------------------------ writing
 
-fn write_block_id(writer: *json.Writer, id: BlockId) json.Writer.WriteError!void {
+pub fn write_block_id(writer: *json.Writer, id: BlockId) json.Writer.WriteError!void {
     try writer.begin_object();
     try writer.key("hash");
     try writer.data(&id.hash.bytes);

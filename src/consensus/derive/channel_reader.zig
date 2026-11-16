@@ -224,19 +224,6 @@ pub fn Upstream(comptime Channels: type, comptime Prev: type) type {
 const testing = std.testing;
 const Prng = @import("../../testing/prng.zig").Prng;
 const rlp = @import("../../common/rlp/root.zig");
-const flate = std.compress.flate;
-
-fn compress_zlib(allocator: Allocator, input: []const u8) ![]u8 {
-    var output: std.Io.Writer.Allocating = try .initCapacity(allocator, 64);
-    defer output.deinit();
-    const window = try allocator.alloc(u8, flate.max_window_len);
-    defer allocator.free(window);
-    var compress = try flate.Compress.init(&output.writer, window, .zlib, .default);
-    try compress.writer.writeAll(input);
-    try compress.finish();
-    return output.toOwnedSlice();
-}
-
 /// Builds a decompressed batch stream: each entry is RLP-string-wrapped.
 const StreamBuilder = struct {
     bytes: std.ArrayList(u8) = .empty,
@@ -279,7 +266,7 @@ const StreamBuilder = struct {
     }
 
     fn compressed(builder: *const StreamBuilder) ![]u8 {
-        return compress_zlib(testing.allocator, builder.bytes.items);
+        return batch_reader.compress_zlib(testing.allocator, builder.bytes.items);
     }
 };
 

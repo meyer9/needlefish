@@ -22,7 +22,6 @@ const RollupConfig = @import("../protocol/rollup_config.zig").RollupConfig;
 
 const Call = rpc.Call;
 const HandlerError = rpc.HandlerError;
-const BlockId = block.BlockId;
 const BlockInfo = block.BlockInfo;
 const L2BlockInfo = block.L2BlockInfo;
 const Hash = block.Hash;
@@ -173,9 +172,9 @@ fn safe_head_at_l1_block(backend: *const Backend, call: *Call) HandlerError!void
     const writer = call.writer;
     try writer.begin_object();
     try writer.key("l1Block");
-    try write_block_id(writer, entry.l1_block);
+    try rollup_json.write_block_id(writer, entry.l1_block);
     try writer.key("safeHead");
-    try write_block_id(writer, entry.safe_head);
+    try rollup_json.write_block_id(writer, entry.safe_head);
     try writer.end_object();
 }
 
@@ -199,15 +198,6 @@ fn version(backend: *const Backend, call: *Call) HandlerError!void {
     try call.writer.string(backend.version);
 }
 
-pub fn write_block_id(writer: *json.Writer, id: BlockId) json.Writer.WriteError!void {
-    try writer.begin_object();
-    try writer.key("hash");
-    try writer.data(&id.hash.bytes);
-    try writer.key("number");
-    try writer.integer(id.number);
-    try writer.end_object();
-}
-
 fn write_block_info_fields(writer: *json.Writer, info: BlockInfo) json.Writer.WriteError!void {
     try writer.key("hash");
     try writer.data(&info.hash.bytes);
@@ -229,7 +219,7 @@ pub fn write_l2_block_info(writer: *json.Writer, info: L2BlockInfo) json.Writer.
     try writer.begin_object();
     try write_block_info_fields(writer, info.block_info);
     try writer.key("l1origin");
-    try write_block_id(writer, info.l1_origin);
+    try rollup_json.write_block_id(writer, info.l1_origin);
     try writer.key("sequenceNumber");
     try writer.integer(info.sequence_number);
     try writer.end_object();

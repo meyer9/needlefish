@@ -37,7 +37,6 @@ const Pipeline = pipeline_module.Pipeline;
 const AttributesWithParent = pipeline_module.AttributesWithParent;
 const StepResult = pipeline_module.StepResult;
 const Error = errors.Error;
-const flate = std.compress.flate;
 
 const inbox = Address.init(@splat(0x11));
 const batcher = Address.init(@splat(0x22));
@@ -79,15 +78,6 @@ fn single(number: u64, epoch: BlockInfo, transactions: []const []const u8) Singl
     };
 }
 
-fn compress_zlib(arena: Allocator, input: []const u8) ![]u8 {
-    var output: std.Io.Writer.Allocating = try .initCapacity(arena, 64);
-    const window = try arena.alloc(u8, flate.max_window_len);
-    var compress = try flate.Compress.init(&output.writer, window, .zlib, .default);
-    try compress.writer.writeAll(input);
-    try compress.finish();
-    return output.toOwnedSlice();
-}
-
 /// A channel's decompressed batch stream: RLP-string-wrapped typed batches.
 const ChannelBuilder = struct {
     arena: Allocator,
@@ -126,6 +116,7 @@ const ChannelBuilder = struct {
     /// (`derivation version 0 ++ frame`).
     fn payloads(builder: *ChannelBuilder, id: u8, parts: u16) ![]const []const u8 {
         assert(parts > 0);
+        const compress_zlib = protocol.batch_reader.compress_zlib;
         const compressed = try compress_zlib(builder.arena, builder.bytes.items);
         assert(compressed.len >= parts);
         const list = try builder.arena.alloc([]const u8, parts);

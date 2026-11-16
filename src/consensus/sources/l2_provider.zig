@@ -31,6 +31,7 @@ const errors = @import("../derive/errors.zig");
 const l2_block = @import("l2_block.zig");
 const l2_block_full = @import("l2_block_full.zig");
 const header_json = @import("header_json.zig");
+const victim = @import("l1_provider.zig").victim;
 const SafeBlock = protocol.span_batch.SafeBlock;
 
 const B256 = primitives.B256;
@@ -110,18 +111,6 @@ const KeyEntry = struct {
     hash: B256 = .zero,
     fetched_ns: u64 = 0,
 };
-
-/// Least recently used slot, preferring empty ones.
-fn victim(comptime Entry: type, entries: []Entry) *Entry {
-    assert(entries.len > 0);
-    var best = &entries[0];
-    for (entries) |*entry| {
-        if (entry.used == 0) return entry;
-        if (entry.used < best.used) best = entry;
-    }
-    assert(best.used != 0);
-    return best;
-}
 
 pub fn L2Provider(comptime IO: type) type {
     return struct {

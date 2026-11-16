@@ -13,11 +13,6 @@ const Frame = frame_module.Frame;
 const ChannelId = frame_module.ChannelId;
 const BlockInfo = @import("block.zig").BlockInfo;
 
-/// Maximum size of a decompressed channel's RLP stream (pre-Fjord limit).
-pub const rlp_bytes_max_bedrock: u64 = 10_000_000;
-/// Maximum size of a decompressed channel's RLP stream from Fjord on.
-pub const rlp_bytes_max_fjord: u64 = 100_000_000;
-
 pub const AddFrameError = error{
     FrameIdMismatch,
     ChannelClosed,
