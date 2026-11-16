@@ -8,7 +8,7 @@
 
 const std = @import("std");
 const assert = std.debug.assert;
-const Keccak256 = std.crypto.hash.sha3.Keccak256;
+const keccak = @import("../../common/crypto/keccak.zig");
 
 const rlp = @import("rlp.zig");
 const nibbles = @import("nibbles.zig");
@@ -32,9 +32,7 @@ pub fn hex_to_hash(comptime hex: *const [64]u8) Hash {
 }
 
 pub fn keccak256(bytes: []const u8) Hash {
-    var result: Hash = undefined;
-    Keccak256.hash(bytes, &result, .{});
-    return result;
+    return keccak.keccak256(bytes);
 }
 
 /// A child reference: raw RLP below 32 bytes, else `0xa0 ++ keccak256(rlp)`.
@@ -83,12 +81,12 @@ pub const RlpNode = struct {
 pub const RefSink = struct {
     total: u64,
     written: u64 = 0,
-    hasher: Keccak256,
+    hasher: keccak.Hasher,
     small: [31]u8 = undefined,
 
     pub fn init(total: u64) RefSink {
         assert(total > 0);
-        return .{ .total = total, .hasher = Keccak256.init(.{}) };
+        return .{ .total = total, .hasher = keccak.Hasher.init() };
     }
 
     pub fn write(self: *RefSink, bytes: []const u8) void {
@@ -104,9 +102,7 @@ pub const RefSink = struct {
     pub fn finish(self: *RefSink) RlpNode {
         assert(self.written == self.total);
         if (self.total < 32) return RlpNode.from_rlp(self.small[0..@intCast(self.total)]);
-        var hash: Hash = undefined;
-        self.hasher.final(&hash);
-        return RlpNode.from_hash(hash);
+        return RlpNode.from_hash(self.hasher.final());
     }
 };
 

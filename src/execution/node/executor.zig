@@ -15,6 +15,7 @@ const assert = std.debug.assert;
 const evm = @import("../evm/root.zig");
 const primitives = @import("../../common/primitives/root.zig");
 const rlp = @import("../../common/rlp/root.zig");
+const keccak = @import("../../common/crypto/keccak.zig");
 const consensus = @import("../../common/consensus/root.zig");
 const ordered = @import("../trie/ordered.zig");
 const chainspec = @import("../chainspec/root.zig");
@@ -991,7 +992,7 @@ pub const Executor = struct {
             .tx_type = envelope.tx_type(),
             .status = executed.status == .success,
             .cumulative_gas_used = 0,
-            .logs_bloom = logs.bloom(),
+            .logs_bloom = logs_bloom(executed.logs),
             .logs = logs,
         };
         if (envelope == .eip8130) receipt.committed_phases = executed.committed_phases;
@@ -1278,6 +1279,74 @@ fn finalize(state: *evm.State, fork: evm.Fork) void {
     switch (fork) {
         inline else => |comptime_fork| state.finalize_transaction(comptime_fork),
     }
+}
+
+/// The bloom of `logs`, the same as `consensus.Logs.bloom` of their encoding, with addresses
+/// and topics hashed `keccak.batch_width` at a time (in two queues: `keccak256_batch` takes
+/// inputs of one length).
+fn logs_bloom(logs: []const evm.state.Log) primitives.Bloom {
+    var bloom = primitives.Bloom.zero;
+    var addresses: BloomBatch = .{};
+    var topics: BloomBatch = .{};
+    for (logs) |*log| {
+        addresses.add(&bloom, &log.address);
+        for (log.topic_slice()) |*topic| topics.add(&bloom, topic);
+    }
+    addresses.flush(&bloom);
+    topics.flush(&bloom);
+    return bloom;
+}
+
+const BloomBatch = struct {
+    inputs: [keccak.batch_width][]const u8 = undefined,
+    len: u32 = 0,
+
+    fn add(batch: *BloomBatch, bloom: *primitives.Bloom, input: []const u8) void {
+        assert(batch.len < keccak.batch_width);
+        assert(batch.len == 0 or batch.inputs[0].len == input.len);
+        batch.inputs[batch.len] = input;
+        batch.len += 1;
+        if (batch.len < keccak.batch_width) return;
+        var digests: [keccak.batch_width]keccak.Digest = undefined;
+        keccak.keccak256_batch(&batch.inputs, &digests);
+        for (digests) |digest| bloom.accrue_hash(.{ .bytes = digest });
+        batch.len = 0;
+    }
+
+    /// Hashes the inputs short of a full batch one at a time.
+    fn flush(batch: *BloomBatch, bloom: *primitives.Bloom) void {
+        assert(batch.len < keccak.batch_width);
+        for (batch.inputs[0..batch.len]) |input| bloom.accrue(input);
+        batch.len = 0;
+    }
+};
+
+test "logs bloom: batched hashing matches the encoded logs' bloom" {
+    // 15 topics and 7 addresses: a full batch and a tail in the topic queue at a width of 4
+    // or 8, and a tail of addresses.
+    var logs: [7]evm.state.Log = undefined;
+    for (&logs, 0..) |*log, index| {
+        log.* = .{
+            .address = @splat(@intCast(index + 1)),
+            .topics = undefined,
+            .topic_count = @intCast((index * 3 + 1) % 5),
+            .data = "",
+        };
+        for (&log.topics, 0..) |*topic, slot| topic.* = @splat(@intCast(index * 4 + slot + 9));
+    }
+    var buffer: [4096]u8 = undefined;
+    var encoder = rlp.Encoder.init(&buffer);
+    for (&logs) |*log| {
+        encoder.list_header(log_payload_length(log));
+        encoder.bytes(&log.address);
+        encoder.list_header(@as(usize, log.topic_count) * 33);
+        for (log.topic_slice()) |*topic| encoder.bytes(topic);
+        encoder.bytes(log.data);
+    }
+    const encoded = try consensus.Logs.from_payload(encoder.written());
+    try std.testing.expectEqual(@as(u32, logs.len), encoded.count);
+    try std.testing.expect(!encoded.bloom().eql(primitives.Bloom.zero));
+    try std.testing.expect(logs_bloom(&logs).eql(encoded.bloom()));
 }
 
 fn bloom_or(into: *primitives.Bloom, from: *const primitives.Bloom) void {

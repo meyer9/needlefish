@@ -452,6 +452,21 @@ Owns `src/execution/evm`. Reference: revm, op-revm, base/base `crates/execution/
   into (it evaluates as unauthorized, unreachable through the ABI).
 
 ## Log
+- 2026-11-16: the block's work around the interpreter. A call-graph profile of the timed
+  window put `Flat.commit` (the bench commit; `evm_backend.commit_evm` in the node is the
+  same loop) at 6.2% and the receipts root at 4.8%: 74% of the commit was the std hash map
+  iterator scanning the metadata of the account and slot tables, sized for 64M gas (65,536
+  entries each) while a block touches a few hundred. `State` now keeps its cached accounts
+  and slots in insertion order (`touched_accounts`, `touched_slots`; the table counts are
+  the list lengths, so existing clears stay correct) and every commit walks those. The trie
+  hashed nodes with std's Keccak; it now uses `common.crypto.keccak` like the rest of the
+  repo. Receipt blooms hash addresses and topics `keccak256_batch` at a time from the evm
+  logs instead of re-decoding the encoded logs. Window per pass: commit 14.0 -> 2.9 ms
+  (revm-node 2.7), receipts root 7.1 -> 3.3 ms (revm-node 6.5), execution 1.03-1.06x,
+  execution + roots 1.16x (CI 1.13-1.21). The front end: hot handlers are 60-90 bytes and
+  80% of dispatches run in 11 KB of handlers; snailtracer alone misses the instruction
+  cache on 14% of fetches and revm 43 on 20% under the same load (SMT siblings share L1i),
+  so shrinking handlers is not where the misses come from.
 - 2026-11-13: 21k-gas regression after fusion found and fixed. Retired instructions per
   small transaction fell with fusion (10,707 against 10,938) while cycles rose; the cycles
   sat in `std.mem.allEqual` over the 33 padding bytes, which `run` asserts once per frame

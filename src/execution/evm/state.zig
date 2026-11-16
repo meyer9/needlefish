@@ -316,11 +316,22 @@ pub const StaticWarm = struct {
     }
 };
 
+/// A cached slot and its key (`State.touched_slots`).
+pub const SlotEntry = struct { key: *const StorageKey, slot: *Slot };
+
 pub const State = struct {
     database: Database,
     limits: Limits,
     accounts: AddressMap(Account) = .empty,
     slots: StorageKeyMap(Slot) = .empty,
+    /// The cached accounts and slots in insertion order: entry `i` is the `i`th inserted,
+    /// and the tables' counts are the lists' lengths, so clearing a table empties its list.
+    /// The tables never grow (capacity is reserved at init) and never remove, so the
+    /// pointers stay valid until they are cleared. A block commit walks these instead of
+    /// iterating the tables, whose capacity follows the gas limit (65,536 entries each at
+    /// the production basis), not what the block touched.
+    account_list: []*Account,
+    slot_list: []SlotEntry,
     transient: StorageKeyMap(u256) = .empty,
     journal: []Entry,
     journal_len: u32 = 0,
@@ -344,6 +355,8 @@ pub const State = struct {
             .logs = try allocator.alloc(Log, limits.logs_max),
             .log_data = try allocator.alloc(u8, limits.log_data_bytes_max),
             .code_store = try allocator.alloc(u8, limits.code_bytes_max),
+            .account_list = try allocator.alloc(*Account, limits.accounts_max),
+            .slot_list = try allocator.alloc(SlotEntry, limits.slots_max),
         };
         errdefer state.deinit(allocator);
         try state.accounts.ensureTotalCapacity(allocator, limits.accounts_max);
@@ -360,6 +373,8 @@ pub const State = struct {
         allocator.free(state.logs);
         allocator.free(state.log_data);
         allocator.free(state.code_store);
+        allocator.free(state.account_list);
+        allocator.free(state.slot_list);
         state.* = undefined;
     }
 
@@ -485,13 +500,28 @@ pub const State = struct {
 
     // ---------------------------------------------------------------- accounts
 
+    /// Every cached account, in the order it was first loaded.
+    pub fn touched_accounts(state: *const State) []const *Account {
+        assert(state.accounts.count() <= state.account_list.len);
+        return state.account_list[0..state.accounts.count()];
+    }
+
+    /// Every cached slot, in the order it was first read.
+    pub fn touched_slots(state: *const State) []const SlotEntry {
+        assert(state.slots.count() <= state.slot_list.len);
+        return state.slot_list[0..state.slots.count()];
+    }
+
     /// The cached account, loading it from the database on first use. Does not warm.
     pub fn load(state: *State, address: Address) Error!*Account {
         if (state.accounts.getPtr(address)) |account| return account;
         if (state.accounts.count() >= state.limits.accounts_max) return error.StateFull;
         const info = try state.database.basic(address);
+        const index = state.accounts.count();
         const entry = state.accounts.getOrPutAssumeCapacity(address);
         assert(!entry.found_existing);
+        assert(state.accounts.count() == index + 1);
+        state.account_list[index] = entry.value_ptr;
         entry.value_ptr.* = .{
             .address = address,
             .info = info orelse .{},
@@ -678,7 +708,11 @@ pub const State = struct {
             try state.database.storage(account.address, slot)
         else
             0;
+        const index = state.slots.count();
         const entry = state.slots.getOrPutAssumeCapacity(key);
+        assert(!entry.found_existing);
+        assert(state.slots.count() == index + 1);
+        state.slot_list[index] = .{ .key = entry.key_ptr, .slot = entry.value_ptr };
         entry.value_ptr.* = .{
             .present = value,
             .original = value,

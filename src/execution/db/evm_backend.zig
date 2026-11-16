@@ -61,8 +61,7 @@ fn block_hash(context: *anyopaque, number: u64) evm.state.Error!evm.B256 {
 /// Copies the evm block state's changes into `overlay`. Clears nothing: the caller resets
 /// the evm state after `Overlay.commit`.
 pub fn commit_evm(evm_state: *const evm.State, overlay: *Overlay) overlay_module.Error!void {
-    var accounts = evm_state.accounts.valueIterator();
-    while (accounts.next()) |account| {
+    for (evm_state.touched_accounts()) |account| {
         if (!account.dirty) continue;
         if (!account.in_database) {
             try overlay.set_account(account.address, null);
@@ -82,14 +81,12 @@ pub fn commit_evm(evm_state: *const evm.State, overlay: *Overlay) overlay_module
         });
         if (account.storage_cleared) try overlay.wipe_storage(account.address);
     }
-    var slots = evm_state.slots.iterator();
-    while (slots.next()) |entry| {
-        if (!entry.value_ptr.dirty) continue;
-        const account = evm_state.accounts.getPtr(entry.key_ptr.address) orelse continue;
+    for (evm_state.touched_slots()) |entry| {
+        if (!entry.slot.dirty) continue;
+        const account = evm_state.accounts.getPtr(entry.key.address) orelse continue;
         if (!account.in_database) continue;
-        if (entry.value_ptr.epoch != account.storage_epoch) continue;
-        const key = entry.key_ptr;
-        try overlay.set_storage(key.address, key.slot, entry.value_ptr.present);
+        if (entry.slot.epoch != account.storage_epoch) continue;
+        try overlay.set_storage(entry.key.address, entry.key.slot, entry.slot.present);
     }
 }
 

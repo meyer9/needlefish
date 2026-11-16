@@ -1217,8 +1217,7 @@ pub const SparseState = struct {
         evm_state: *const evm.State,
         changeset: *Changeset,
     ) (Error || changeset_module.Error)!void {
-        var accounts = evm_state.accounts.valueIterator();
-        while (accounts.next()) |account| {
+        for (evm_state.touched_accounts()) |account| {
             if (!account.dirty) continue;
             const old = try self.basic(account.address);
             const new: ?AccountInfo = if (account.in_database) .{
@@ -1253,20 +1252,19 @@ pub const SparseState = struct {
         evm_state: *const evm.State,
         changeset: *Changeset,
     ) (Error || changeset_module.Error)!void {
-        var slots = evm_state.slots.iterator();
-        while (slots.next()) |entry| {
-            if (!entry.value_ptr.dirty) continue;
-            const key = entry.key_ptr;
+        for (evm_state.touched_slots()) |entry| {
+            if (!entry.slot.dirty) continue;
+            const key = entry.key;
             const account = evm_state.accounts.getPtr(key.address) orelse continue;
             if (!account.in_database) continue;
-            if (entry.value_ptr.epoch != account.storage_epoch) continue;
+            if (entry.slot.epoch != account.storage_epoch) continue;
             const old = try self.storage(key.address, key.slot);
-            if (old == entry.value_ptr.present) continue;
+            if (old == entry.slot.present) continue;
             try changeset.add_storage(.{
                 .address = key.address,
                 .slot = key.slot,
                 .old = old,
-                .new = entry.value_ptr.present,
+                .new = entry.slot.present,
             });
         }
     }

@@ -62,8 +62,7 @@ pub const opaque_branch: [2 + 2 * 33 + 15]u8 = blk: {
 /// it), and empties the evm cache so the next block reads the new state.
 pub fn commit_block(sparse: *SparseState, changeset: *db.Changeset, state: *evm.State) !void {
     try sparse.apply_evm(state, changeset);
-    var accounts = state.accounts.valueIterator();
-    while (accounts.next()) |account| {
+    for (state.touched_accounts()) |account| {
         if (!account.dirty or !account.in_database) continue;
         const code = account.info.code orelse continue;
         if (code.len == 0) continue;

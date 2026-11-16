@@ -187,8 +187,7 @@ const Flat = struct {
     fn fold(flat: *Flat, state: *const evm.State) !void {
         const database = flat.database;
         const gpa = database.allocator;
-        var accounts = state.accounts.valueIterator();
-        while (accounts.next()) |account| {
+        for (state.touched_accounts()) |account| {
             if (!account.dirty) continue;
             if (!account.in_database or account.storage_cleared) {
                 wipe_storage(database, account.address);
@@ -214,14 +213,13 @@ const Flat = struct {
     }
 
     fn fold_slots(database: *evm.MemoryDatabase, state: *const evm.State) !void {
-        var slots = state.slots.iterator();
-        while (slots.next()) |entry| {
-            if (!entry.value_ptr.dirty) continue;
-            const key = entry.key_ptr.*;
+        for (state.touched_slots()) |entry| {
+            if (!entry.slot.dirty) continue;
+            const key = entry.key.*;
             const account = state.accounts.getPtr(key.address) orelse continue;
             if (!account.in_database) continue;
-            if (entry.value_ptr.epoch != account.storage_epoch) continue;
-            const value = entry.value_ptr.present;
+            if (entry.slot.epoch != account.storage_epoch) continue;
+            const value = entry.slot.present;
             if (value == 0) {
                 _ = database.storage.remove(key);
                 continue;
