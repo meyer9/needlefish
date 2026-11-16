@@ -436,8 +436,9 @@ pub const Follower = struct {
         self.deleted_slots_len = 0;
         self.deletions_dropped = 0;
         const state = self.executor.state;
-        var accounts = state.accounts.valueIterator();
-        while (accounts.next()) |account| {
+        // The cached entries in insertion order: a block touches a few hundred of the tables'
+        // 65,536 slots, and a table iterator scans them all.
+        for (state.touched_accounts()) |account| {
             if (!account.dirty or account.in_database) continue;
             if (self.deleted_accounts_len == self.deleted_accounts.len) {
                 self.deletions_dropped += 1;
@@ -446,19 +447,18 @@ pub const Follower = struct {
             self.deleted_accounts[self.deleted_accounts_len] = account.address;
             self.deleted_accounts_len += 1;
         }
-        var slots = state.slots.iterator();
-        while (slots.next()) |entry| {
-            const slot = entry.value_ptr;
+        for (state.touched_slots()) |entry| {
+            const slot = entry.slot;
             if (!slot.dirty or slot.present != 0) continue;
-            const account = state.accounts.getPtr(entry.key_ptr.address) orelse continue;
+            const account = state.accounts.getPtr(entry.key.address) orelse continue;
             if (!account.in_database or slot.epoch != account.storage_epoch) continue;
             if (self.deleted_slots_len == self.deleted_slots.len) {
                 self.deletions_dropped += 1;
                 continue;
             }
             self.deleted_slots[self.deleted_slots_len] = .{
-                .address = entry.key_ptr.address,
-                .slot = entry.key_ptr.slot,
+                .address = entry.key.address,
+                .slot = entry.key.slot,
             };
             self.deleted_slots_len += 1;
         }
