@@ -14,10 +14,10 @@ is older and compares against the proof executor only.
 
 ## Against the Base node and revm
 
-Measured November 13, 2026 on one core (pinned, SMT sibling not reserved) of an AMD Ryzen AI
-MAX+ 395 (Zen 5, 32 threads), at nice 19 while a live mainnet node ran on other cores.
-needlefish at `main` after the instruction fusion change, `-Dcpu=native`; base/base at
-`a8b34b69` with `maxperf` and `-C target-cpu=native`.
+Mainnet blocks measured November 16, 2026, EVM fixtures November 13, on one core (pinned,
+SMT sibling not reserved) of an AMD Ryzen AI MAX+ 395 (Zen 5, 32 threads), at nice 19 while
+a live mainnet node ran on other cores. needlefish `-Dcpu=native`; base/base at `a8b34b69`
+with `maxperf` and `-C target-cpu=native`.
 
 ### Mainnet blocks against the node's execution path
 
@@ -25,23 +25,35 @@ The 100-block window (Base mainnet 53775088 to 53775187) over a flat in-memory p
 senders recovered before the timed region, single-threaded
 ([EVM only](#evm-only) in the method). 10 rounds; each round runs every configuration once
 as a fresh process, in a rotated order, with 3 more passes in the same process (*repeat*).
-Every block of every pass reproduced its gas used and receipts root.
+Every block of every pass reproduced its gas used and receipts root. Other work kept the
+machine busy (load average 40-70 on 32 threads), so the intervals are wider than on
+November 13, when the previous build measured 108.1 ms against the node path's 144.5 ms.
 
-| configuration | ms per 100 blocks, first pass (95% CI) | repeat passes (95% CI) | Mgas/s |
-| --- | ---: | ---: | ---: |
-| needlefish `ReleaseSafe` | 108.1 (105.7-110.0) | 107.6 (106.6-108.1) | 2514 |
-| needlefish `ReleaseFast` | 109.8 (107.5-116.1) | 108.8 (107.6-110.5) | 2499 |
-| needlefish `ReleaseSafe` before instruction fusion | 114.5 (112.0-116.7) | 113.5 (111.8-114.7) | 2375 |
-| base/base node path (revm) | 144.5 (139.8-153.6) | 138.0 (135.8-138.8) | 1881 |
-| base/base proof executor, EVM only (revm) | 138.8 (133.6-139.4) | 132.5 (131.4-134.9) | 1959 |
+| configuration | execution, first pass (95% CI) | repeat (95% CI) | + receipts root + commit, first pass | Mgas/s |
+| --- | ---: | ---: | ---: | ---: |
+| needlefish `ReleaseSafe` | 116.2 (104.4-145.9) | 131.7 (111.4-151.7) | 121.0 (108.5-151.6) | 2340 |
+| needlefish `ReleaseFast` | 118.3 (110.3-142.3) | 115.4 (111.4-130.5) | 122.7 (114.9-147.4) | 2298 |
+| needlefish `ReleaseSafe` before the commit change (`ffa0b83`) | 119.2 (115.8-145.4) | 127.8 (115.0-142.9) | 134.1 (130.3-164.2) | 2280 |
+| base/base node path (revm) | 161.8 (148.5-179.9) | 154.9 (147.6-168.0) | 169.7 (155.2-188.7) | 1680 |
 
-| faster | slower | first pass (95% CI) | repeat (95% CI) |
-| --- | --- | ---: | ---: |
-| needlefish `ReleaseSafe` | base/base node path | 1.34x (1.29-1.43) | 1.28x (1.26-1.30) |
-| needlefish `ReleaseFast` | base/base node path | 1.32x (1.26-1.41) | 1.27x (1.24-1.29) |
-| needlefish `ReleaseSafe` before fusion | base/base node path | 1.26x (1.21-1.35) | 1.22x (1.19-1.24) |
-| needlefish `ReleaseSafe` | needlefish before fusion | 1.06x (1.03-1.09) | 1.05x (1.04-1.07) |
+Milliseconds per 100 blocks.
 
+| faster | slower | execution, first pass (95% CI) | repeat (95% CI) | + receipts root + commit, first pass |
+| --- | --- | ---: | ---: | ---: |
+| needlefish `ReleaseSafe` | base/base node path | 1.39x (1.12-1.67) | 1.18x (1.02-1.45) | 1.40x (1.12-1.67) |
+| needlefish `ReleaseFast` | base/base node path | 1.37x (1.12-1.59) | 1.35x (1.18-1.47) | 1.39x (1.12-1.61) |
+| needlefish before the commit change | base/base node path | 1.35x (1.05-1.54) | 1.20x (1.06-1.39) | 1.27x (0.97-1.43) |
+
+- **A tighter run of the same builds.** 8 rounds of the `ReleaseSafe` builds and the node path
+  the same evening: needlefish 1.33x the node path on execution (repeat 1.30x, CI 1.27-1.35)
+  and 1.34x with the receipts root and commit (repeat 1.31x, CI 1.27-1.37); the commit change
+  1.16x (CI 1.13-1.21) on execution + receipts root + commit.
+- **Per block, besides execution.** Receipts root 0.030 ms (node path 0.056 ms, before the
+  change 0.065 ms) and commit 0.020 ms (node path `merge_transitions` 0.022 ms, before the
+  change 0.097 ms). The commit walked the evm state's account and slot tables, sized for
+  64M gas, with the std iterator; it now walks the entries the block inserted. The trie
+  hashed with std's Keccak and now uses needlefish's own, and receipt blooms are hashed
+  several inputs at a time.
 - **The node path** (`nf-replay-bench --evm-only <prestate> --node`) is what `base-reth-node`
   runs for a new payload (reth `crates/engine/tree/src/tree/payload_validator.rs`): the
   node's `BaseEvmConfig` for Base mainnet, `ConfigureEvm::executor_for_block` over a `State`
@@ -53,7 +65,7 @@ Every block of every pass reproduced its gas used and receipts root.
   prewarming threads run. *Execution* is pre-block changes plus transactions on both sides;
   post-block changes and the commit (`merge_transitions`, needlefish `Backend.commit`) are
   timed separately.
-- **Before this run the comparison was unfair to revm in two ways**, both fixed: the harness
+- **Before November 13 the comparison was unfair to revm in two ways**, both fixed: the harness
   built revm with the portable Keccak instead of the node's `asm-keccak` and global Keccak
   cache (1.15x slower on this window), and it analyzed bytecode while filling `CacheDB`,
   outside the timed region, while needlefish analyzed inside it. needlefish now analyzes
@@ -114,6 +126,11 @@ transaction over processes; the speedup is the ratio of medians.
   32-byte compare per buffer replaced both loops; on the 12 smallest fixtures (12 rounds)
   needlefish is now 1.06x its pre-fusion build, where fusion alone measured 0.96x. The
   table above predates that fix.
+- **Rerun November 16** with the current build, under the machine load described for the
+  mainnet window: `ReleaseSafe` 1.78x revm and 1.86x evm2, `ReleaseFast` 1.83x revm, by
+  geometric mean. Both builds measure lower against revm under that load: on the 12
+  smallest fixtures, interleaved in one run, the current build is 1.08x the November 13
+  build and 1.80x revm, and the November 13 build is 1.67x revm.
 - The precompile fixtures, measured separately: ecrecover 25 µs on both sides (revm uses C
   libsecp256k1), bn254 pairing 610 µs against 800 µs, modexp from 0.8x to 2x.
 
