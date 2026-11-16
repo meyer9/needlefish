@@ -23,6 +23,7 @@ const roxy = @import("roxy.zig");
 const basectl = @import("basectl.zig");
 const audit = @import("audit.zig");
 const replay = @import("replay.zig");
+const diff_adapter = @import("diff_adapter.zig");
 const follow = @import("follow.zig");
 const snapshot_import = @import("snapshot_import.zig");
 const import_run = @import("import_run.zig");
@@ -65,6 +66,7 @@ const usage =
     \\  basectl    operator commands: sync-status, block, txpool, doctor, ...
     \\  audit      transaction-event audit archiver: Vector ingest, JSON-RPC queries
     \\  replay     replay real Base blocks offline and check every header field
+    \\  diff-adapter  differential execution adapter (JSON lines on stdin/stdout)
     \\  follow     follow a live Base chain over RPC, re-executing and checking every block
     \\  snapshot-import  verify a reth snapshot database: state root against the block header
     \\  import-run  execute blocks N+1.. on an imported disk-mode database, checking headers
@@ -100,6 +102,7 @@ test {
     _ = basectl;
     _ = audit;
     _ = replay;
+    _ = diff_adapter;
     _ = follow;
     _ = snapshot_import;
     _ = import_run;
@@ -215,6 +218,9 @@ fn infra_main(init: std.process.Init, command: []const u8, args: []const []const
     }
     if (std.mem.eql(u8, command, "replay")) {
         return try replay.main(init, args);
+    }
+    if (std.mem.eql(u8, command, "diff-adapter")) {
+        return try diff_adapter.main(init, args);
     }
     if (std.mem.eql(u8, command, "follow")) {
         return try follow.main(init, args);
