@@ -309,7 +309,9 @@ test "diff adapter: build mode skips invalid transactions and reports the block"
     // A witness without one of its nodes cannot be executed.
     const missing = try answer(adapter, arena, try lines.request(&genesis, "build", 0));
     try testing.expect(!missing.ok);
-    try testing.expect(std.mem.indexOf(u8, missing.@"error".?, "WitnessIncomplete") != null);
+    const text = missing.@"error".?;
+    const prefix = "WitnessIncomplete: witness lacks trie node 0x";
+    try testing.expect(std.mem.startsWith(u8, text, prefix));
     // Requests are independent: the full witness answers the same again.
     const again = try answer(adapter, arena, try lines.request(&genesis, "build", null));
     const again_hash = again.header.?.object.get("hash").?.string;

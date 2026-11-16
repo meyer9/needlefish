@@ -65,6 +65,56 @@ pub const Outcome = struct {
     post: []const PostAccount = &.{},
 };
 
+/// What the witness lacked in the last run, for the `WitnessIncomplete` error text.
+pub const Missing = struct {
+    pub const Phase = enum { pre_block, transaction, post_block };
+    pub const Item = union(enum) {
+        none,
+        node: Hash,
+        code: Hash,
+        block_hash: u64,
+    };
+    pub const Key = union(enum) {
+        none,
+        account: Address,
+        slot: struct { address: Address, slot: u256 },
+    };
+
+    /// The first trie node, code or ancestor the witness lacked.
+    item: Item = .none,
+    /// The first account or slot read that failed for it (execution), if any.
+    key: Key = .none,
+    phase: Phase = .pre_block,
+    /// The transaction being applied (`phase == .transaction`).
+    transaction: u32 = 0,
+    /// The post-state commit and root computation failed (not an execution read).
+    committing: bool = false,
+
+    /// One line naming what is missing and where it was needed.
+    pub fn describe(missing: *const Missing, out: *std.Io.Writer) std.Io.Writer.Error!void {
+        switch (missing.item) {
+            .none => try out.writeAll("witness incomplete"),
+            .node => |hash| try out.print("witness lacks trie node 0x{x}", .{&hash}),
+            .code => |hash| try out.print("witness lacks code 0x{x}", .{&hash}),
+            .block_hash => |number| try out.print("ancestors lack block {d}", .{number}),
+        }
+        switch (missing.key) {
+            .none => {},
+            .account => |address| try out.print(", reading account 0x{x}", .{&address}),
+            .slot => |key| try out.print(", reading slot 0x{x:0>64} of 0x{x}", .{
+                key.slot,
+                &key.address,
+            }),
+        }
+        if (missing.committing) return out.writeAll(", computing the post-state root");
+        switch (missing.phase) {
+            .pre_block => try out.writeAll(", before the first transaction"),
+            .transaction => try out.print(", executing transaction {d}", .{missing.transaction}),
+            .post_block => try out.writeAll(", after the last transaction"),
+        }
+    }
+};
+
 /// Adapter-level failures: the response is `ok: false` with this error.
 pub const Error = error{
     /// The witness lacks a trie node, code or ancestor the block needs.
@@ -91,6 +141,8 @@ pub const Adapter = struct {
     changeset: db.Changeset,
     sparse: SparseState,
     sparse_ready: bool = false,
+    /// What the witness lacked in the last run.
+    missing: Missing = .{},
     schedule: ?base_time.Schedule,
 
     pub const changeset_config: db.changeset.Config = .{
@@ -114,7 +166,7 @@ pub const Adapter = struct {
         errdefer self.changeset.deinit(allocator);
         const backend: node_executor.Backend = .{
             .context = self,
-            .database = self.sparse.database(),
+            .database = self.database(),
             .commit = backend_commit,
             .root = backend_root,
         };
@@ -133,9 +185,10 @@ pub const Adapter = struct {
 
     /// Runs `case`. Results borrow `arena` and the executor's scratch until the next run.
     pub fn run(self: *Adapter, arena: std.mem.Allocator, case: *const Case) Error!Outcome {
+        self.missing = .{};
         try self.load(case);
         self.executor.abort_block();
-        self.executor.state.reset(self.sparse.database());
+        self.executor.state.reset(self.database());
         var outcome: Outcome = .{ .computed_base_fee = next_base_fee(self.spec, case) };
         self.execute(arena, case, &outcome) catch |err| return self.failure(err);
         if (self.sparse.incomplete) return error.WitnessIncomplete;
@@ -183,6 +236,12 @@ pub const Adapter = struct {
             self.sparse.add_header(case.ancestors[index]) catch return error.InvalidAncestors;
         }
         self.sparse.verify_headers() catch return error.InvalidAncestors;
+        self.sparse.set_fallback(.{
+            .context = self,
+            .node = missing_node,
+            .code = missing_code,
+            .block_hash = missing_block_hash,
+        });
         assert(self.sparse.headers_len == case.ancestors.len);
     }
 
@@ -200,7 +259,9 @@ pub const Adapter = struct {
         };
         var included: std.ArrayList([]const u8) = .empty;
         var rejected: std.ArrayList(Rejected) = .empty;
+        self.missing.phase = .transaction;
         for (case.transactions, 0..) |raw, index| {
+            self.missing.transaction = @intCast(index);
             executor.apply(&building, raw) catch |err| {
                 if (!is_rejection(err)) {
                     executor.abort_block();
@@ -213,6 +274,7 @@ pub const Adapter = struct {
             try included.append(arena, raw);
         }
         assert(building.count == included.items.len);
+        self.missing.phase = .post_block;
         const withdrawals = withdrawals_of(self.spec, &case.header);
         const executed = executor.finish_block(&building, withdrawals) catch |err| {
             if (is_witness_error(self, err)) return err;
@@ -324,13 +386,86 @@ pub const Adapter = struct {
         return out.items;
     }
 
+    const logging_vtable: evm.state.Database.VTable = .{
+        .basic = database_basic,
+        .code_by_hash = database_code_by_hash,
+        .storage = database_storage,
+        .block_hash = database_block_hash,
+    };
+
+    /// The sparse state's evm `Database`, logging the key of every read the witness cannot
+    /// serve.
+    fn database(self: *Adapter) evm.state.Database {
+        return .{ .context = self, .vtable = &logging_vtable };
+    }
+
+    fn inner(context: *anyopaque) evm.state.Database {
+        const self: *Adapter = @ptrCast(@alignCast(context));
+        return self.sparse.database();
+    }
+
+    fn database_basic(
+        context: *anyopaque,
+        address: evm.Address,
+    ) evm.state.Error!?evm.state.AccountInfo {
+        return inner(context).basic(address) catch |err| {
+            const self: *Adapter = @ptrCast(@alignCast(context));
+            if (self.missing.key == .none) self.missing.key = .{ .account = address };
+            return err;
+        };
+    }
+
+    fn database_code_by_hash(context: *anyopaque, hash: evm.B256) evm.state.Error![]const u8 {
+        return inner(context).code_by_hash(hash);
+    }
+
+    fn database_storage(
+        context: *anyopaque,
+        address: evm.Address,
+        slot: u256,
+    ) evm.state.Error!u256 {
+        return inner(context).storage(address, slot) catch |err| {
+            const self: *Adapter = @ptrCast(@alignCast(context));
+            const key: Missing.Key = .{ .slot = .{ .address = address, .slot = slot } };
+            if (self.missing.key == .none) self.missing.key = key;
+            return err;
+        };
+    }
+
+    fn database_block_hash(context: *anyopaque, number: u64) evm.state.Error!evm.B256 {
+        return inner(context).block_hash(number);
+    }
+
+    // The witness lacks something the block needs: the first such item names the
+    // request's `WitnessIncomplete` error.
+    fn missing_node(context: *anyopaque, hash: *const Hash) ?[]const u8 {
+        const self: *Adapter = @ptrCast(@alignCast(context));
+        if (self.missing.item == .none) self.missing.item = .{ .node = hash.* };
+        return null;
+    }
+
+    fn missing_code(context: *anyopaque, hash: *const Hash) ?[]const u8 {
+        const self: *Adapter = @ptrCast(@alignCast(context));
+        if (self.missing.item == .none) self.missing.item = .{ .code = hash.* };
+        return null;
+    }
+
+    fn missing_block_hash(context: *anyopaque, number: u64) ?Hash {
+        const self: *Adapter = @ptrCast(@alignCast(context));
+        if (self.missing.item == .none) self.missing.item = .{ .block_hash = number };
+        return null;
+    }
+
     fn backend_commit(
         context: *anyopaque,
         state: *evm.State,
     ) node_executor.BackendError!void {
         const self: *Adapter = @ptrCast(@alignCast(context));
         self.sparse.apply_evm(state, &self.changeset) catch |err| {
-            if (err == error.WitnessIncomplete) self.sparse.incomplete = true;
+            if (err == error.WitnessIncomplete) {
+                self.sparse.incomplete = true;
+                if (self.missing.key == .none) self.missing.committing = true;
+            }
             return error.StateUnavailable;
         };
         state.accounts.clearRetainingCapacity();

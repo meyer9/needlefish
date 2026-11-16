@@ -28,9 +28,23 @@ pub fn handle_line(
         return response.write_error(out, raw.id, error_text(arena, "invalid request", err));
     };
     const outcome = self.run(arena, &case) catch |err| {
-        return response.write_error(out, raw.id, error_text(arena, "cannot execute", err));
+        const text = if (err == error.WitnessIncomplete)
+            missing_text(arena, &self.missing)
+        else
+            error_text(arena, "cannot execute", err);
+        std.log.info("diff adapter: {s}: {s}", .{ raw.id orelse "(no id)", text });
+        return response.write_error(out, raw.id, text);
     };
     return response.write_outcome(out, raw.id, &outcome);
+}
+
+/// `WitnessIncomplete: witness lacks trie node 0x.., reading account 0x.., executing
+/// transaction 7`.
+fn missing_text(arena: std.mem.Allocator, missing: *const adapter.Missing) []const u8 {
+    var text: std.Io.Writer.Allocating = .init(arena);
+    text.writer.writeAll("WitnessIncomplete: ") catch return "WitnessIncomplete";
+    missing.describe(&text.writer) catch return "WitnessIncomplete";
+    return text.written();
 }
 
 fn error_text(arena: std.mem.Allocator, what: []const u8, err: anyerror) []const u8 {
