@@ -768,3 +768,25 @@ fn fuzz_prefetch(_: void, smith: *testing.Smith) anyerror!void {
 test "executor: fuzz prefetched recovery" {
     try testing.fuzz({}, fuzz_prefetch, .{});
 }
+
+test "executor: the ActivationRegistry admin falls back to the chain's Beryl admin" {
+    // base/base passes the chain's `activation_admin_address` to the EVM; before Cobalt's
+    // stored admin it is the registry's admin (an admin-gated `activate` depends on it).
+    const mainnet = &chainspec.ChainSpec.presets.base_mainnet;
+    var f: Fixture = undefined;
+    try f.init_with(mainnet);
+    defer f.deinit();
+    var block = block_env(1);
+    block.timestamp = mainnet.upgrades[@backingInt(chainspec.Upgrade.beryl)].?;
+    const native_activation = @import("../evm/native_activation.zig");
+    const result = try f.executor.simulate(&block, .{
+        .to = native_activation.address,
+        .data = &native_activation.selector_admin,
+    });
+    const executed = result.executed;
+    try testing.expect(executed.success);
+    var expected: [32]u8 = @splat(0);
+    expected[12..].* = mainnet.activation_admin.?;
+    try testing.expectEqualSlices(u8, &expected, executed.output);
+    try testing.expect(!std.mem.allEqual(u8, &mainnet.activation_admin.?, 0));
+}

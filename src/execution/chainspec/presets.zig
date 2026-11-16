@@ -1,9 +1,18 @@
 //! Built-in chain specs. Timestamps and parameters come from the public base/base
 //! `crates/common/chains/src/config.rs`.
 
+const std = @import("std");
 const root = @import("root.zig");
 const ChainSpec = root.ChainSpec;
 const BaseFeeParams = root.BaseFeeParams;
+
+/// A Beryl activation admin from base/base `crates/common/chains/src/config.rs`.
+fn admin(comptime text: *const [40]u8) [20]u8 {
+    var out: [20]u8 = undefined;
+    // Proof: comptime literal of valid hex digits.
+    _ = std.fmt.hexToBytes(&out, text) catch unreachable;
+    return out;
+}
 
 /// Base upgrades in `root.Upgrade` order.
 fn upgrades(values: [15]?u64) root.UpgradeSchedule {
@@ -33,6 +42,7 @@ pub const base_mainnet: ChainSpec = .{
     .base_fee_params = .{ .max_change_denominator = 50, .elasticity_multiplier = 6 },
     .base_fee_params_canyon = .{ .max_change_denominator = 250, .elasticity_multiplier = 6 },
     .gas_limit = 30_000_000,
+    .activation_admin = admin("cE3a3bEE7E72E2A24079f3c0Cb3b97740ED425A9"),
 };
 
 pub const base_sepolia: ChainSpec = .{
@@ -58,6 +68,7 @@ pub const base_sepolia: ChainSpec = .{
     .base_fee_params = .{ .max_change_denominator = 50, .elasticity_multiplier = 10 },
     .base_fee_params_canyon = .{ .max_change_denominator = 250, .elasticity_multiplier = 10 },
     .gas_limit = 25_000_000,
+    .activation_admin = admin("5F43072722f59964d886CBb507F6a85ca0759D42"),
 };
 
 /// Local devnet L2: every upgrade through Azul active at genesis.
@@ -68,6 +79,7 @@ pub const base_devnet: ChainSpec = .{
     .base_fee_params = .{ .max_change_denominator = 50, .elasticity_multiplier = 6 },
     .base_fee_params_canyon = .{ .max_change_denominator = 250, .elasticity_multiplier = 6 },
     .gas_limit = 30_000_000,
+    .activation_admin = admin("9965507D1a55bcC2695C58ba16FB37d819B0A4dc"),
 };
 
 /// `--dev-l1` chain: Shanghai, Cancun and Prague at genesis. Osaka stays off by default

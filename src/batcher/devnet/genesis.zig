@@ -200,6 +200,9 @@ pub fn write_l2_genesis(w: *Writer, config: *const Config) Writer.Error!void {
     try w.writeAll("    \"shanghaiTime\": 0,\n    \"cancunTime\": 0,\n    \"pragueTime\": 0,\n");
     for (l2_upgrade_keys) |key| try w.print("    \"{s}Time\": 0,\n", .{key});
     try write_base_upgrades(w, "    ");
+    // Beryl requires an ActivationRegistry admin (base/base devnet: the sequencer address).
+    try w.writeAll("    \"activationAdminAddress\": " ++
+        "\"0x9965507D1a55bcC2695C58ba16FB37d819B0A4dc\",\n");
     // Anchors the Denim timestamp schedule on the EL (base/base `blockTime`).
     try w.print("    \"blockTime\": {d},\n", .{config.l2_block_time_s});
     try w.print(

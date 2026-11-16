@@ -40,7 +40,7 @@ pub fn context(spec: *const chainspec.ChainSpec, timestamp: u64) ?evm.op.Context
         const upgrade = @field(Upgrade, name);
         if (spec.is_upgrade_active(upgrade, timestamp)) latest = evm_upgrade(upgrade);
     }
-    return .{ .upgrade = latest };
+    return .{ .upgrade = latest, .activation_admin = spec.activation_admin };
 }
 
 /// Irregular state changes before the first transaction: the Canyon create2 deployer
