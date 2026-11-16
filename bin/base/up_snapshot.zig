@@ -235,6 +235,8 @@ pub const Download = struct {
     /// time (a pause, a stall), so at most `rate_burst_ms` of unused budget is ever banked.
     received: std.atomic.Value(u64) = .init(0),
     started_ms: std.atomic.Value(i64) = .init(0),
+    /// Workers that returned (no chunk left, or the download halted).
+    workers_done: std.atomic.Value(u32) = .init(0),
 
     pub fn chunk_range(download: *const Download, index: u32) struct { start: u64, end: u64 } {
         assert(index < download.chunks);
@@ -297,6 +299,7 @@ pub const Download = struct {
 
     /// A worker: claims chunks in order until none is left or the download halts.
     pub fn worker(download: *Download) Io.Cancelable!void {
+        defer _ = download.workers_done.fetchAdd(1, .acq_rel);
         var state: Worker = .{ .download = download };
         state.client = .{ .allocator = download.gpa, .io = download.io };
         defer state.client.deinit();

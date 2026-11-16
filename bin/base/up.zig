@@ -4,7 +4,8 @@
 //!             [--l1 <url>] [--l1-beacon <url>] [--no-consensus]
 //!             [--rpc.port <n>] [--engine.port <n>] [--consensus.port <n>]
 //!             [--download.connections <n>] [--download.rate <MB/s>]
-//!             [--gossip [--gossip.port <n>]] [--reimport] [--dry-run] [--plain]
+//!             [--gossip [--gossip.port <n>]] [--download-only] [--reimport] [--dry-run]
+//!             [--plain]
 //!
 //! Every run checks the setup first, then does only what is missing, in order:
 //! 1. Snapshot (`up_snapshot.zig`): the chain's latest public snapshot, downloaded and
@@ -46,7 +47,8 @@ const usage =
     \\               [--l1 <url>] [--l1-beacon <url>] [--no-consensus]
     \\               [--rpc.port <n>] [--engine.port <n>] [--consensus.port <n>]
     \\               [--download.connections <n>] [--download.rate <MB/s>]
-    \\               [--gossip [--gossip.port <n>]] [--reimport] [--dry-run] [--plain]
+    \\               [--gossip [--gossip.port <n>]] [--download-only] [--reimport]
+    \\               [--dry-run] [--plain]
     \\
     \\Runs a Base node that follows the tip, from nothing: downloads and verifies the latest
     \\public snapshot, imports it, then runs the execution node (blocks over devp2p) and the
@@ -68,6 +70,8 @@ const usage =
     \\  --gossip     also join Base's consensus gossip and execute the sequencer-signed block
     \\               at the tip as it arrives (devp2p stays the fallback)
     \\  --gossip.port   gossip TCP port on all interfaces, UDP one above (default 9222)
+    \\  --download-only  fetch the snapshot archive and stop: no extraction, no import (they
+    \\               write several times as much to disk); run again without it to go on
     \\  --reimport    delete the datadir's database and import the latest snapshot again
     \\  --dry-run     check everything and print the plan; change nothing
     \\  --plain       no color and no redrawn lines (the default without a terminal)
@@ -93,6 +97,8 @@ const Flags = struct {
     /// MB/s; 0: no cap.
     rate_mb_per_s: u32 = 0,
     reimport: bool = false,
+    /// Fetch the archive's chunks only; a later run without it extracts and imports them.
+    download_only: bool = false,
     dry_run: bool = false,
     /// No color and no redraws (also without a TTY).
     plain: bool = false,
@@ -128,6 +134,10 @@ fn parse_flags(args: []const []const u8) !Flags {
             flags.plain = true;
             continue;
         }
+        if (std.mem.eql(u8, name, "--download-only")) {
+            flags.download_only = true;
+            continue;
+        }
         if (std.mem.eql(u8, name, "--gossip")) {
             flags.gossip = true;
             continue;
@@ -139,6 +149,9 @@ fn parse_flags(args: []const []const u8) !Flags {
     }
     if (flags.reimport and flags.db != null) {
         return fail_flag("--reimport replaces the datadir's own database, not a --db file", .{});
+    }
+    if (flags.download_only and flags.db != null) {
+        return fail_flag("--download-only fetches the datadir's snapshot; it takes no --db", .{});
     }
     if (flags.gossip_port != null and !flags.gossip) {
         return fail_flag("--gossip.port needs --gossip", .{});
@@ -659,6 +672,10 @@ fn run_stages(up: *Up) !u8 {
         up.view.ok("dry run", "nothing was changed", .{});
         return 0;
     }
+    if (up.flags.download_only) {
+        if (ready) up.view.ok("database", "ready; --download-only has nothing to fetch", .{});
+        return if (ready) 0 else fetch_snapshot(up, &snapshot.?);
+    }
     if (!ready) {
         const stage = try fetch_snapshot(up, &snapshot.?);
         if (stage != 0 or stop_requested.load(.acquire)) return stage;
@@ -1133,6 +1150,14 @@ fn fetch_snapshot(up: *const Up, snapshot: *const Snapshot) !u8 {
                 });
                 return 0;
             },
+            .downloaded => {
+                up.view.ok("snapshot", "block {d}: {s} downloaded (--download-only); run " ++
+                    "the command again without it to extract and import", .{
+                    snapshot.block,
+                    up_check.format_bytes(&b[0], snapshot.archive_bytes),
+                });
+                return 0;
+            },
             .stopped => {
                 up.view.note("stopped; the downloaded chunks are kept: run the same command " ++
                     "again to resume", .{});
@@ -1151,7 +1176,7 @@ fn fetch_snapshot(up: *const Up, snapshot: *const Snapshot) !u8 {
     return 1;
 }
 
-const RoundOutcome = union(enum) { extracted, stopped, retry, failed: []const u8 };
+const RoundOutcome = union(enum) { extracted, downloaded, stopped, retry, failed: []const u8 };
 
 const Round = struct {
     halt: std.atomic.Value(bool) = .init(false),
@@ -1196,7 +1221,9 @@ fn snapshot_round(up: *const Up, snapshot: *const Snapshot) !RoundOutcome {
     for (0..up.flags.connections) |_| {
         try group.concurrent(up.io, up_snapshot.Download.worker, .{&round.download});
     }
-    try group.concurrent(up.io, up_snapshot.Extraction.run, .{ &round.extraction, up.gpa });
+    if (!up.flags.download_only) {
+        try group.concurrent(up.io, up_snapshot.Extraction.run, .{ &round.extraction, up.gpa });
+    }
     watch_round(up, snapshot, round);
     round.halt.store(true, .release);
     group.cancel(up.io);
@@ -1211,7 +1238,14 @@ fn watch_round(up: *const Up, snapshot: *const Snapshot, round: *Round) void {
     var sample_ms = up.now_ms();
     var sample_bytes = round.download.bytes.load(.acquire);
     var rate: f64 = 0;
-    while (!round.extraction.done.load(.acquire)) {
+    const workers: u32 = up.flags.connections;
+    while (true) {
+        // Download only: done when every worker returned; else when the extraction ended.
+        const done = if (up.flags.download_only)
+            round.download.workers_done.load(.acquire) == workers
+        else
+            round.extraction.done.load(.acquire);
+        if (done) return;
         if (stop_requested.load(.acquire) or round.download.failed() != .none) return;
         Io.sleep(up.io, .fromMilliseconds(500), .awake) catch return;
         const now = up.now_ms();
@@ -1230,7 +1264,11 @@ fn watch_round(up: *const Up, snapshot: *const Snapshot, round: *Round) void {
         // The extraction trails the download: the bar is the slower of the two.
         const extracted_fraction = @as(f64, @floatFromInt(extracted)) /
             @as(f64, @floatFromInt(snapshot.mdbx_bytes()));
-        const fraction = @min(@as(f64, @floatFromInt(bytes)) / total, extracted_fraction);
+        const downloaded_fraction = @as(f64, @floatFromInt(bytes)) / total;
+        const fraction = if (up.flags.download_only)
+            downloaded_fraction
+        else
+            @min(downloaded_fraction, extracted_fraction);
         up.view.progress(now, "snapshot", fraction, "{s} / {s} downloaded  {d:.1} MB/s  " ++
             "{s} extracted  {s}", .{
             up_check.format_bytes(&b[0], bytes),
@@ -1276,6 +1314,7 @@ fn judge_round(up: *const Up, round: *Round) !RoundOutcome {
         .write_failed, .gave_up => return .{ .failed = "the download keeps failing; check " ++
             "the network and the disk" },
     }
+    if (up.flags.download_only) return .downloaded;
     const result = round.extraction.result orelse return .retry;
     return judge_extraction(up, round, result);
 }
@@ -1551,12 +1590,13 @@ test "up: flags" {
     try testing.expectEqualStrings("https://l1.example", full.l1.?);
     try testing.expectEqual(@as(?u16, 9545), full.rpc_port);
     const invalid = [_][]const []const u8{
-        &.{"--rpc.port"},                    &.{ "--rpc.port", "0" },
-        &.{ "--rpc.port", "70000" },         &.{ "--l1", "ethereum-rpc.publicnode.com" },
-        &.{ "--download.connections", "0" }, &.{"--bogus"},
-        &.{ "--db", "x", "--reimport" },     &.{ "--no-consensus", "--l1", "https://x" },
-        &.{ "--download.rate", "0" },        &.{ "--download.rate", "fast" },
-        &.{ "--gossip.port", "9322" },       &.{ "--gossip", "--gossip.port", "65535" },
+        &.{"--rpc.port"},                           &.{ "--rpc.port", "0" },
+        &.{ "--rpc.port", "70000" },                &.{ "--l1", "ethereum-rpc.publicnode.com" },
+        &.{ "--download.connections", "0" },        &.{"--bogus"},
+        &.{ "--db", "x", "--reimport" },            &.{ "--no-consensus", "--l1", "https://x" },
+        &.{ "--download.rate", "0" },               &.{ "--download.rate", "fast" },
+        &.{ "--download-only", "--db", "x" },       &.{ "--gossip.port", "9322" },
+        &.{ "--gossip", "--gossip.port", "65535" },
     };
     const gossip = try parse_flags(&.{ "--gossip", "--gossip.port", "9422" });
     try testing.expect(gossip.gossip and !defaults.gossip);
@@ -1564,6 +1604,8 @@ test "up: flags" {
     const capped = try parse_flags(&.{ "--download.rate", "6" });
     try testing.expectEqual(@as(u32, 6), capped.rate_mb_per_s);
     try testing.expectEqual(@as(u32, 0), defaults.rate_mb_per_s);
+    const fetch_only = try parse_flags(&.{ "--download-only", "--download.rate", "3" });
+    try testing.expect(fetch_only.download_only and !defaults.download_only);
     for (invalid) |args| try testing.expectError(error.InvalidArguments, parse_flags(args));
     try testing.expectError(error.Help, parse_flags(&.{"--help"}));
 }
