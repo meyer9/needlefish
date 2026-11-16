@@ -81,6 +81,9 @@ fn set_upgrades(spec: *ChainSpec, config: genesis.Config) Error!void {
     if (config.block_time) |seconds| {
         if (seconds == 0) return error.InvalidBlockTime;
         spec.block_time_seconds = seconds;
+    } else if (upgrades[@backingInt(root.Upgrade.denim)] != null) {
+        // base/base anchors the Denim schedule on `blockTime` and rejects blocks without it.
+        return error.InvalidBlockTime;
     }
     const elasticity = config.eip1559_elasticity orelse 6;
     const denominator = config.eip1559_denominator orelse 50;
@@ -170,5 +173,8 @@ test "chainspec: Base upgrades and block time from config.base and blockTime" {
     try testing.expect(spec.timestamp_follows(10, 10));
     try testing.expect(!spec.timestamp_follows(9, 9));
     l2.config.block_time = 0;
+    try testing.expectError(error.InvalidBlockTime, from_genesis(&l2));
+    // Denim anchors its schedule on `blockTime`; base/base rejects blocks without it.
+    l2.config.block_time = null;
     try testing.expectError(error.InvalidBlockTime, from_genesis(&l2));
 }

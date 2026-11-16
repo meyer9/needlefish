@@ -296,6 +296,26 @@ test "genesis json: header fork fields" {
     try testing.expectError(error.InvalidHex, parse(testing.allocator, "{\"alloc\":{\"zz\":{}}}"));
 }
 
+test "genesis json: OP header ignores Ethereum fork times and gas used (reth)" {
+    // base/base takes Shanghai/Cancun/Prague from Canyon/Ecotone/Isthmus on OP chains, and
+    // reth's genesis header never carries gas used.
+    const text =
+        \\{"config":{"chainId":901,"londonBlock":0,"bedrockBlock":0,"regolithTime":0,
+        \\ "shanghaiTime":0,"cancunTime":0,"pragueTime":0,"canyonTime":100},
+        \\ "timestamp":"0x10","gasLimit":"0x1c9c380","gasUsed":"0x5208","alloc":{}}
+    ;
+    const parsed = try parse(testing.allocator, text);
+    defer parsed.deinit();
+    const genesis = &parsed.value;
+    const root = try genesis.compute_state_root(testing.allocator);
+    const header = try genesis.header(testing.allocator, root);
+    try testing.expectEqual(@as(u64, 0), header.gas_used);
+    try testing.expectEqual(@as(?primitives.B256, null), header.withdrawals_root);
+    try testing.expectEqual(@as(?u64, null), header.excess_blob_gas);
+    try testing.expectEqual(@as(?primitives.B256, null), header.requests_hash);
+    try testing.expect(header.base_fee_per_gas != null);
+}
+
 const Prng = @import("../../testing/prng.zig").Prng;
 
 fn parse_and_root(input: []const u8) !void {
