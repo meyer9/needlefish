@@ -9,15 +9,14 @@ const io = @import("../../utilities/io/root.zig");
 const harness_module = @import("../../consensus/sources/sim_harness.zig");
 const verifier = @import("../contracts/aggregate_verifier.zig");
 const endpoint_module = @import("../rpc/endpoint.zig");
-const consensus = @import("../../common/consensus/root.zig");
-const rlp = @import("../../common/rlp/root.zig");
 const txdata = @import("../../batcher/txdata/root.zig");
 const accounts = @import("../../batcher/devnet/accounts.zig");
 const chain = @import("chain.zig");
 const tx_submitter = @import("tx_submitter.zig");
+const sender_test = @import("../submission/sender_test.zig");
+const revert_error = sender_test.revert_error;
 
 const FakeRpc = harness_module.FakeRpc;
-const Harness = harness_module.Harness(*FakeRpc, FakeRpc.handle);
 const Endpoint = endpoint_module.Endpoint(io.SimIo);
 const Submitter = tx_submitter.TxSubmitter(Endpoint);
 
@@ -27,23 +26,10 @@ const base_fee: u64 = 9;
 const tip: u128 = 2;
 const nonce: u64 = 11;
 
-/// A JSON-RPC `execution reverted` error carrying `data`.
-fn revert_error(arena: std.mem.Allocator, data: []const u8) ![]const u8 {
-    const format = "{{\"code\":3,\"message\":\"execution reverted\",\"data\":\"0x{x}\"}}";
-    return std.fmt.allocPrint(arena, format, .{data});
-}
-
-fn step(context: *anyopaque) anyerror!void {
-    const harness: *Harness = @ptrCast(@alignCast(context));
-    harness.world.run_for_ns(std.time.ns_per_ms);
-}
-
 const Fixture = struct {
     arena: std.heap.ArenaAllocator,
-    harness: Harness,
     fake: FakeRpc = .{},
-    client: Endpoint.Client,
-    l1: Endpoint,
+    fake_l1: sender_test.FakeL1,
     submitter: Submitter,
     account: accounts.Account,
     calldata: []const u8,
@@ -58,25 +44,16 @@ const Fixture = struct {
         errdefer allocator.destroy(self);
         self.* = .{
             .arena = .init(allocator),
-            .harness = undefined,
-            .client = undefined,
-            .l1 = undefined,
+            .fake_l1 = undefined,
             .submitter = undefined,
             .account = accounts.derive_dev(4),
             .calldata = undefined,
         };
         errdefer self.arena.deinit();
         try self.add_answers();
-        try self.harness.init(&self.fake, 0x62);
-        errdefer self.harness.deinit();
-        const options = harness_module.client_options;
-        const address = self.harness.address;
-        self.client = try .init(allocator, &self.harness.client_io, address, options, 4096);
-        errdefer self.client.deinit();
-        const pump: endpoint_module.Pump = .{ .context = &self.harness, .step = step };
-        self.l1 = .init(allocator, &self.client, pump, 100_000);
-        errdefer self.l1.deinit();
-        self.submitter = try .init(allocator, &self.l1, .{
+        try self.fake_l1.init(&self.fake, 0x62);
+        errdefer self.fake_l1.deinit();
+        self.submitter = try .init(allocator, &self.fake_l1.l1, .{
             .chain_id = 900,
             .private_key = self.account.private_key,
             .from = self.account.address.bytes,
@@ -87,9 +64,7 @@ const Fixture = struct {
 
     fn destroy(self: *Fixture) void {
         self.submitter.deinit(testing.allocator);
-        self.l1.deinit();
-        self.client.deinit();
-        self.harness.deinit();
+        self.fake_l1.deinit();
         self.arena.deinit();
         testing.allocator.destroy(self);
     }
@@ -111,15 +86,7 @@ const Fixture = struct {
         self.fake.add(.{ .method = "eth_estimateGas", .result = "\"0x40000\"" });
         self.fake.add(.{ .method = "eth_getTransactionCount", .result = "\"0xb\"" });
         self.fake.add(.{ .method = "eth_maxPriorityFeePerGas", .result = "\"0x2\"" });
-        var header_buffer: [600]u8 = undefined;
-        const header = rlp.encode_to(&header_buffer, consensus.Header{
-            .number = 12,
-            .base_fee_per_gas = base_fee,
-        });
-        self.fake.add(.{
-            .method = "debug_getRawHeader",
-            .result = try std.fmt.allocPrint(arena, "\"0x{x}\"", .{header}),
-        });
+        try sender_test.add_raw_header(&self.fake, arena, 12, base_fee);
         self.fake.add(.{
             .method = "eth_sendRawTransaction",
             .result = try std.fmt.allocPrint(arena, "\"0x{x}\"", .{&(try self.expected_hash())}),

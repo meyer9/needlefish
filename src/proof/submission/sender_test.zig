@@ -30,6 +30,52 @@ fn step(context: *anyopaque) anyerror!void {
     harness.world.run_for_ns(std.time.ns_per_ms);
 }
 
+/// A canned L1 over SimIo for the submitter tests: the fake node's harness, a JSON-RPC
+/// client to it, and an endpoint that pumps the harness while it waits.
+pub const FakeL1 = struct {
+    harness: Harness,
+    client: Endpoint.Client,
+    l1: Endpoint,
+
+    /// `fake` holds its answers and outlives the L1; `self` must not move after this.
+    pub fn init(self: *FakeL1, fake: *FakeRpc, seed: u64) !void {
+        const allocator = testing.allocator;
+        try self.harness.init(fake, seed);
+        errdefer self.harness.deinit();
+        const options = harness_module.client_options;
+        const address = self.harness.address;
+        self.client = try .init(allocator, &self.harness.client_io, address, options, 4096);
+        errdefer self.client.deinit();
+        const pump: endpoint_module.Pump = .{ .context = &self.harness, .step = step };
+        self.l1 = .init(allocator, &self.client, pump, 100_000);
+    }
+
+    pub fn deinit(self: *FakeL1) void {
+        self.l1.deinit();
+        self.client.deinit();
+        self.harness.deinit();
+    }
+};
+
+/// A JSON-RPC `execution reverted` error carrying `data`.
+pub fn revert_error(arena: std.mem.Allocator, data: []const u8) ![]const u8 {
+    const format = "{{\"code\":3,\"message\":\"execution reverted\",\"data\":\"0x{x}\"}}";
+    return std.fmt.allocPrint(arena, format, .{data});
+}
+
+/// Answers `debug_getRawHeader` with a header at `number` carrying `fee`.
+pub fn add_raw_header(fake: *FakeRpc, arena: std.mem.Allocator, number: u64, fee: u64) !void {
+    var buffer: [600]u8 = undefined;
+    const header = rlp.encode_to(&buffer, consensus.Header{
+        .number = number,
+        .base_fee_per_gas = fee,
+    });
+    fake.add(.{
+        .method = "debug_getRawHeader",
+        .result = try std.fmt.allocPrint(arena, "\"0x{x}\"", .{header}),
+    });
+}
+
 /// The raw transaction and hash the sender signs at `fees` (RFC 6979 is deterministic).
 fn signed(
     arena: std.mem.Allocator,
@@ -69,15 +115,7 @@ test "submission sender: a stuck transaction is resubmitted at its nonce with bu
     fake.add(.{ .method = "eth_estimateGas", .result = "\"0x40000\"" });
     fake.add(.{ .method = "eth_getTransactionCount", .result = "\"0xb\"" });
     fake.add(.{ .method = "eth_maxPriorityFeePerGas", .result = "\"0x2\"" });
-    var header_buffer: [600]u8 = undefined;
-    const header = rlp.encode_to(&header_buffer, consensus.Header{
-        .number = 12,
-        .base_fee_per_gas = base_fee,
-    });
-    fake.add(.{
-        .method = "debug_getRawHeader",
-        .result = try std.fmt.allocPrint(arena, "\"0x{x}\"", .{header}),
-    });
+    try add_raw_header(fake, arena, 12, base_fee);
     for ([_]@TypeOf(first){ first, second }) |tx| fake.add(.{
         .method = "eth_sendRawTransaction",
         .params_contain = tx.raw_hex,
@@ -90,16 +128,10 @@ test "submission sender: a stuck transaction is resubmitted at its nonce with bu
         .result = "null",
     });
     fake.add(.{ .method = "eth_getTransactionReceipt", .result = "null" });
-    var harness: Harness = undefined;
-    try harness.init(fake, 0x63);
-    defer harness.deinit();
-    const address = harness.address;
-    const options = harness_module.client_options;
-    var client: Endpoint.Client = try .init(allocator, &harness.client_io, address, options, 4096);
-    defer client.deinit();
-    var l1: Endpoint = .init(allocator, &client, .{ .context = &harness, .step = step }, 100_000);
-    defer l1.deinit();
-    var sender: Sender = try .init(allocator, &l1, .{
+    var chain: FakeL1 = undefined;
+    try chain.init(fake, 0x63);
+    defer chain.deinit();
+    var sender: Sender = try .init(allocator, &chain.l1, .{
         .chain_id = 900,
         .private_key = account.private_key,
         .from = account.address.bytes,
