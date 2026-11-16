@@ -59,18 +59,6 @@ pub fn is_predeploy(candidate: Address) bool {
 /// Sender of every L1-attributes and system deposit.
 pub const depositor_account = address("DeaDDEaDDeAdDeAdDEAdDEaddeAddEAdDEAd0001");
 
-/// Deployers of the network-upgrade transactions.
-pub const deployers = struct {
-    pub const ecotone_l1_block = address("4210000000000000000000000000000000000000");
-    pub const ecotone_gas_price_oracle = address("4210000000000000000000000000000000000001");
-    pub const fjord_gas_price_oracle = address("4210000000000000000000000000000000000002");
-    pub const isthmus_l1_block = address("4210000000000000000000000000000000000003");
-    pub const isthmus_gas_price_oracle = address("4210000000000000000000000000000000000004");
-    pub const isthmus_operator_fee_vault = address("4210000000000000000000000000000000000005");
-    pub const jovian_l1_block = address("4210000000000000000000000000000000000006");
-    pub const jovian_gas_price_oracle = address("4210000000000000000000000000000000000007");
-};
-
 test "predeploys: table" {
     try std.testing.expectEqual(@as(usize, 25), all.len);
     for (all, 0..) |a, i| {
