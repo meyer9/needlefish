@@ -549,6 +549,13 @@ pub const State = struct {
         return account.warm_tx == state.tx_id;
     }
 
+    /// Whether a slot of `account` is warm in the current transaction, without loading it.
+    pub fn is_slot_warm(state: *State, account: *const Account, slot: u256) bool {
+        const key = StorageKey{ .address = account.address, .slot = slot };
+        const cached = state.slots.getPtr(key) orelse return false;
+        return cached.warm_tx == state.tx_id;
+    }
+
     pub fn code(state: *State, account: *Account) Error![]const u8 {
         if (account.info.code) |bytes| return bytes;
         const bytes: []const u8 = if (account.info.has_code())

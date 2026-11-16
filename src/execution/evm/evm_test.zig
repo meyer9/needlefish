@@ -536,3 +536,55 @@ test "evm: tracer sees nested calls, logs, selfdestruct, and create in order" {
     // The top frame's exit comes last and reports the transaction's outcome.
     try std.testing.expectEqual(outcome.gas_remaining, recorder.outcomes[3].gas_remaining);
 }
+
+/// Runs `code` at `contract` with `gas` and reports whether it ran out of gas and whether
+/// it loaded `target` from the database.
+fn cold_load_run(code: []const u8, gas: u64, target: Address) !struct { bool, bool } {
+    var h: Harness = undefined;
+    try h.init(std.testing.allocator);
+    defer h.deinit(std.testing.allocator);
+    try h.database.put_account(contract, 10, 0, code);
+    try h.database.put_account(target, 1, 0, &.{});
+    const outcome = try h.call(.prague, contract, &.{}, gas);
+    const loaded = h.state.accounts.getPtr(target) != null;
+    return .{ outcome.exit == .out_of_gas, loaded };
+}
+
+test "evm: an unaffordable cold access runs out of gas without reading the account" {
+    // revm (base/base) skips the database read of a cold account the frame cannot pay
+    // for; its stateless witnesses lack that account, so needlefish must not read it.
+    const target = primitives.address_from_int(0x7a26e7);
+    const push_target = [_]u8{0x73} ++ target; // PUSH20
+    const balance = push_target ++ [_]u8{ op.BALANCE, op.STOP };
+    const selfdestruct = push_target ++ [_]u8{op.SELFDESTRUCT};
+    // CALL(gas, target, value, 0, 0, 0, 0) with value 0 and 1.
+    const zeros = [_]u8{ op.PUSH1, 0, op.PUSH1, 0, op.PUSH1, 0, op.PUSH1, 0 };
+    const call_free = zeros ++ [_]u8{ op.PUSH1, 0 } ++ push_target ++
+        [_]u8{ op.PUSH1, 0, op.CALL, op.STOP };
+    const call_value = zeros ++ [_]u8{ op.PUSH1, 1 } ++ push_target ++
+        [_]u8{ op.PUSH1, 0, op.CALL, op.STOP };
+    const cases = [_]struct { code: []const u8, affordable: u64 }{
+        .{ .code = &balance, .affordable = 3 + 2600 },
+        .{ .code = &selfdestruct, .affordable = 3 + 5000 + 2600 },
+        .{ .code = &call_free, .affordable = 7 * 3 + 2600 },
+        .{ .code = &call_value, .affordable = 7 * 3 + 9000 + 2600 },
+    };
+    for (cases) |case| {
+        const short = try cold_load_run(case.code, case.affordable - 1, target);
+        try std.testing.expect(short[0]);
+        try std.testing.expect(!short[1]);
+        const enough = try cold_load_run(case.code, case.affordable + 40_000, target);
+        try std.testing.expect(!enough[0]);
+        try std.testing.expect(enough[1]);
+    }
+    // SLOAD: a cold slot below the cold surcharge is not read either.
+    const sload = [_]u8{ op.PUSH1, 7, op.SLOAD, op.STOP };
+    var h: Harness = undefined;
+    try h.init(std.testing.allocator);
+    defer h.deinit(std.testing.allocator);
+    try h.database.put_account(contract, 0, 0, &sload);
+    const outcome = try h.call(.prague, contract, &.{}, 3 + 2100 - 1);
+    try std.testing.expectEqual(evm_module.Exit.out_of_gas, outcome.exit);
+    const key: state_module.StorageKey = .{ .address = contract, .slot = 7 };
+    try std.testing.expect(h.state.slots.getPtr(key) == null);
+}
