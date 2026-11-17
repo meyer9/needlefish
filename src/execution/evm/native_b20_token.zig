@@ -412,9 +412,11 @@ fn view_extension(context: *Context, tag: Tag, arguments: *const Arguments) Erro
             return write_bool(context, supported);
         },
         .to_raw_balance, .from_ui_amount => {
+            // base/base reads the multiplier before the overflow check (its gas is spent).
+            const divisor = try multiplier(context);
             const product = std.math.mul(u256, arguments.uint256(0), wad) catch
                 return b20.overflow(context);
-            return write_u256(context, product / try multiplier(context));
+            return write_u256(context, product / divisor);
         },
         .scaled_balance_of, .balance_of_ui => {
             const balance = try b20.balance_of(context, arguments.address(0));

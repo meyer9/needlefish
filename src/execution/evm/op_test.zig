@@ -800,6 +800,23 @@ test "op: B-20 asset pause flags, roles, and views" {
     try testing.expectEqualSlices(u8, &native.selector_non_payable, payable.output);
 }
 
+test "op: B-20 toRawBalance (fromUIAmount) reads the multiplier before its overflow check" {
+    var h: Harness = undefined;
+    try token_setup(&h);
+    defer h.deinit(testing.allocator);
+    var buffer: [4 + 32]u8 = undefined;
+    const fine_input = token_input(&buffer, .to_raw_balance, &.{1});
+    const fine = try native_call(&h, token_address, fine_input, 0);
+    try testing.expect(fine.status == .success);
+    const fine_gas = fine.gas_used - 21_000 - calldata_gas(fine_input);
+    // base/base: the multiplier read (a cold SLOAD) is paid before the product overflows.
+    const max_input = token_input(&buffer, .to_raw_balance, &.{std.math.maxInt(u256)});
+    const overflow = try native_call(&h, token_address, max_input, 0);
+    try testing.expect(overflow.status == .revert);
+    try testing.expectEqualSlices(u8, &native.error_panic, overflow.output[0..4]);
+    try testing.expectEqual(fine_gas, overflow.gas_used - 21_000 - calldata_gas(max_input));
+}
+
 test "op: B-20 asset metadata, multiplier, allowances, and permit failures" {
     var h: Harness = undefined;
     try token_setup(&h);
