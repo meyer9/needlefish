@@ -596,6 +596,34 @@ test "op: B-20 factory calldata below the interface minimum fails the interface 
     try testing.expectEqualSlices(u8, &selector, cobalt.output);
 }
 
+test "op: B-20 factory bytes[] elements decode before the count is checked (Beryl)" {
+    var h: Harness = undefined;
+    try h.init(testing.allocator);
+    defer h.deinit(testing.allocator);
+    h.evm.block.op = .{ .upgrade = .beryl, .activation_admin = sender_address };
+    // Chain-campaign finding: initCalls points one byte into the arguments, so its count is
+    // 0x0397 and its first element head is the salt shifted by one byte. alloy reserves the
+    // elements and fails that head's offset check; checking the count against the calldata
+    // first reported an overrun, a shorter revert.
+    const salt = "97667070c54ef182b0f5858b034beac1b6f3089aa2d3188bb1e8929f4fa9b929";
+    var input: [4 + 9 * 32]u8 = undefined;
+    _ = try std.fmt.hexToBytes(&input, "62975e6a" ++
+        "0000000000000000000000000000000000000000000000000000000000000003" ++ salt ++
+        "0000000000000000000000000000000000000000000000000000000000000080" ++
+        "0000000000000000000000000000000000000000000000000000000000000001" ++
+        "0000000000000000000000000000000000000000000000000000000000000044" ++
+        "40c10f19000000000000000000000000c99a712af88be98c5179b3fbdb12588b" ++
+        "5b6a303f00000000000000000000000000000000000000000000000000000000" ++
+        "000389b200000000000000000000000000000000000000000000000000000000" ++
+        "0000000000000000000000000000000000000000000000000000000000000000");
+    const executed = try create_call(&h, &input);
+    try testing.expect(executed.status == .revert);
+    const expected = "\x62\x97\x5e\x6a" ++
+        "type check failed for \"offset (usize)\" with data: " ++ salt[2..] ++ "00";
+    try testing.expectEqual(@as(usize, 118), expected.len);
+    try testing.expectEqualStrings(expected, executed.output);
+}
+
 test "op: PolicyRegistry argument-free views answer a bare selector (Denim)" {
     var h: Harness = undefined;
     try h.init(testing.allocator);

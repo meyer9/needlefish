@@ -174,6 +174,8 @@ pub const Context = struct {
             .overrun => try writer.writeAll(
                 "ABI decoding failed: buffer overrun while deserializing",
             ),
+            .capacity => try writer.writeAll("memory allocation failed because the computed " ++
+                "capacity exceeded the collection's maximum"),
             .type_check => {
                 try writer.print("type check failed for \"{s}\" with data: ", .{parameters});
                 try native_abi.write_tuple_hex(writer, data, kinds);
@@ -249,7 +251,8 @@ const keccak256_gas: u64 = 30;
 
 /// `short`: calldata below the interface's minimum length (alloy `SolInterface::
 /// abi_decode_validate`); the message names the interface, its data is the whole calldata.
-pub const DecodeFailure = union(enum) { overrun, type_check, offset: [32]u8, short };
+/// `capacity`: alloy's element vector reservation overflowed (`TryReserveError`).
+pub const DecodeFailure = union(enum) { overrun, type_check, offset: [32]u8, short, capacity };
 /// Longest parameter tuple signature in a type-check message.
 pub const parameters_length_max = 96;
 
