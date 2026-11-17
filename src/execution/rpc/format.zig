@@ -427,6 +427,9 @@ pub fn receipt_context(
         blob_price = params.base_fee(header.excess_blob_gas orelse 0);
     };
     assert(value.cumulative_gas_used >= position.previous_gas);
+    // A deposit has no nonce: it creates at the sender's nonce before execution, the receipt's
+    // deposit nonce (zero before Regolith), as base/base's receipt builder reports.
+    const creation_nonce = envelope.nonce() orelse value.deposit_nonce orelse 0;
     return .{
         .inclusion = .{
             .block_hash = hash,
@@ -438,7 +441,7 @@ pub fn receipt_context(
         .tx_hash = primitives.keccak256(raw).bytes,
         .from = sender,
         .to = to,
-        .contract_address = if (to == null) contract_address(sender, envelope.nonce().?) else null,
+        .contract_address = if (to == null) contract_address(sender, creation_nonce) else null,
         .gas_used = value.cumulative_gas_used - position.previous_gas,
         .effective_gas_price = envelope.effective_gas_price(base_fee) orelse 0,
         .first_log_index = position.log_index,
@@ -566,6 +569,39 @@ test "format: deposit transaction and receipt carry the OP fields" {
     try testing.expect(std.mem.indexOf(u8, receipt_text, "\"depositNonce\":\"0x3\"") != null);
     const version = "\"depositReceiptVersion\":\"0x1\"";
     try testing.expect(std.mem.indexOf(u8, receipt_text, version) != null);
+}
+
+test "format: a creating deposit's receipt names the address at its deposit nonce" {
+    const deposit: Envelope = .{ .deposit = .{
+        .source_hash = .{ .bytes = @splat(0x5c) },
+        .from = .{ .bytes = @splat(0xde) },
+        .to = .create,
+        .mint = 0,
+        .value = 0,
+        .gas_limit = 1_000_000,
+        .is_system_transaction = false,
+        .input = &.{},
+    } };
+    var raw_buffer: [256]u8 = undefined;
+    const raw = deposit.encode_to(&raw_buffer);
+    const value: consensus.Receipt = .{
+        .tx_type = .deposit,
+        .status = false,
+        .cumulative_gas_used = 50_000,
+        .logs_bloom = .zero,
+        .logs = .{ .payload = &.{}, .count = 0 },
+        .deposit_nonce = 3,
+        .deposit_receipt_version = 1,
+    };
+    const spec = &chainspec.ChainSpec.presets.base_devnet;
+    const header: Header = .{};
+    // A deposit has no nonce of its own (this used to unwrap null and abort the node).
+    const context = receipt_context(spec, no_recovery, &header, @splat(1), raw, 0, value, .{
+        .previous_gas = 0,
+        .log_index = 0,
+    });
+    const from: primitives.Address = .{ .bytes = @splat(0xde) };
+    try testing.expectEqual(contract_address(from, 3), context.contract_address.?);
 }
 
 fn timestamp_scenario(seed: u64) !void {

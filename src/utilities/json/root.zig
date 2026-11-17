@@ -5,12 +5,19 @@
 //! are slices into that input, so nothing is copied unless the caller unescapes a string
 //! into its own buffer. Nesting depth is bounded by `depth_max`; exceeding it is an error,
 //! not a crash. Structure is validated while scanning: a document that scans to `.end`
-//! without error is well formed.
+//! without error is well formed. The writer nests up to `writer_depth_max`, enough for any
+//! call tree.
 
 const std = @import("std");
 const assert = std.debug.assert;
 
-pub const depth_max = 64;
+/// Scanner nesting: 127 levels, as serde_json's default recursion limit (128, an error once
+/// it is reached), which base/base parses JSON-RPC requests with.
+pub const depth_max = 127;
+
+/// Writer nesting: a callTracer tree takes two levels per call frame (an object and its
+/// `calls` array), and the EVM nests at most 1025 frames; geth-style traces have no limit.
+pub const writer_depth_max = 4096;
 
 pub const Error = error{
     UnexpectedEnd,
@@ -456,7 +463,7 @@ pub const Writer = struct {
     out: *std.Io.Writer,
     depth: u32 = 0,
     /// Per depth: whether the container already has an element (needs a comma first).
-    has_element: [depth_max + 1]bool = @splat(false),
+    has_element: std.StaticBitSet(writer_depth_max + 1) = .empty,
     /// True right after `key()`: the next value must not be preceded by a comma.
     after_key: bool = false,
 
@@ -471,8 +478,8 @@ pub const Writer = struct {
             writer.after_key = false;
             return;
         }
-        if (writer.has_element[writer.depth]) try writer.out.writeByte(',');
-        writer.has_element[writer.depth] = true;
+        if (writer.has_element.isSet(writer.depth)) try writer.out.writeByte(',');
+        writer.has_element.set(writer.depth);
     }
 
     pub fn begin_object(writer: *Writer) WriteError!void {
@@ -492,11 +499,11 @@ pub const Writer = struct {
     }
 
     fn begin(writer: *Writer, byte: u8) WriteError!void {
-        assert(writer.depth < depth_max);
+        assert(writer.depth < writer_depth_max);
         try writer.separate();
         try writer.out.writeByte(byte);
         writer.depth += 1;
-        writer.has_element[writer.depth] = false;
+        writer.has_element.unset(writer.depth);
     }
 
     fn end(writer: *Writer, byte: u8) WriteError!void {

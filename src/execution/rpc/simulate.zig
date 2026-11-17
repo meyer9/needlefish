@@ -3,7 +3,8 @@
 //! top of a base block, carrying state across calls and blocks. Nothing is committed.
 //!
 //! Supported: block overrides `number`, `time`, `gasLimit`, `feeRecipient`, `prevRandao`
-//! (numbers and times must increase; defaults are parent + 1 and parent time + 12);
+//! (overridden numbers and times must increase; defaults are parent + 1 and parent time + 12,
+//! saturating);
 //! state overrides `balance`, `nonce`, `code`, `state` (replaces all storage) and
 //! `stateDiff`. Calls run fee-free (gas price and base fee zero, as without
 //! `validation`), with the block's remaining gas by default. Each block reports
@@ -175,16 +176,18 @@ fn simulate_block(
     raw: []const u8,
 ) HandlerError!BlockEnv {
     var env = parent.*;
-    env.number = parent.number + 1;
-    env.timestamp = parent.timestamp + timestamp_increment;
+    // Defaults saturate at 2^64 - 1 and only overrides must increase, as base/base's
+    // simulate does: blocks after one at the maximum repeat it.
+    env.number = parent.number +| 1;
+    env.timestamp = parent.timestamp +| timestamp_increment;
     if (json.find_path(raw, &.{"blockOverrides"}) catch return error.InvalidParams) |o| {
         try apply_block_overrides(call, &env, o);
-    }
-    if (env.number <= parent.number) {
-        return call.fail(code_block_number, "block numbers must increase");
-    }
-    if (env.timestamp <= parent.timestamp) {
-        return call.fail(code_block_timestamp, "block timestamps must increase");
+        if (try overridden(o, "number") and env.number <= parent.number) {
+            return call.fail(code_block_number, "block numbers must increase");
+        }
+        if (try overridden(o, "time") and env.timestamp <= parent.timestamp) {
+            return call.fail(code_block_timestamp, "block timestamps must increase");
+        }
     }
     const executor = api.chain.executor;
     if (json.find_path(raw, &.{"stateOverrides"}) catch return error.InvalidParams) |o| {
@@ -225,6 +228,12 @@ fn simulate_block(
     try w.quantity(gas_used);
     try w.end_object();
     return env;
+}
+
+/// Whether the block overrides `raw` set `name` (a null member sets nothing).
+fn overridden(raw: []const u8, name: []const u8) HandlerError!bool {
+    const value = json.find_path(raw, &.{name}) catch return error.InvalidParams;
+    return value != null and !std.mem.eql(u8, value.?, "null");
 }
 
 const Position = struct { block: u64, index: u64 };

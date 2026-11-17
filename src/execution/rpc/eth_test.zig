@@ -597,6 +597,16 @@ test "eth: eth_simulateV1 limits and rejections" {
     try expect_contains(try h.request("eth_simulateV1", gas), "\"code\":-38015");
     const backwards = "[{\"blockStateCalls\":[{\"blockOverrides\":{\"number\":\"0x0\"}}]}]";
     try expect_contains(try h.request("eth_simulateV1", backwards), "\"code\":-38020");
+    // Blocks after one at 2^64 - 1 saturate instead of overflowing (base/base does too).
+    const max = "\"0xffffffffffffffff\"";
+    const late = "[{\"blockStateCalls\":[{\"blockOverrides\":{\"time\":" ++ max ++ "," ++
+        "\"number\":" ++ max ++ "}},{}]}]";
+    const saturated = try h.request("eth_simulateV1", late);
+    try testing.expectEqual(@as(usize, 2), std.mem.count(u8, saturated, "\"timestamp\":" ++ max));
+    try testing.expectEqual(@as(usize, 2), std.mem.count(u8, saturated, "\"number\":" ++ max));
+    const stalled = "[{\"blockStateCalls\":[{\"blockOverrides\":{\"time\":" ++ max ++ "}}," ++
+        "{\"blockOverrides\":{\"time\":" ++ max ++ "}}]}]";
+    try expect_contains(try h.request("eth_simulateV1", stalled), "\"code\":-38021");
     const validation = "[{\"blockStateCalls\":[],\"validation\":true}]";
     try expect_contains(try h.request("eth_simulateV1", validation), "not supported");
     const fee = "[{\"blockStateCalls\":[{\"blockOverrides\":{\"baseFeePerGas\":\"0x1\"}}]}]";
@@ -616,6 +626,8 @@ fn simulate_scenario(seed: u64) !void {
         "{\"calls\":[{\"to\":" ++ counter_at ++ "}]}",
         "{\"stateOverrides\":{" ++ counter_at ++ ":{\"code\":\"" ++ counter_hex ++ "\"}}}",
         "{\"blockOverrides\":{\"time\":\"0x5\"}}",
+        "{\"blockOverrides\":{\"time\":\"0xffffffffffffffff\"}}",
+        "{\"blockOverrides\":{\"number\":\"0xffffffffffffffff\"}}",
         "{\"blockOverrides\":{\"gasLimit\":\"0x0\"},\"calls\":[{}]}",
         "{\"stateOverrides\":{" ++ counter_at ++ ":{\"balance\":\"0x10\",\"state\":{}}}}",
         "{\"calls\":[{\"to\":" ++ counter_at ++ ",\"value\":\"0x1\"}]}",

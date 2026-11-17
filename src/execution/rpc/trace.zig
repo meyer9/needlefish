@@ -42,6 +42,10 @@ pub const methods = [_]rpc.Method(*Api){
 
 /// Call depth bound (EIP-150 caps it at 1024; one more for the top frame and a phase shift).
 pub const depth_max = 1026;
+comptime {
+    // A tree takes two writer levels per frame, inside the response envelope's few.
+    assert(2 * depth_max + 8 <= json.writer_depth_max);
+}
 
 pub const Frame = struct {
     kind: evm.evm.TraceKind,
@@ -749,6 +753,43 @@ fn random_tree(seed: u64) !void {
 
 test "trace: seeded fuzz of call trees" {
     for (0..256) |seed| try random_tree(seed);
+}
+
+test "trace: a call tree as deep as the EVM allows writes in full" {
+    // Frames at depths 0..1024, each the only child of the one before (a 90-deep tree used
+    // to trip the writer's 64-level bound and abort the node).
+    const count = depth_max - 1;
+    const frames = try testing.allocator.alloc(Frame, count);
+    defer testing.allocator.free(frames);
+    for (frames, 0..) |*frame, index| {
+        frame.* = .{
+            .kind = @fromBackingInt(0),
+            .from = @splat(1),
+            .to = @splat(2),
+            .value = 0,
+            .gas = 100,
+            .gas_used = 100,
+            .input = &.{},
+            .output = &.{},
+            .exit = if (index + 1 == count) .out_of_gas else .return_,
+            .depth = @intCast(index),
+            .transaction = 0,
+        };
+    }
+    var recorder: Recorder = .{ .frames = frames, .logs = &.{}, .bytes = &.{} };
+    recorder.frame_count = count;
+    const out = try testing.allocator.alloc(u8, 1 << 20);
+    defer testing.allocator.free(out);
+    var writer: std.Io.Writer = .fixed(out);
+    var w: json.Writer = .init(&writer);
+    try write_tree(&w, &recorder, 0, count, .{ .limit = 1, .used = 1 }, false);
+    const text = writer.buffered();
+    try testing.expectEqual(count, std.mem.count(u8, text, "{"));
+    try testing.expectEqual(count, std.mem.count(u8, text, "}"));
+    try testing.expectEqual(count - 1, std.mem.count(u8, text, "\"calls\":["));
+    const tail = text[text.len - 2 * (count - 1) ..];
+    for (0..count - 1) |index| try testing.expectEqualStrings("]}", tail[2 * index ..][0..2]);
+    try testing.expectEqual(@as(u32, 0), w.depth);
 }
 
 fn fuzz_trace(_: void, smith: *testing.Smith) anyerror!void {
