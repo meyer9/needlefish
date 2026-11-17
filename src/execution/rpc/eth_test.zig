@@ -891,6 +891,13 @@ test "eth: fee history closes with the base fee after its newest block, not the 
     try expect_contains(try h.request("eth_getBlockByNumber", "[\"0x1\",false]"), size);
 }
 
+test "eth: fuzz_coverage exists only in a coverage build" {
+    if (eth.fuzz_coverage.enabled) return error.SkipZigTest;
+    const h = try Harness.create();
+    defer h.destroy();
+    try expect_contains(try h.request("fuzz_coverage", "[]"), "\"code\":-32601");
+}
+
 fn fuzz_body(h: *Harness, body: []const u8) !void {
     var out: std.Io.Writer = .fixed(&h.out);
     const outcome = eth.Router.handle(&h.api, body, &out);

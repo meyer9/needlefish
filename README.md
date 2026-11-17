@@ -163,6 +163,28 @@ first fills a cache (code analysis, the warm-address set) can show a few more ed
 same request later. Without the flag the hooks compile away; the variable then makes the adapter
 exit with an error rather than report nothing.
 
+The same `-Ddiff-coverage` build adds a `fuzz_coverage` JSON-RPC method to `base node`, on the
+normal HTTP port, for a coverage-guided JSON-RPC fuzzer:
+
+```sh
+zig build -Doptimize=ReleaseSafe -Ddiff-coverage -p zig-out-coverage
+zig-out-coverage/bin/base node --chain genesis.json --http.port 8545
+curl -s localhost:8545 -H 'content-type: application/json' \
+  -d '{"jsonrpc":"2.0","id":1,"method":"fuzz_coverage","params":[]}'
+```
+
+It answers `{"counters": <kept counters>, "hits": [[index, count], ...]}`: every kept edge
+counter hit since the previous call (or process start), by index, with its 8-bit count, and
+then zeroes all counters. An index is the counter's position among the kept ones, stable for
+one binary. Kept counters lie in functions named with one of the comma-separated prefixes in
+`BASE_RPC_COVERAGE_PREFIXES`, by default the JSON-RPC serving code (HTTP, JSON-RPC, JSON, the
+RPC handlers and tracers, block-store lookups, RLP and consensus types, the EVM, and crypto):
+`utilities.http.,utilities.rpc.,utilities.json.,execution.rpc.,execution.node.block_store.,`
+`common.rlp.,common.consensus.,execution.evm.,common.crypto.`. Counters are process-wide and
+not atomic, so send requests one at a time. Block import and timers also run some kept code
+(the EVM, RLP, the HTTP server), so discard the reading after the chain advances. Without the
+flag the method does not exist (-32601).
+
 ### Local devnet
 
 The devnet runs natively, with no Docker and no external L1: needlefish brings its own L1 dev
