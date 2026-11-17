@@ -1,8 +1,9 @@
 //! Calldata decoding for native precompiles with alloy's validating decoder semantics
 //! (`abi_decode_validate`, non-strict): trailing bytes are allowed, offsets need not be
 //! canonical, a short buffer is an overrun, an offset or length word above 64 bits is an
-//! "offset (usize)" type-check failure, and invalid values (dirty address bits, a bool above
-//! 1, an out-of-range enum) fail the whole parameter tuple's type check after decoding.
+//! "offset (usize)" type-check failure, and invalid values (dirty address bits, a bool with
+//! dirty high bytes, an out-of-range enum) fail the whole parameter tuple's type check after
+//! decoding.
 
 const std = @import("std");
 const assert = std.debug.assert;
@@ -329,7 +330,9 @@ fn valid(kind: Kind, word: *const [32]u8, elements: Array, enumeration_max: u8) 
     return switch (kind) {
         .address => zero(word[0..12]),
         .uint64 => zero(word[0..24]),
-        .bool => zero(word[0..31]) and word[31] <= 1,
+        // alloy 1.6.1 `Bool::valid_token` checks only the high 31 bytes; any nonzero low
+        // byte is `true`.
+        .bool => zero(word[0..31]),
         .enumeration => zero(word[0..31]) and word[31] <= enumeration_max,
         .bytes32, .uint256 => true,
         .uint8 => zero(word[0..31]),
@@ -380,7 +383,9 @@ test "native abi: dynamic address arrays follow alloy's decoder" {
     try testing.expectEqual(null, decode_arguments(&data, &kinds, 1, &failure));
     try testing.expectEqual(native.DecodeFailure.type_check, failure);
     data[160] = 0;
-    data[63] = 2; // Bool above 1.
+    data[63] = 0xdc; // A bool's low byte may be anything nonzero: true, as in alloy.
+    try testing.expect(decode_arguments(&data, &kinds, 1, &failure).?.flag(1));
+    data[62] = 1; // A dirty high byte fails the type check.
     try testing.expectEqual(null, decode_arguments(&data, &kinds, 1, &failure));
     try testing.expectEqual(native.DecodeFailure.type_check, failure);
 }

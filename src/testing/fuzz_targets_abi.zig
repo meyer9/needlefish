@@ -7,7 +7,7 @@
 //! reference encoder here. Properties:
 //!   - the canonical encoding decodes, and every accessor returns the encoded value;
 //!   - trailing bytes change nothing (non-strict decoding);
-//!   - one invalid value (dirty high bits, bool above 1, enum above the maximum, dirty
+//!   - one invalid value (dirty high bits, of a bool too, enum above the maximum, dirty
 //!     array element, invalid UTF-8) fails with `type_check`;
 //!   - any truncation fails with `overrun`, or decodes to the same values (only padding
 //!     of the last payload was cut);
@@ -209,7 +209,8 @@ fn corrupt_value(prng: *Prng, kind: Kind, value: *Value, enumeration_max: u8) bo
     switch (kind) {
         .address => value.word[@intCast(prng.below(12))] |= 1,
         .uint64 => value.word[@intCast(prng.below(24))] |= 0x80,
-        .bool => value.word[31] = @intCast(prng.range(2, 255)),
+        // alloy checks a bool's high 31 bytes only (any nonzero low byte is true).
+        .bool => value.word[@intCast(prng.below(31))] |= 1,
         .enumeration => value.word[31] = enumeration_max + 1,
         .uint8 => value.word[@intCast(prng.below(31))] |= 1,
         .bytes4 => value.word[@intCast(prng.range(4, 31))] |= 1,
