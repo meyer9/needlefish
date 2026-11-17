@@ -11,6 +11,7 @@ pub const request = @import("request.zig");
 pub const adapter = @import("adapter.zig");
 pub const response = @import("response.zig");
 pub const coverage = @import("coverage.zig");
+pub const system_config = @import("system_config.zig");
 pub const Adapter = adapter.Adapter;
 pub const Coverage = coverage.Coverage;
 
@@ -30,6 +31,11 @@ pub fn handle_line(
         const text = error_text(arena, "invalid request", err);
         return response.write_error(out, id, text, features);
     };
+    if (std.mem.eql(u8, raw.mode, "systemConfig") and
+        std.mem.eql(u8, raw.chain, "base-mainnet"))
+    {
+        return system_config.handle(arena, raw.id, raw.systemConfig, out);
+    }
     const case = request.decode(arena, &raw) catch |err| {
         const text = error_text(arena, "invalid request", err);
         return response.write_error(out, raw.id, text, features);
@@ -63,4 +69,5 @@ test {
     std.testing.refAllDecls(@This());
     _ = @import("adapter_test.zig");
     _ = @import("coverage.zig");
+    _ = @import("system_config.zig");
 }
