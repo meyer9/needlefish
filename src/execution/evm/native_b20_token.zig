@@ -265,7 +265,10 @@ fn internal_call(context: *Context, call: []const u8, privileged: bool) Error!vo
         return revert_with_bytes(context, error_internal_call_failed, call);
     if (function.tag == .announce) return context.revert_selector(error_announcement_in_progress);
     _ = execute(context, function, call, privileged) catch |err| switch (err) {
-        error.Revert => return revert_with_bytes(context, error_internal_call_failed, call),
+        error.Revert => {
+            if (context.panicked()) return error.Revert;
+            return revert_with_bytes(context, error_internal_call_failed, call);
+        },
         else => |other| return other,
     };
 }

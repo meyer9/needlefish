@@ -81,6 +81,14 @@ pub const Context = struct {
         return error.Revert;
     }
 
+    /// The last revert was a `Panic(uint256)` (checked arithmetic, enum conversion, array
+    /// bounds): base/base's `is_system_error`, which wrappers such as B-20 init calls and
+    /// announce internal calls pass through unchanged instead of wrapping.
+    pub fn panicked(context: *const Context) bool {
+        if (context.revert_custom or context.revert_len != 36) return false;
+        return std.mem.eql(u8, context.out[0..4], &error_panic);
+    }
+
     pub fn revert_selector(context: *Context, selector: [4]u8) error{Revert} {
         return context.revert(&selector);
     }

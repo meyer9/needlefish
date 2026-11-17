@@ -1031,6 +1031,23 @@ test "op: B-20 asset announce runs internal calls atomically" {
     try testing.expectEqual(@as(usize, 4 + 64 + 96), failed.output.len);
 }
 
+/// `Panic(0x11)`, the revert of base/base's checked arithmetic.
+const panic_overflow = native.error_panic ++ native.u256_word(0x11);
+
+test "op: B-20 announce passes an internal call's Panic through unwrapped" {
+    var h: Harness = undefined;
+    try token_setup(&h);
+    defer h.deinit(testing.allocator);
+    _ = try token_call(&h, .grant_role, &.{ b20_asset.role_operator, address_int(sender_address) });
+    var call_buffer: [4 + 32]u8 = undefined;
+    const overflow = token_input(&call_buffer, .to_raw_balance, &.{std.math.maxInt(u256)});
+    var buffer: [4 + 32 * 16]u8 = undefined;
+    const id = short_string("p") & ~@as(u256, 0xff);
+    const failed = try native_call(&h, token_address, announce_input(&buffer, overflow, id), 0);
+    try testing.expect(failed.status == .revert);
+    try testing.expectEqualSlices(u8, &panic_overflow, failed.output);
+}
+
 const b20_factory = @import("native_b20_factory.zig");
 
 const Writer = struct {
@@ -1138,6 +1155,14 @@ test "op: B-20 factory creates activated asset tokens with init calls" {
     const unknown = try create_call(&h, create_input(&buffer, 8, 1, 6, &.{ 1, 2, 3, 4 }));
     try testing.expect(unknown.status == .revert);
     try testing.expectEqual(@as(usize, 36), unknown.output.len);
+    // A Panic in an init call is base/base's system error: it passes through, not as
+    // InitCallFailed (fuzz: a mint whose total supply overflows).
+    var overflow_buffer: [4 + 32]u8 = undefined;
+    const maximum = std.math.maxInt(u256);
+    const overflow = token_input(&overflow_buffer, .to_raw_balance, &.{maximum});
+    const panicked = try create_call(&h, create_input(&buffer, 9, 1, 6, overflow));
+    try testing.expect(panicked.status == .revert);
+    try testing.expectEqualSlices(u8, &panic_overflow, panicked.output);
     const fresh = try create_call(&h, create_input(&buffer, 8, 1, 6, null));
     try testing.expect(fresh.status == .success);
 }

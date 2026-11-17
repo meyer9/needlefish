@@ -355,6 +355,7 @@ fn run_init_calls(
         _ = asset.route(context, call, true) catch |err| switch (err) {
             error.Revert => {
                 if (context.revert_len != 0 and context.revert_custom) return error.Revert;
+                if (context.panicked()) return error.Revert;
                 return context.revert_word(error_init_call_failed, word(index));
             },
             else => |other| return other,
