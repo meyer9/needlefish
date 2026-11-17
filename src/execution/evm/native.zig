@@ -178,6 +178,10 @@ pub const Context = struct {
                 try writer.print("type check failed for \"{s}\" with data: ", .{parameters});
                 try native_abi.write_tuple_hex(writer, data, kinds);
             },
+            .short => try writer.print(
+                "type check failed for \"{s}\" with data: {x}",
+                .{ parameters, data },
+            ),
             .offset => |word| try writer.print(
                 "type check failed for \"offset (usize)\" with data: {x}",
                 .{&word},
@@ -243,7 +247,9 @@ pub const marker_code = [_]u8{0xef};
 /// G_sha3, the static KECCAK256 cost.
 const keccak256_gas: u64 = 30;
 
-pub const DecodeFailure = union(enum) { overrun, type_check, offset: [32]u8 };
+/// `short`: calldata below the interface's minimum length (alloy `SolInterface::
+/// abi_decode_validate`); the message names the interface, its data is the whole calldata.
+pub const DecodeFailure = union(enum) { overrun, type_check, offset: [32]u8, short };
 /// Longest parameter tuple signature in a type-check message.
 pub const parameters_length_max = 96;
 

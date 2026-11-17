@@ -559,6 +559,38 @@ test "op: PolicyRegistry rejects value and reports Beryl decode failures" {
     try testing.expectEqualSlices(u8, &expected, failed.output);
     const paid = try native_call(&h, policy.address, bad_type, 1);
     try testing.expectEqualSlices(u8, &native.selector_non_payable, paid.output);
+    // Calldata shorter than the V1 interface minimum (one word) fails the whole interface,
+    // with the calldata as data, before any argument decodes.
+    const short_input = policy_selector(.create_policy) ++ [_]u8{ 0xab, 0xcd };
+    const short = try native_call(&h, policy.address, &short_input, 0);
+    const short_message = "type check failed for \"IPolicyRegistryCalls\" with data: ";
+    var short_expected: [4 + short_message.len + 12]u8 = undefined;
+    _ = try std.fmt.bufPrint(&short_expected, "{s}{s}{x}", .{
+        &policy_selector(.create_policy),
+        short_message,
+        &short_input,
+    });
+    try testing.expectEqualSlices(u8, &short_expected, short.output);
+}
+
+test "op: B-20 factory calldata below the interface minimum fails the interface type check" {
+    var h: Harness = undefined;
+    try h.init(testing.allocator);
+    defer h.deinit(testing.allocator);
+    h.evm.block.op = .{ .upgrade = .beryl, .activation_admin = sender_address };
+    const selector = b20_factory.selector_of(.create_b20);
+    // 16 bytes, as in the fuzz finding: alloy reports the interface, not a field overrun.
+    const input = selector ++ @as([12]u8, @splat(0x11));
+    const beryl = try create_call(&h, &input);
+    try testing.expect(beryl.status == .revert);
+    const message = "type check failed for \"IB20FactoryCalls\" with data: ";
+    var expected: [4 + message.len + 32]u8 = undefined;
+    _ = try std.fmt.bufPrint(&expected, "{s}{s}{x}", .{ &selector, message, &input });
+    try testing.expectEqualSlices(u8, &expected, beryl.output);
+    // From Cobalt the error is the bare selector.
+    h.evm.block.op = .{ .upgrade = .cobalt, .activation_admin = sender_address };
+    const cobalt = try create_call(&h, &input);
+    try testing.expectEqualSlices(u8, &selector, cobalt.output);
 }
 
 fn policy_call(h: *Harness, input: []const u8) !transaction.Executed {

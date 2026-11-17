@@ -85,6 +85,10 @@ pub fn dispatch(context: *Context, input: []const u8) Error![]const u8 {
         if (std.mem.eql(u8, &function.selector, &selector)) break function;
     } else return context.revert_unknown(selector);
     assert(input.len >= 4);
+    // Every factory function takes arguments: shorter calldata fails the whole interface.
+    if (input.len < 4 + 32) {
+        return context.revert_decode(selector, "IB20FactoryCalls", .short, input, &.{});
+    }
     var failure: native.DecodeFailure = .overrun;
     const kinds = function.kinds;
     const arguments = abi.decode_arguments(input[4..], kinds, variant_max, &failure) orelse
