@@ -105,7 +105,7 @@ test "op: deposit whose value exceeds balance plus mint fails with its whole gas
     try testing.expectEqual(@as(u256, 5), try balance(&h, target));
 }
 
-test "op: deposits need OP rules and reject system transactions since Regolith" {
+test "op: deposits need OP rules; a system deposit since Regolith is a failed deposit" {
     var h: Harness = undefined;
     try h.init(testing.allocator);
     defer h.deinit(testing.allocator);
@@ -114,9 +114,15 @@ test "op: deposits need OP rules and reject system transactions since Regolith" 
     try testing.expectEqual(transaction.Invalid.type_not_supported, plain.invalid);
     h.evm.block.op = .{ .upgrade = .regolith };
     tx.is_system_transaction = true;
-    const system = try transaction.transact(&h.evm, .shanghai, &tx);
-    try testing.expectEqual(transaction.Invalid.deposit_system_transaction, system.invalid);
-    try testing.expectEqual(@as(u256, 0), try balance(&h, depositor));
+    // base/base: `validate_env` rejects it, `catch_error` includes it as a failed deposit
+    // (mint and nonce bump kept, no value transfer, the whole gas limit used).
+    const system = (try transaction.transact(&h.evm, .shanghai, &tx)).executed;
+    try testing.expectEqual(evm_module.Status.halt, system.status);
+    try testing.expectEqual(@as(u64, 100_000), system.gas_used);
+    try testing.expectEqual(@as(u256, 1_000), try balance(&h, depositor));
+    try testing.expectEqual(@as(u256, 0), try balance(&h, target));
+    const account = (try h.state.load(depositor)).info;
+    try testing.expectEqual(@as(u64, 1), account.nonce);
 }
 
 fn put_l1_block(h: *Harness) !void {

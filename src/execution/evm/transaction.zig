@@ -99,7 +99,6 @@ pub const Invalid = enum {
     blob_fee_too_low,
     authorization_empty,
     authorization_create,
-    deposit_system_transaction,
     /// EIP-8130 pre-call rejection (authorization, nonce, intrinsic gas, fees, payer).
     eip8130_rejected,
 };
@@ -418,10 +417,12 @@ fn execute_top(
 fn transact_deposit(comptime fork: Fork, evm: *Evm, tx: *const TxEnv) evm_module.Error!Result {
     assert(tx.tx_type == .deposit);
     const context = evm.block.op orelse return .{ .invalid = .type_not_supported };
-    if (context.rules().at_least(.regolith) and tx.is_system_transaction) {
-        return .{ .invalid = .deposit_system_transaction };
-    }
     evm.state.begin_transaction();
+    // base/base `validate_env` rejects a system deposit since Regolith, and `catch_error`
+    // turns that transaction error into a failed deposit like any other.
+    if (context.rules().at_least(.regolith) and tx.is_system_transaction) {
+        return .{ .executed = try fail_deposit(fork, evm, tx, .revert) };
+    }
     const intrinsic = intrinsic_gas(fork, tx);
     if (intrinsic.gas > tx.gas_limit or intrinsic.floor > tx.gas_limit) {
         return .{ .executed = try fail_deposit(fork, evm, tx, .out_of_gas) };
