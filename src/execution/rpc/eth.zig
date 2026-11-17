@@ -211,7 +211,7 @@ fn fee_history(api: *Api, call: *Call) HandlerError!void {
     const count = @min(try call.params.quantity(u64), fee_history_blocks_max);
     const newest = try resolve_number(api, call, try call.params.raw());
     const percentiles = try call.params.optional_raw();
-    const oldest = (newest + 1) -| count;
+    const oldest = @max((newest + 1) -| count, api.chain.genesis_number);
     const w = call.writer;
     try w.begin_object();
     try format.field_quantity(w, "oldestBlock", oldest);
@@ -383,12 +383,12 @@ fn resolve_number(api: *Api, call: *Call, raw: []const u8) HandlerError!u64 {
 fn resolve_number_text(api: *Api, call: *Call, text: []const u8) HandlerError!u64 {
     const head = head_header(api).number;
     if (std.mem.eql(u8, text, "latest") or std.mem.eql(u8, text, "pending")) return head;
-    if (std.mem.eql(u8, text, "earliest")) return 0;
+    if (std.mem.eql(u8, text, "earliest")) return api.chain.genesis_number;
     if (std.mem.eql(u8, text, "safe") or std.mem.eql(u8, text, "finalized")) {
         const fc = api.chain.forkchoice;
         const safe = std.mem.eql(u8, text, "safe");
         const hash = if (safe) fc.safe_block_hash else fc.finalized_block_hash;
-        const stored = api.chain.store.ref(hash.bytes) orelse return 0;
+        const stored = api.chain.store.ref(hash.bytes) orelse return api.chain.genesis_number;
         return stored.number;
     }
     const number = json.parse_quantity(u64, text) catch return error.InvalidParams;

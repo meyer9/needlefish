@@ -83,7 +83,9 @@ fn meter(api: *Api, call: *Call, hash: Hash) HandlerError!void {
         return call.fail(rpc.code.server_error, "block not found");
     };
     const header = stored.header;
-    if (header.number == 0) return call.fail(rpc.code.invalid_params, "genesis has no parent");
+    if (header.number <= chain.genesis_number) {
+        return call.fail(rpc.code.invalid_params, "genesis has no parent");
+    }
     var count: usize = 0;
     while (!stored.transactions.is_empty()) : (count += 1) {
         assert(count < chain.transactions_buffer.len); // Stored blocks fit the executor.

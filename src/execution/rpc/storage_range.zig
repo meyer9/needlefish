@@ -101,7 +101,9 @@ fn storage_range_at(api: *Api, call: *Call) HandlerError!void {
     var state_number = number;
     var state_hash = block_hash;
     if (transaction_index == 0 and count > 0) {
-        if (number == 0) return call.fail(rpc.code.invalid_params, "genesis has no parent");
+        if (number <= api.chain.genesis_number) {
+            return call.fail(rpc.code.invalid_params, "genesis has no parent");
+        }
         state_number = number - 1;
         state_hash = record.header.parent_hash.bytes;
     } else if (transaction_index < count) {

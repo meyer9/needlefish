@@ -328,7 +328,6 @@ pub const Chain = struct {
         genesis: *const Header,
         config: Config,
     ) !Chain {
-        assert(genesis.number == 0);
         if (!config.restoring) {
             assert(std.mem.eql(u8, &genesis.state_root.bytes, &(try db.root())));
         }
@@ -373,8 +372,8 @@ pub const Chain = struct {
         errdefer chain.recent_senders.deinit(allocator);
         const genesis_record = try chain.encode_record(genesis, &.{}, null, &.{}, &.{});
         try chain.store.put(ref_of(genesis, hash), genesis_record);
-        chain.store.set_canonical(0, hash);
-        db.set_block_hash(0, hash);
+        chain.store.set_canonical(genesis.number, hash);
+        db.set_block_hash(genesis.number, hash);
         return chain;
     }
 
@@ -904,11 +903,12 @@ pub const Chain = struct {
         var a = chain.store.ref(chain.state_hash) orelse return error.StateUnavailable;
         var b = chain.store.ref(target) orelse return error.StateUnavailable;
         while (!std.mem.eql(u8, &a.hash, &b.hash)) {
-            if (a.number >= b.number and a.number > 0) {
+            if (a.number >= b.number and a.number > chain.genesis_number) {
                 rollbacks += 1;
                 a = chain.store.ref(a.parent_hash) orelse return error.StateUnavailable;
             } else {
-                if (path_len == reexecute_max or b.number == 0) return error.StateUnavailable;
+                const at_genesis = b.number <= chain.genesis_number;
+                if (path_len == reexecute_max or at_genesis) return error.StateUnavailable;
                 path[path_len] = b.hash;
                 path_len += 1;
                 b = chain.store.ref(b.parent_hash) orelse return error.StateUnavailable;
@@ -964,7 +964,7 @@ pub const Chain = struct {
             }
             chain.store.set_canonical(cursor.number, cursor.hash);
             chain.prune_pool(cursor.hash);
-            if (cursor.number == 0) break;
+            if (cursor.number <= chain.genesis_number) break;
             cursor = chain.store.ref(cursor.parent_hash) orelse break;
         }
     }

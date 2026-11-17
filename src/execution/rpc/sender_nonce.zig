@@ -51,7 +51,7 @@ fn by_sender_and_nonce(api: *Api, call: *Call) HandlerError!void {
     var scanned: u64 = 0;
     while (scanned < scan_blocks_max) : (scanned += 1) {
         if (try write_in_block(api, call, number, sender, nonce)) return;
-        if (number == 0) break;
+        if (number <= api.chain.genesis_number) break;
         number -= 1;
     }
     try call.writer.null_value();

@@ -1971,7 +1971,7 @@ pub fn DatabaseType(comptime Storage: type) type {
 
         /// The oldest block the window can be rebuilt from: `head - window_blocks + 1`, or
         /// the state below the oldest canonical block whose changeset is still retained
-        /// (genesis is never unwound).
+        /// (genesis, at any number, is never unwound).
         fn history_rebuild_start(self: *const Self) u64 {
             const head = self.head_info.number;
             const window_blocks = self.config.history.?.window_blocks;
@@ -1980,7 +1980,8 @@ pub fn DatabaseType(comptime Storage: type) type {
             var start = head;
             while (start > lowest and start > 0) : (start -= 1) {
                 const hash = self.chain.canonical_hash(start) orelse break;
-                if (self.chain.block(hash) == null) break;
+                const view = self.chain.block(hash) orelse break;
+                if (std.mem.allEqual(u8, &view.meta.parent_hash, 0)) break; // Genesis.
             }
             assert(start >= lowest and start <= head);
             return start;

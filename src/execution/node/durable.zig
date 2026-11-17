@@ -11,8 +11,8 @@
 //!
 //! Lifecycle (storage callbacks only run from the caller's storage tick):
 //! `start` opens the storage, formatting it first when it holds no database, and reports
-//! `ready`. A fresh database gets the genesis allocation as block 0 (`bootstrap`). On a
-//! restart `retained` lists the canonical blocks for `Chain.restore`.
+//! `ready`. A fresh database gets the genesis allocation as the genesis block, whatever its
+//! number (`bootstrap`). On a restart `retained` lists the canonical blocks for `Chain.restore`.
 //!
 //! The format id carries the genesis hash prefix in its high 64 bits, so a datadir written
 //! for another chain is refused instead of silently reused.
@@ -138,8 +138,8 @@ pub fn Durable(comptime Storage: type) type {
             return self.database.head_info.present;
         }
 
-        /// Commits the genesis allocation as block 0 of a fresh database. Allocates a
-        /// temporary overlay sized from the allocation (startup only).
+        /// Commits the genesis allocation as the genesis block (any number) of a fresh
+        /// database. Allocates a temporary overlay sized from the allocation (startup only).
         pub fn bootstrap(
             self: *Self,
             allocator: std.mem.Allocator,

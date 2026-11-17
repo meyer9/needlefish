@@ -535,7 +535,9 @@ fn trace_block(
     reserved: usize,
 ) HandlerError!void {
     const chain = api.chain;
-    if (header.number == 0) return call.fail(rpc.code.invalid_params, "genesis has no parent");
+    if (header.number <= chain.genesis_number) {
+        return call.fail(rpc.code.invalid_params, "genesis has no parent");
+    }
     var list = transactions_in;
     var count: u32 = 0;
     while (!list.is_empty()) : (count += 1) {
