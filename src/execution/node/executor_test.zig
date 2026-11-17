@@ -348,6 +348,45 @@ test "executor: L2 deposit mints, records its nonce, and fees go to the vaults" 
     try testing.expectError(error.TxTypeNotSupported, rejected);
 }
 
+/// Base devnet with only Regolith active (before Canyon).
+const regolith_spec: chainspec.ChainSpec = blk: {
+    var result = chainspec.ChainSpec.presets.base_devnet;
+    result.upgrades = @splat(null);
+    result.upgrades[@backingInt(chainspec.Upgrade.regolith)] = 0;
+    break :blk result;
+};
+
+test "executor: a Regolith receipts root leaves out the deposit nonce (base/base)" {
+    var f: Fixture = undefined;
+    try f.init_with(&regolith_spec);
+    defer f.deinit();
+    const deposit: consensus.Envelope = .{ .deposit = .{
+        .source_hash = .{ .bytes = @splat(1) },
+        .from = .{ .bytes = @splat(0xde) },
+        .to = .{ .call = .{ .bytes = @splat(0x33) } },
+        .mint = 5000,
+        .value = 0,
+        .gas_limit = 100_000,
+        .is_system_transaction = false,
+        .input = &.{},
+    } };
+    var deposit_buffer: [256]u8 = undefined;
+    const deposit_raw = deposit.encode_to(&deposit_buffer);
+    const out = try f.executor.execute_block(&block_env(1), &.{deposit_raw}, &.{});
+    // The stored receipt keeps the nonce; only the root's encoding drops it.
+    var receipt = out.receipts[0];
+    try testing.expectEqual(@as(?u64, 0), receipt.deposit_nonce);
+    try testing.expectEqual(@as(?u64, null), receipt.deposit_receipt_version);
+    var bytes: [1024]u8 = undefined;
+    var items: [1][]const u8 = undefined;
+    const scratch: consensus.block.RootScratch = .{ .bytes = &bytes, .items = &items };
+    const with_nonce = consensus.block.receipts_root(&.{receipt}, scratch);
+    receipt.deposit_nonce = null;
+    const without_nonce = consensus.block.receipts_root(&.{receipt}, scratch);
+    try testing.expect(!with_nonce.eql(without_nonce));
+    try testing.expectEqualSlices(u8, &without_nonce.bytes, &out.receipts_root);
+}
+
 const eip8130 = consensus.tx.eip8130;
 
 /// Base devnet with every upgrade through Everest active at genesis.
