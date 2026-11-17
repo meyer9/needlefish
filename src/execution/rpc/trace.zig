@@ -374,6 +374,7 @@ pub fn parse_options(raw: ?[]const u8) error{ InvalidParams, Unsupported }!Optio
     while (true) {
         const name = scanner.next() catch return error.InvalidParams;
         if (name.tag == .object_end) break;
+        if (name.tag != .string) return error.InvalidParams;
         const value = scanner.next() catch return error.InvalidParams;
         if (std.mem.eql(u8, name.bytes, "tracer")) {
             if (value.tag != .string) return error.InvalidParams;
@@ -397,7 +398,10 @@ fn parse_config(scanner: *json.Scanner, options: *Options) error{InvalidParams}!
     while (true) {
         const name = scanner.next() catch return error.InvalidParams;
         if (name.tag == .object_end) return;
+        if (name.tag != .string) return error.InvalidParams;
         const value = scanner.next() catch return error.InvalidParams;
+        // A container value is skipped whole, so the next token read is a member name.
+        scanner.skip(value) catch return error.InvalidParams;
         const flag = value.tag == .true;
         if (std.mem.eql(u8, name.bytes, "onlyTopCall")) {
             options.only_top_call = flag;
@@ -405,8 +409,6 @@ fn parse_config(scanner: *json.Scanner, options: *Options) error{InvalidParams}!
             options.with_logs = flag;
         } else if (std.mem.eql(u8, name.bytes, "diffMode")) {
             options.diff_mode = flag;
-        } else {
-            scanner.skip(value) catch return error.InvalidParams;
         }
     }
 }

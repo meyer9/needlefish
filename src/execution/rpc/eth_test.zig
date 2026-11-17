@@ -898,6 +898,26 @@ test "eth: fuzz_coverage exists only in a coverage build" {
     try expect_contains(try h.request("fuzz_coverage", "[]"), "\"code\":-32601");
 }
 
+test "eth: block objects refuse unknown members instead of spinning" {
+    const h = try Harness.create();
+    defer h.destroy();
+    const address = "\"0x833b738e23eb9ba1529e0d93ff98ba38dbb503bf\"";
+    // An unknown member whose value is a container once left the member loop reading the
+    // scanner's end token forever.
+    for ([_][]const u8{ "{\"a\":[]}", "{\"accessList\":[]}", "{\"a\":1}", "{}" }) |block| {
+        var body: [256]u8 = undefined;
+        const text = try std.fmt.bufPrint(&body, request_prefix_format ++
+            "eth_getBalance\",\"params\":[{s},{s}]}}", .{ address, block });
+        try expect_contains(try h.request_runtime(text), "\"code\":-32602");
+    }
+    const by_number = try h.request("eth_getBalance", "[" ++ address ++
+        ",{\"blockNumber\":\"0x0\"}]");
+    try expect_contains(by_number, "\"result\":\"0x");
+    const config = try h.request("debug_traceCall", "[{}, \"latest\"," ++
+        "{\"tracer\":\"callTracer\",\"tracerConfig\":{\"onlyTopCall\":[],\"x\":1}}]");
+    try expect_contains(config, "\"result\"");
+}
+
 fn fuzz_body(h: *Harness, body: []const u8) !void {
     var out: std.Io.Writer = .fixed(&h.out);
     const outcome = eth.Router.handle(&h.api, body, &out);

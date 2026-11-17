@@ -184,6 +184,7 @@ fn parse_bundle(raw: []const u8, space: []u8, bundle: *Bundle) HandlerError!void
     while (true) {
         const name = scanner.next() catch return error.InvalidParams;
         if (name.tag == .object_end) break;
+        if (name.tag != .string) return error.InvalidParams;
         const value = scanner.next() catch return error.InvalidParams;
         if (!std.mem.eql(u8, name.bytes, "txs")) return error.InvalidParams;
         if (value.tag != .array_begin) return error.InvalidParams;

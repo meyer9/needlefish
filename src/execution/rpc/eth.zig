@@ -541,24 +541,49 @@ pub fn resolve_block(api: *Api, call: *Call, raw: []const u8) HandlerError!Hash 
         return hash;
     }
     if (raw.len > 0 and raw[0] == '{') {
-        var scanner = json.Scanner.init(raw);
-        if ((try scanner_next(&scanner)).tag != .object_begin) return error.InvalidParams;
-        while (true) {
-            const token = try scanner_next(&scanner);
-            if (token.tag == .object_end) return error.InvalidParams;
-            const value = try scanner_next(&scanner);
-            if (!std.mem.eql(u8, token.bytes, "blockHash")) continue;
-            const hash = json.parse_fixed(32, value.bytes) catch return error.InvalidParams;
-            if (api.chain.store.ref(hash) == null) {
-                return call.fail(rpc.code.server_error, "block not found");
-            }
-            return hash;
-        }
+        return resolve_block_object(api, call, raw);
     }
     const number = try resolve_number(api, call, raw);
     return api.chain.store.canonical_hash(number) orelse {
         return call.fail(rpc.code.server_error, "block not found");
     };
+}
+
+/// An EIP-1898 block object: `blockHash` (with an optional boolean `requireCanonical`) or
+/// `blockNumber`. Any other member is refused, as alloy's `BlockId` refuses unknown fields.
+fn resolve_block_object(api: *Api, call: *Call, raw: []const u8) HandlerError!Hash {
+    var scanner = json.Scanner.init(raw);
+    if ((try scanner_next(&scanner)).tag != .object_begin) return error.InvalidParams;
+    var hash: ?Hash = null;
+    var number: ?[]const u8 = null;
+    while (true) {
+        const name = try scanner_next(&scanner);
+        if (name.tag == .object_end) break;
+        if (name.tag != .string) return error.InvalidParams;
+        const value = try scanner_next(&scanner);
+        if (std.mem.eql(u8, name.bytes, "requireCanonical")) {
+            if (value.tag != .true and value.tag != .false) return error.InvalidParams;
+            continue;
+        }
+        if (value.tag != .string) return error.InvalidParams;
+        if (hash != null or number != null) return error.InvalidParams;
+        if (std.mem.eql(u8, name.bytes, "blockHash")) {
+            hash = json.parse_fixed(32, value.bytes) catch return error.InvalidParams;
+        } else if (std.mem.eql(u8, name.bytes, "blockNumber")) {
+            number = value.bytes;
+        } else return error.InvalidParams;
+    }
+    if (number) |text| {
+        const resolved = try resolve_number_text(api, call, text);
+        return api.chain.store.canonical_hash(resolved) orelse {
+            return call.fail(rpc.code.server_error, "block not found");
+        };
+    }
+    const found = hash orelse return error.InvalidParams;
+    if (api.chain.store.ref(found) == null) {
+        return call.fail(rpc.code.server_error, "block not found");
+    }
+    return found;
 }
 
 fn resolve_number(api: *Api, call: *Call, raw: []const u8) HandlerError!u64 {
@@ -773,6 +798,7 @@ pub fn parse_call(space: []u8, raw: []const u8) HandlerError!node.executor.Execu
     while (true) {
         const name = try scanner_next(&scanner);
         if (name.tag == .object_end) break;
+        if (name.tag != .string) return error.InvalidParams;
         const value = try scanner_next(&scanner);
         if (value.tag == .null) continue;
         const text = value.bytes;
@@ -1075,6 +1101,7 @@ pub fn parse_filter(api: *Api, raw: []const u8) HandlerError!Filter {
     while (true) {
         const name = try scanner_next(&scanner);
         if (name.tag == .object_end) break;
+        if (name.tag != .string) return error.InvalidParams;
         const value = try scanner_next(&scanner);
         if (std.mem.eql(u8, name.bytes, "fromBlock") or std.mem.eql(u8, name.bytes, "toBlock")) {
             if (value.tag != .string) return error.InvalidParams;
