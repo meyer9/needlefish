@@ -281,9 +281,9 @@ fn warm_addresses(comptime fork: Fork, evm: *Evm, tx: *const TxEnv) state_module
     if (tx.to) |to| _ = try evm.state.access(to);
     try warm_system_addresses(fork, evm);
     for (tx.access_list) |item| {
-        const access = try evm.state.access(item.address);
+        _ = try evm.state.access(item.address);
         for (item.storage_keys) |key| {
-            _ = try evm.state.storage_access(access.account, primitives.b256_to_u256(key));
+            try evm.state.warm_listed_slot(item.address, primitives.b256_to_u256(key));
         }
     }
 }

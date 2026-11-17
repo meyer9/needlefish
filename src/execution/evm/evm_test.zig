@@ -355,6 +355,45 @@ test "transaction: value transfer pays fees and tip" {
     try std.testing.expectEqual(@as(u256, 21_000 * 2), (try h.state.load(coinbase)).info.balance);
 }
 
+test "transaction: access-list storage keys are warm without being read" {
+    var h: Harness = undefined;
+    try h.init(std.testing.allocator);
+    defer h.deinit(std.testing.allocator);
+    try h.database.put_account(caller, 1_000_000_000, 0, &.{});
+    // `other` stops at once; `contract` reads slot 5 (SLOAD then STOP).
+    try h.database.put_account(other, 0, 1, &.{op.STOP});
+    try h.database.put_account(contract, 0, 1, &.{ op.PUSH1, 5, op.SLOAD, op.STOP });
+    const key: primitives.B256 = primitives.u256_to_b256(5);
+    var tx = transaction.TxEnv{
+        .tx_type = .eip2930,
+        .caller = caller,
+        .gas_limit = 100_000,
+        .gas_price = 1,
+        .to = other,
+    };
+    const unread = [_]transaction.AccessListItem{.{ .address = other, .storage_keys = &.{key} }};
+    tx.access_list = &unread;
+    const skipped = (try transact(&h, &tx)).executed;
+    try std.testing.expectEqual(evm_module.Status.success, skipped.status);
+    // Never read: a stateless witness without the slot still executes (mainnet 58525016).
+    const unread_key = state_module.StorageKey{ .address = other, .slot = 5 };
+    try std.testing.expect(h.state.slots.getPtr(unread_key) == null);
+    // A listed slot the code reads costs a warm SLOAD (100), not a cold one (2100).
+    const read = [_]transaction.AccessListItem{.{ .address = contract, .storage_keys = &.{key} }};
+    tx = .{
+        .tx_type = .eip2930,
+        .caller = caller,
+        .nonce = 1,
+        .gas_limit = 100_000,
+        .gas_price = 1,
+        .to = contract,
+        .access_list = &read,
+    };
+    const warm = (try transact(&h, &tx)).executed;
+    try std.testing.expectEqual(evm_module.Status.success, warm.status);
+    try std.testing.expectEqual(@as(u64, 21_000 + 2_400 + 1_900 + 3 + 100), warm.gas_used);
+}
+
 test "transaction: invalid transactions change nothing" {
     var h: Harness = undefined;
     try h.init(std.testing.allocator);
