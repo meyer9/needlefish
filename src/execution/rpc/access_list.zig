@@ -1,10 +1,11 @@
-//! `eth_createAccessList(call, block?)` (geth): runs the call, collects the accounts and
-//! slots it warms beyond the pre-warmed set (`node.access_list`), and repeats with that
-//! list until it stops changing (at most `rounds_max` runs; geth has no bound). Returns
-//! `{accessList, gasUsed, error?}` where `gasUsed` is the last run's gas with the list
-//! applied and `error` the revert message. A request's own `accessList` is not used as
-//! the starting point (the result converges to the same list). Buffers are carved from
-//! the API scratch after the call data (and before a historical call's proof tail).
+//! `eth_createAccessList(call, block?, stateOverrides?)` (geth): runs the call, collects
+//! the accounts and slots it warms beyond the pre-warmed set (`node.access_list`), and
+//! repeats with that list until it stops changing (at most `rounds_max` runs; geth has no
+//! bound). Returns `{accessList, gasUsed, error?}` where `gasUsed` is the last run's gas
+//! with the list applied and `error` reth's text for its revert or halt (`call_error`). A
+//! request's own `accessList` is not used as the starting point (the result converges to
+//! the same list). Buffers are carved from the API scratch after the call data and
+//! override space (and before a historical call's proof tail).
 
 const std = @import("std");
 const assert = std.debug.assert;
@@ -13,6 +14,7 @@ const json = @import("../../utilities/json/root.zig");
 const evm = @import("../evm/root.zig");
 const node = @import("../node/root.zig");
 const eth = @import("eth.zig");
+const call_error = @import("call_error.zig");
 
 const Api = eth.Api;
 const Call = rpc.Call;
@@ -40,12 +42,15 @@ const Buffers = struct {
 
 fn create_access_list(api: *Api, call: *Call) HandlerError!void {
     var request = try eth.parse_call_request(api, call);
+    // reth's third parameter: state overrides (no block overrides).
+    const state_overrides = try call.params.optional_raw();
+    try call.params.finish();
+    try eth.set_overrides(api, call, &request, state_overrides, null);
     const buffers = carve_buffers(api, request) orelse
         return call.fail(rpc.code.internal_error, "scratch too small");
     var collector: node.access_list.Collector = .{ .entries = buffers.current };
     var previous_len: usize = 0;
-    var gas_used: u64 = 0;
-    var reverted = false;
+    var last: Executed = undefined;
     for (0..rounds_max) |round| {
         const previous = buffers.previous[0..previous_len];
         request.message.access_list = node.access_list.to_items(
@@ -54,31 +59,34 @@ fn create_access_list(api: *Api, call: *Call) HandlerError!void {
             buffers.keys,
         ) catch unreachable; // Proof: items and keys hold as many as the entry buffers.
         request.message.collect = &collector;
-        switch (try eth.simulate(api, call, request)) {
-            .invalid => |reason| return call.fail(rpc.code.server_error, @tagName(reason)),
-            .executed => |executed| {
-                gas_used = executed.gas_used;
-                reverted = !executed.success;
-            },
-        }
+        last = switch (try eth.simulate(api, call, request)) {
+            .invalid => |reason| return eth.fail_invalid(call, reason),
+            .executed => |executed| executed,
+        };
         if (collector.overflow) return call.fail(rpc.code.server_error, "access list too large");
         if (collector.eql(previous) or round + 1 == rounds_max) break;
         @memcpy(buffers.previous[0..collector.len], collector.slice());
         previous_len = collector.len;
     }
-    try write_result(call.writer, buffers.previous[0..previous_len], gas_used, reverted);
+    // The item and key buffers are done with: the error text goes there.
+    const text_buffer = std.mem.sliceAsBytes(buffers.keys);
+    const failure: ?[]const u8 = if (last.success)
+        null
+    else if (last.exit.status() == .revert)
+        call_error.revert_message(text_buffer, last.output)
+    else
+        call_error.halt(text_buffer, last.exit, last.gas_used).message;
+    try write_result(call.writer, buffers.previous[0..previous_len], last.gas_used, failure);
 }
 
-/// The list buffers, after the parsed call data and before a historical call's proofs.
+const Executed = @FieldType(node.executor.Executor.Simulated, "executed");
+
+/// The list buffers, after the parsed call data and override space and before a
+/// historical call's proofs.
 fn carve_buffers(api: *Api, request: eth.CallRequest) ?Buffers {
     const scratch = api.scratch;
-    const base = @intFromPtr(scratch.ptr);
-    const data = request.message.data;
-    var start: usize = 0;
-    const data_address = @intFromPtr(data.ptr);
-    if (data.len > 0 and data_address >= base and data_address < base + scratch.len) {
-        start = data_address - base + data.len;
-    }
+    // After the call data and the override code space.
+    const start = eth.scratch_used(api, &request);
     const end = switch (request.view) {
         .head => scratch.len,
         .historical => eth.proof_tail_offset(api).?, // Checked when parsed.
@@ -112,7 +120,7 @@ fn write_result(
     w: *json.Writer,
     entries: []const Entry,
     gas_used: u64,
-    reverted: bool,
+    failure: ?[]const u8,
 ) HandlerError!void {
     try w.begin_object();
     try w.key("accessList");
@@ -142,9 +150,9 @@ fn write_result(
     try w.end_array();
     try w.key("gasUsed");
     try w.quantity(gas_used);
-    if (reverted) {
+    if (failure) |text| {
         try w.key("error");
-        try w.string("execution reverted");
+        try w.string(text);
     }
     try w.end_object();
 }

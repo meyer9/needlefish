@@ -24,6 +24,10 @@ const HandlerError = rpc.HandlerError;
 const Chain = node.Chain;
 
 pub const estimate_iterations_max = 64;
+/// reth's default RPC gas cap (`--rpc.gascap`, `RPC_DEFAULT_GAS_CAP`): the most gas a call
+/// (eth_call, eth_estimateGas, eth_createAccessList, debug_traceCall, eth_simulateV1) runs
+/// with, whatever it or a block override asks for.
+pub const rpc_gas_cap: u64 = 50_000_000;
 pub const logs_blocks_max = 10_000;
 pub const logs_max = 10_000;
 pub const fee_history_blocks_max = 1024;
@@ -66,6 +70,8 @@ const state_view = @import("state_view.zig");
 const eth_proof = @import("eth_proof.zig");
 const simulate_module = @import("simulate.zig");
 const evm = @import("../evm/root.zig");
+const call_error = @import("call_error.zig");
+const call_fees = @import("call_fees.zig");
 
 const core_methods = [_]rpc.Method(*Api){
     .{ .name = "web3_clientVersion", .handler = client_version },
@@ -828,6 +834,8 @@ pub fn parse_call(space: []u8, raw: []const u8) HandlerError!node.executor.Execu
 pub const CallRequest = struct {
     message: node.executor.Executor.Call,
     view: state_view.View,
+    /// The request's fee fields (`call_fees`), applied when the call runs.
+    fees: call_fees.Fees = .{},
     /// Raw geth `stateOverrides` / `blockOverrides` objects (see `set_overrides`).
     state_overrides: ?[]const u8 = null,
     block_overrides: ?[]const u8 = null,
@@ -874,19 +882,65 @@ pub fn set_overrides(
     const size = state.len / 2 + 32;
     if (start + size > end) return call.fail(rpc.code.invalid_params, "overrides too large");
     request.override_space = api.scratch[start..][0..size];
+    if (try simulate_module.both_state_and_diff(state)) |address| {
+        // reth `EthApiError::BothStateAndStateDiffInOverride`; the call data is done with.
+        const message = simulate_module.both_state_message(api.scratch, address);
+        return call.fail(rpc.code.invalid_params, message);
+    }
 }
 
-const Overrides = struct {
-    raw: []const u8,
-    space: []u8,
+/// The executor's `prepare` hook of an RPC call: applies the state overrides, then for a
+/// priced call reads the caller's gas allowance and caps the gas with it (reth
+/// `caller_gas_allowance` in `prepare_call_env` and the estimate).
+pub const Prepared = struct {
+    raw: []const u8 = "",
+    space: []u8 = &.{},
     failure: ?simulate_module.OverrideError = null,
+    gas_price: u256 = 0,
+    cap: Cap = .none,
+    /// Records whether the callee has code (eth_estimateGas's transfer test).
+    check_callee: bool = false,
+    callee_code: bool = false,
+    /// The caller's balance, read when `cap` is set.
+    balance: u256 = 0,
+    /// What the caller can afford; null when the balance does not cover `value`.
+    allowance: ?u64 = null,
 
-    fn run(context: *anyopaque, state: *evm.State) void {
-        const overrides: *Overrides = @ptrCast(@alignCast(context));
-        simulate_module.apply_state_overrides(state, overrides.space, overrides.raw) catch |err|
-            {
-                overrides.failure = err;
-            };
+    pub const Cap = enum {
+        none,
+        /// Caps the gas the call was given (an eth_call that named none).
+        allowance,
+    };
+
+    fn run(context: *anyopaque, state: *evm.State, message: *node.executor.Executor.Call) void {
+        const prepared: *Prepared = @ptrCast(@alignCast(context));
+        prepared.apply(state, message) catch |err| {
+            prepared.failure = err;
+        };
+    }
+
+    fn apply(
+        prepared: *Prepared,
+        state: *evm.State,
+        message: *node.executor.Executor.Call,
+    ) simulate_module.OverrideError!void {
+        if (prepared.raw.len > 0) {
+            try simulate_module.apply_state_overrides(state, prepared.space, prepared.raw);
+        }
+        if (prepared.check_callee) if (message.to) |to| {
+            prepared.callee_code = (try state.load(to)).info.has_code();
+        };
+        if (prepared.cap == .none) return;
+        assert(prepared.gas_price > 0);
+        const caller = try state.load(message.from);
+        prepared.balance = caller.info.balance;
+        const balance = caller.info.balance;
+        prepared.allowance = call_fees.allowance(balance, message.value, prepared.gas_price);
+        message.gas = @min(message.gas.?, prepared.allowance orelse 0);
+    }
+
+    fn hooked(prepared: *const Prepared) bool {
+        return prepared.raw.len > 0 or prepared.check_callee or prepared.cap != .none;
     }
 };
 
@@ -899,7 +953,8 @@ pub fn parse_call_request(api: *Api, call: *Call) HandlerError!CallRequest {
             return call.fail(rpc.code.internal_error, "proof scratch too small");
         }],
     };
-    return .{ .message = try parse_call(space, call_raw), .view = view };
+    const message = try parse_call(space, call_raw);
+    return .{ .message = message, .view = view, .fees = try call_fees.parse(call_raw) };
 }
 
 /// Where the proof buffers of a historical call start (aligned, at the scratch tail).
@@ -920,29 +975,110 @@ pub fn view_header(api: *Api, view: state_view.View) consensus.Header {
     };
 }
 
-pub fn simulate(
+/// The block a call request runs in: the next one after its view, with block overrides.
+pub fn request_env(
     api: *Api,
     call: *Call,
-    request: CallRequest,
-) HandlerError!node.executor.Executor.Simulated {
+    request: *const CallRequest,
+) HandlerError!node.executor.BlockEnv {
     const header = view_header(api, request.view);
     var env = node.chain.env_of(&header);
     env.number += 1;
     env.timestamp += 1;
     env.parent_hash = header.hash().bytes;
     if (request.block_overrides) |raw| try simulate_module.apply_block_overrides(call, &env, raw);
+    assert(env.number == header.number + 1 or request.block_overrides != null);
+    return env;
+}
+
+/// The prices of a call under `base_fee` (reth `CallFees::ensure_fees`).
+pub fn call_prices(call: *Call, fees: call_fees.Fees, base_fee: u64) HandlerError!call_fees.Prices {
+    return switch (call_fees.ensure(fees, base_fee)) {
+        .prices => |prices| prices,
+        .failure => |failure| call.fail(failure.code, failure.message),
+    };
+}
+
+/// Runs a call request as reth's `prepare_call_env` sets it up: priced by its fee fields
+/// (an unpriced call runs with a zero base fee), and when priced without a gas limit
+/// capped at what the caller can afford.
+pub fn simulate(
+    api: *Api,
+    call: *Call,
+    request: CallRequest,
+) HandlerError!node.executor.Executor.Simulated {
+    const env = try request_env(api, call, &request);
+    const prices = try call_prices(call, request.fees, env.base_fee);
     var message = request.message;
-    var overrides: Overrides = .{ .raw = "", .space = request.override_space };
-    if (request.state_overrides) |raw| {
-        overrides.raw = raw;
-        message.prepare = .{ .context = &overrides, .run = Overrides.run };
+    message.gas_price = prices.gas_price;
+    message.priority_fee = prices.priority_fee;
+    message.keep_base_fee = prices.gas_price != 0;
+    var prepared: Prepared = .{
+        .raw = request.state_overrides orelse "",
+        .space = request.override_space,
+        .gas_price = prices.gas_price,
+    };
+    // The gas cap bounds a given gas silently and is the default; the block's gas limit
+    // does not bound it (reth `prepare_call_env`) unless the allowance caps the default.
+    message.gas = @min(request.message.gas orelse rpc_gas_cap, rpc_gas_cap);
+    if (request.message.gas == null and prices.gas_price > 0) {
+        message.gas = @min(rpc_gas_cap, env.gas_limit);
+        prepared.cap = .allowance;
     }
-    const simulated = try simulate_in(api, call, request.view, &env, message);
-    if (overrides.failure) |failure| switch (failure) {
+    return run_prepared(api, call, request.view, &env, message, &prepared);
+}
+
+/// Runs `message` with the `prepare` hook `prepared`, failing on its override or funds error.
+pub fn run_prepared(
+    api: *Api,
+    call: *Call,
+    view: state_view.View,
+    env: *const node.executor.BlockEnv,
+    message_in: node.executor.Executor.Call,
+    prepared: *Prepared,
+) HandlerError!node.executor.Executor.Simulated {
+    var message = message_in;
+    assert(message.prepare == null);
+    if (prepared.hooked()) message.prepare = .{ .context = prepared, .run = Prepared.run };
+    const simulated = try simulate_in(api, call, view, env, message);
+    if (prepared.failure) |failure| switch (failure) {
         error.InvalidParams => return error.InvalidParams,
         else => return call.fail(rpc.code.invalid_params, "invalid state override"),
     };
+    if (prepared.cap != .none and prepared.allowance == null) {
+        // reth `InsufficientFunds` from `caller_gas_allowance`; the call data is done with.
+        const message_text = std.fmt.bufPrint(
+            api.scratch,
+            "insufficient funds for gas * price + value: have {d} want {d}",
+            .{ prepared.balance, message.value },
+        ) catch "insufficient funds for gas * price + value";
+        return call.fail(call_error.code_transaction_rejected, message_text);
+    }
     return simulated;
+}
+
+/// Fails with reth's error for a call the EVM rejected.
+pub fn fail_invalid(call: *Call, reason: evm.transaction.Invalid) HandlerError {
+    const failure = call_error.invalid(reason);
+    return call.fail(failure.code, failure.message);
+}
+
+/// Fails with reth's error for a call that reverted (code 3, the output as data) or halted
+/// with `gas_limit`. The text goes to the scratch, whose call data is done with.
+pub fn fail_executed(
+    api: *Api,
+    call: *Call,
+    output: []const u8,
+    exit: evm.evm.Exit,
+    gas_limit: u64,
+) HandlerError {
+    assert(exit.status() != .success);
+    if (exit.status() == .revert) {
+        const message = call_error.revert_message(api.scratch, output);
+        return call.fail_data(call_error.code_execution_error, message, output);
+    }
+    const failure = call_error.halt(api.scratch, exit, gas_limit);
+    return call.fail(failure.code, failure.message);
 }
 
 fn simulate_in(
@@ -987,9 +1123,11 @@ fn eth_call(api: *Api, call: *Call) HandlerError!void {
     try call.params.finish();
     try set_overrides(api, call, &request, state_overrides, block_overrides);
     switch (try simulate(api, call, request)) {
-        .invalid => |reason| return call.fail(rpc.code.server_error, @tagName(reason)),
+        .invalid => |reason| return fail_invalid(call, reason),
         .executed => |executed| {
-            if (!executed.success) return call.fail(3, "execution reverted");
+            if (!executed.success) {
+                return fail_executed(api, call, executed.output, executed.exit, executed.gas_used);
+            }
             try call.writer.data(executed.output);
         },
     }
@@ -1009,7 +1147,7 @@ fn eip8130_request(
     return true;
 }
 
-/// Binary search for the smallest gas limit that succeeds, bounded by the block limit.
+/// reth's estimate (`estimate.zig`).
 fn estimate_gas(api: *Api, call: *Call) HandlerError!void {
     if (try eip8130_request(api, call, .estimate)) return;
     var request = try parse_call_request(api, call);
@@ -1017,28 +1155,7 @@ fn estimate_gas(api: *Api, call: *Call) HandlerError!void {
     const block_overrides = try call.params.optional_raw();
     try call.params.finish();
     try set_overrides(api, call, &request, state_overrides, block_overrides);
-    const header = view_header(api, request.view);
-    var env = node.chain.env_of(&header);
-    env.timestamp += 1; // As `simulate` runs it: in the next block.
-    var high = request.message.gas orelse api.chain.executor.default_call_gas(&env);
-    request.message.gas = high;
-    const first = try simulate(api, call, request);
-    switch (first) {
-        .invalid => |reason| return call.fail(rpc.code.server_error, @tagName(reason)),
-        .executed => |e| if (!e.success) return call.fail(3, "execution reverted"),
-    }
-    var low: u64 = first.executed.gas_used - 1;
-    var iterations: u32 = 0;
-    while (low + 1 < high and iterations < estimate_iterations_max) : (iterations += 1) {
-        const middle = low + (high - low) / 2;
-        request.message.gas = middle;
-        const ok = switch (try simulate(api, call, request)) {
-            .invalid => false,
-            .executed => |e| e.success,
-        };
-        if (ok) high = middle else low = middle;
-    }
-    try call.writer.quantity(high);
+    try call.writer.quantity(try @import("estimate.zig").estimate(api, call, &request));
 }
 
 // ---- Logs -------------------------------------------------------------------------
@@ -1224,6 +1341,9 @@ pub fn block_logs(
 }
 
 test {
+    _ = @import("call_error.zig");
+    _ = @import("call_fees.zig");
+    _ = @import("simulate_schedule.zig");
     _ = @import("eth_config.zig");
     _ = @import("access_list.zig");
     _ = @import("simulate.zig");

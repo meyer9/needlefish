@@ -75,6 +75,16 @@ pub const TxEnv = struct {
     /// An unsigned call (eth_call, eth_simulateV1): a sender with code may call, as geth
     /// and reth allow. EIP-3607 rejects it only for signed transactions.
     skip_sender_code_check: bool = false,
+    /// An unvalidated RPC call (eth_call, eth_estimateGas, eth_simulateV1): no base-fee
+    /// check, no balance check, no fee charged or paid (revm's `disable_base_fee` and
+    /// `disable_fee_charge`, which reth sets for calls). A balance short of `value` halts
+    /// the call (`out_of_funds`) as revm's first frame does.
+    disable_fee_charge: bool = false,
+    /// An RPC call: no EIP-7825 per-transaction gas cap (reth lifts it for calls).
+    disable_tx_gas_cap: bool = false,
+    /// An RPC call: its gas may exceed the block's (revm `disable_block_gas_limit`, which
+    /// reth's `prepare_call_env` sets; the RPC gas cap bounds it instead).
+    disable_block_gas_limit: bool = false,
 };
 
 pub const Invalid = enum {
@@ -205,15 +215,21 @@ fn type_supported(comptime fork: Fork, tx_type: TxType) bool {
 /// Checks that need no state.
 fn validate_env(comptime fork: Fork, evm: *const Evm, tx: *const TxEnv) ?Invalid {
     if (!type_supported(fork, tx.tx_type)) return .type_not_supported;
-    if (fork.at_least(.osaka) and tx.gas_limit > tx_gas_limit_cap) return .gas_cap_exceeded;
+    if (fork.at_least(.osaka) and !tx.disable_tx_gas_cap and tx.gas_limit > tx_gas_limit_cap) {
+        return .gas_cap_exceeded;
+    }
     if (tx.chain_id) |chain_id| {
         if (chain_id != evm.config.chain_id) return .chain_id_mismatch;
     }
-    if (tx.gas_limit > evm.block.gas_limit) return .gas_limit_too_high;
+    if (!tx.disable_block_gas_limit and tx.gas_limit > evm.block.gas_limit) {
+        return .gas_limit_too_high;
+    }
     if (tx.gas_priority_fee) |priority| {
         if (priority > tx.gas_price) return .priority_fee_above_max_fee;
     }
-    if (fork.at_least(.london) and tx.gas_price < evm.block.base_fee) return .fee_below_base_fee;
+    if (fork.at_least(.london) and !tx.disable_fee_charge and tx.gas_price < evm.block.base_fee) {
+        return .fee_below_base_fee;
+    }
     if (fork.at_least(.shanghai) and tx.to == null) {
         if (tx.data.len > evm.config.initcode_size_max) return .initcode_too_large;
     }
@@ -261,6 +277,11 @@ fn validate_and_buy_gas(
     if (sender.info.nonce == std.math.maxInt(u64)) return .nonce_overflow;
     if (tx.nonce < sender.info.nonce) return .nonce_too_low;
     if (tx.nonce > sender.info.nonce) return .nonce_too_high;
+    if (tx.disable_fee_charge) {
+        if (tx.to != null) try evm.state.set_nonce(sender, sender.info.nonce + 1);
+        try evm.state.touch(sender);
+        return null;
+    }
     // OP Stack: the L1 data fee and the upfront operator fee count toward the balance.
     const op_cost: u512 = if (fees) |f| @as(u512, f.l1) + f.operator_charge else 0;
     const max_cost = @as(u512, tx.gas_limit) * tx.gas_price + tx.value +
@@ -391,7 +412,7 @@ pub fn transact_fork(comptime fork: Fork, evm: *Evm, tx: *const TxEnv) evm_modul
     const intrinsic = intrinsic_gas(fork, tx);
     const outcome = try execute_top(fork, evm, tx, intrinsic);
     const accounted = account_gas(fork, tx, outcome, intrinsic, authorization_refund);
-    try pay_fees(fork, evm, tx, accounted.gas_used, fees);
+    if (!tx.disable_fee_charge) try pay_fees(fork, evm, tx, accounted.gas_used, fees);
     return .{ .executed = finish(fork, evm, outcome, accounted) };
 }
 
@@ -402,6 +423,18 @@ fn execute_top(
     intrinsic: Intrinsic,
 ) evm_module.Error!evm_module.Outcome {
     assert(intrinsic.gas <= tx.gas_limit);
+    if (tx.disable_fee_charge) {
+        // revm's first frame halts with `OutOfFunds`, returning its gas, when the caller
+        // cannot transfer `value` (the up-front balance check is disabled).
+        const caller = try evm.state.load(tx.caller);
+        if (caller.info.balance < tx.value) return .{
+            .status = .halt,
+            .exit = .out_of_funds,
+            .gas_remaining = tx.gas_limit - intrinsic.gas,
+            .gas_refund = 0,
+            .output = &.{},
+        };
+    }
     return evm.execute_fork(fork, .{
         .kind = if (tx.to == null) .create else .call,
         .caller = tx.caller,

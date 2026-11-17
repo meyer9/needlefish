@@ -221,7 +221,7 @@ pub fn error_text(exit: evm.evm.Exit) ?[]const u8 {
         .stop, .return_, .self_destruct => null,
         .revert => "execution reverted",
         .out_of_gas => "out of gas",
-        .invalid_opcode => "invalid opcode",
+        .invalid_opcode, .invalid_fe_opcode => "invalid opcode",
         .stack_underflow => "stack underflow",
         .stack_overflow => "stack limit reached 1024",
         .invalid_jump => "invalid jump destination",
@@ -230,7 +230,8 @@ pub fn error_text(exit: evm.evm.Exit) ?[]const u8 {
         .code_size_limit => "max code size exceeded",
         .invalid_code_prefix => "invalid code: must not begin with 0xef",
         .create_collision => "contract address collision",
-        .precompile_failure => "precompile failed",
+        .precompile_failure, .precompile_out_of_gas => "precompile failed",
+        .out_of_funds => "insufficient balance for transfer",
         .call, .create, .fatal => "internal error",
     };
 }

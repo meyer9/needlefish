@@ -36,6 +36,8 @@ pub const Exit = enum(u8) {
     revert,
     out_of_gas,
     invalid_opcode,
+    /// The designated INVALID opcode (0xfe); revm reports it apart (`InvalidFEOpcode`).
+    invalid_fe_opcode,
     stack_underflow,
     stack_overflow,
     invalid_jump,
@@ -45,6 +47,11 @@ pub const Exit = enum(u8) {
     invalid_code_prefix,
     create_collision,
     precompile_failure,
+    /// A precompile ran out of gas (revm `OutOfGas(Precompile)`).
+    precompile_out_of_gas,
+    /// The caller of an unvalidated RPC call cannot pay its `value` (revm `OutOfFunds`; a
+    /// transaction's first frame only, see `TxEnv.disable_fee_charge`).
+    out_of_funds,
     call,
     create,
     fatal,
@@ -515,7 +522,10 @@ pub const Evm = struct {
         coverage.precompile(&request.target, request.input.len, @tagName(result.status));
         if (result.status != .success) {
             evm.state.revert(checkpoint);
-            return failed(0, .precompile_failure);
+            return failed(0, if (result.status == .out_of_gas)
+                .precompile_out_of_gas
+            else
+                .precompile_failure);
         }
         assert(result.gas_used <= request.gas_limit);
         return .{ .done = .{

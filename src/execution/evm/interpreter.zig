@@ -112,7 +112,7 @@ inline fn step(
 ) bool {
     @setEvalBranchQuota(100_000);
     if (comptime !op.is_defined(fork, opcode) or opcode == op.INVALID) {
-        exit.* = .invalid_opcode;
+        exit.* = if (comptime opcode == op.INVALID) .invalid_fe_opcode else .invalid_opcode;
         return false;
     }
     const inputs: u32 = comptime op.table[opcode].inputs;

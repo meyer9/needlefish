@@ -213,12 +213,26 @@ pub const Call = struct {
     writer: *json.Writer,
     error_code: i32 = code.internal_error,
     error_message: []const u8 = "internal error",
+    /// The error object's `data` (written as hex when non-empty).
+    error_data: []const u8 = &.{},
 
     /// Fails the call with `error_code` and a static `message`.
     pub fn fail(call: *Call, error_code: i32, message: []const u8) HandlerError {
         call.error_code = error_code;
         call.error_message = message;
         return error.Failed;
+    }
+
+    /// Fails the call with `error_code`, `message` and hex `data` (e.g. revert output). Both
+    /// slices must outlive the handler.
+    pub fn fail_data(
+        call: *Call,
+        error_code: i32,
+        message: []const u8,
+        data: []const u8,
+    ) HandlerError {
+        call.error_data = data;
+        return call.fail(error_code, message);
     }
 };
 
@@ -328,6 +342,7 @@ pub fn Router(comptime Context: type, comptime methods: []const Method(Context))
         const Failure = struct {
             error_code: i32 = code.internal_error,
             message: []const u8 = "internal error",
+            data: []const u8 = &.{},
         };
 
         fn dispatch(
@@ -347,6 +362,7 @@ pub fn Router(comptime Context: type, comptime methods: []const Method(Context))
                     method.handler(context, &call) catch |err| {
                         failure.error_code = call.error_code;
                         failure.message = call.error_message;
+                        failure.data = call.error_data;
                         return err;
                     };
                     if (writer.depth != 0) return error.WriteFailed;
@@ -370,7 +386,13 @@ pub fn Router(comptime Context: type, comptime methods: []const Method(Context))
                 error.Failed => .{ failure.error_code, failure.message },
             };
             if (id.len == 0) return .empty; // Notifications get no reply, even on error.
-            write_error(out, id, error_code, message) catch return overflow(out, out.end);
+            const data = if (err == error.Failed) failure.data else &.{};
+            const start = out.end;
+            write_error_data(out, id, error_code, message, data) catch {
+                // Too large with its data: reply without it.
+                out.end = start;
+                write_error(out, id, error_code, message) catch return overflow(out, out.end);
+            };
             return .response;
         }
     };
@@ -403,6 +425,28 @@ pub fn write_error(
     try out.print(",\"error\":{{\"code\":{d},\"message\":", .{error_code});
     try json.write_string_escaped(out, message);
     try out.writeAll("}}");
+}
+
+/// `write_error` with the error object's `data` as hex (omitted when empty).
+pub fn write_error_data(
+    out: *std.Io.Writer,
+    id: []const u8,
+    error_code: i32,
+    message: []const u8,
+    data: []const u8,
+) std.Io.Writer.Error!void {
+    if (data.len == 0) return write_error(out, id, error_code, message);
+    try out.writeAll("{\"jsonrpc\":\"2.0\",\"id\":");
+    try out.writeAll(if (id.len == 0) "null" else id);
+    try out.print(",\"error\":{{\"code\":{d},\"message\":", .{error_code});
+    try json.write_string_escaped(out, message);
+    try out.writeAll(",\"data\":\"0x");
+    const digits = "0123456789abcdef";
+    for (data) |byte| {
+        try out.writeByte(digits[byte >> 4]);
+        try out.writeByte(digits[byte & 0x0f]);
+    }
+    try out.writeAll("\"}}");
 }
 
 fn write_bare_error(out: *std.Io.Writer, error_code: i32) Outcome {

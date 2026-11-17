@@ -92,6 +92,18 @@ const Harness = struct {
     }
 };
 
+/// Expects the request to fail with `code` and a message starting with `message`.
+fn expect_failure(
+    h: *Harness,
+    comptime method: []const u8,
+    comptime params: []const u8,
+    comptime code: []const u8,
+    comptime message: []const u8,
+) !void {
+    const response = try h.request(method, params);
+    try expect_contains(response, "{\"code\":" ++ code ++ ",\"message\":\"" ++ message);
+}
+
 fn expect_contains(haystack: []const u8, needle: []const u8) !void {
     if (std.mem.indexOf(u8, haystack, needle) == null) {
         std.debug.print("missing {s} in {s}\n", .{ needle, haystack });
@@ -582,7 +594,8 @@ test "eth: eth_simulateV1 carries state across calls and blocks with overrides" 
     try expect_contains(text, "\"logIndex\":\"0x1\"");
     try expect_contains(text, "\"error\":{\"code\":3,\"message\":\"execution reverted\"}");
     try expect_contains(text, "\"number\":\"0x2\",\"timestamp\":\"0x1000\"");
-    try expect_contains(text, "\"number\":\"0x3\",\"timestamp\":\"0x100c\"");
+    // base/base's default: the chain's schedule, here two seconds after the override.
+    try expect_contains(text, "\"number\":\"0x3\",\"timestamp\":\"0x1002\"");
     // Nothing was committed.
     try testing.expectEqual(head_root, try h.node.db.root());
     try testing.expectEqualStrings("\"result\":\"0x\"", try h.request("eth_getCode", "[" ++
@@ -594,27 +607,103 @@ test "eth: eth_simulateV1 limits and rejections" {
     defer h.destroy();
     const gas = "[{\"blockStateCalls\":[{\"blockOverrides\":{\"gasLimit\":\"0x7530\"}," ++
         "\"calls\":[{\"to\":" ++ address_target ++ ",\"gas\":\"0xc350\"}]}]}]";
-    try expect_contains(try h.request("eth_simulateV1", gas), "\"code\":-38015");
+    try expect_contains(try h.request("eth_simulateV1", gas), "{\"code\":-38015,\"message\":" ++
+        "\"Block gas limit exceeded by the block's transactions\"}");
+    // A call the EVM rejects fails the whole request.
+    const no_gas = "[{\"blockStateCalls\":[{\"calls\":[{\"gas\":\"0x0\"}]}]}]";
+    try expect_contains(try h.request("eth_simulateV1", no_gas), "{\"code\":-38013,\"message\":" ++
+        "\"intrinsic gas too low\"}");
     const backwards = "[{\"blockStateCalls\":[{\"blockOverrides\":{\"number\":\"0x0\"}}]}]";
-    try expect_contains(try h.request("eth_simulateV1", backwards), "\"code\":-38020");
-    // Blocks after one at 2^64 - 1 saturate instead of overflowing (base/base does too).
+    try expect_failure(h, "eth_simulateV1", backwards, "-38020", "block numbers must be in order");
+    // At most 256 blocks past the base block, gap fillers included.
+    const too_many = "{\"code\":-38026,\"message\":\"too many blocks\"}";
+    const far = "[{\"blockStateCalls\":[{\"blockOverrides\":{\"number\":\"0x1000\"}}]}]";
+    try expect_contains(try h.request("eth_simulateV1", far), too_many);
     const max = "\"0xffffffffffffffff\"";
-    const late = "[{\"blockStateCalls\":[{\"blockOverrides\":{\"time\":" ++ max ++ "," ++
-        "\"number\":" ++ max ++ "}},{}]}]";
+    const last = "[{\"blockStateCalls\":[{\"blockOverrides\":{\"number\":" ++ max ++ "}}]}]";
+    try expect_contains(try h.request("eth_simulateV1", last), too_many);
+    const many = comptime blk: {
+        var text: []const u8 = "[{\"blockStateCalls\":[";
+        for (0..256) |_| text = text ++ "{},";
+        break :blk text ++ "{}]}]";
+    };
+    try expect_contains(try h.request("eth_simulateV1", many), too_many);
+    // Number gaps fill with empty blocks.
+    const gap = "[{\"blockStateCalls\":[{\"blockOverrides\":{\"number\":\"0x3\"}}]}]";
+    const filled = try h.request("eth_simulateV1", gap);
+    try testing.expectEqual(@as(usize, 3), count_of(filled, "\"miner\""));
+    // Before Denim a default timestamp after 2^64 - 1 overflows.
+    const late = "[{\"blockStateCalls\":[{\"blockOverrides\":{\"time\":" ++ max ++ "}},{}]}]";
+    try expect_contains(try h.request("eth_simulateV1", late), "{\"code\":-38021,\"message\":" ++
+        "\"block timestamps must be in order: 18446744073709551615 <= 18446744073709551615\"}");
+    const validation = "[{\"blockStateCalls\":[],\"validation\":true}]";
+    try expect_contains(try h.request("eth_simulateV1", validation), "{\"code\":-32602," ++
+        "\"message\":\"calls are empty.\"}");
+    // Base fee and blob base fee overrides apply (BASEFEE, BLOBBASEFEE).
+    const fees = "[{\"blockStateCalls\":[{\"blockOverrides\":{\"baseFeePerGas\":\"0x7\"," ++
+        "\"blobBaseFee\":\"0x9\"},\"stateOverrides\":{" ++ override_target ++
+        ":{\"code\":\"0x484a015f5260205ff3\"}},\"calls\":[{\"to\":" ++ override_target ++ "}]}]}]";
+    const fee_text = try h.request("eth_simulateV1", fees);
+    try expect_contains(fee_text, "\"baseFeePerGas\":\"0x7\"");
+    try expect_contains(fee_text, "\"returnData\":\"0x" ++ zeros_62 ++ "10\"");
+    try expect_contains(try h.request("eth_simulateV1", "[{}]"), "invalid params");
+    // A gas limit above the block's and the RPC gas cap is refused, not run (a looping call
+    // without gas would otherwise spin for 2^64 gas).
+    const unbounded = "[{\"blockStateCalls\":[{\"blockOverrides\":{\"gasLimit\":" ++ max ++
+        "},\"stateOverrides\":{" ++ override_target ++ ":{\"code\":\"0x5b5f56\"}}," ++
+        "\"calls\":[{\"to\":" ++ override_target ++ "}]}]}]";
+    try expect_failure(h, "eth_simulateV1", unbounded, "-38026", "Client adjustable limit reached");
+}
+
+test "eth: eth_simulateV1 Denim timestamps repeat at 2^64 - 1" {
+    const h = try Harness.create_for(&denim_rpc_spec);
+    defer h.destroy();
+    const max = "\"0xffffffffffffffff\"";
+    const late = "[{\"blockStateCalls\":[{\"blockOverrides\":{\"time\":" ++ max ++ "}},{}]}]";
     const saturated = try h.request("eth_simulateV1", late);
-    try testing.expectEqual(@as(usize, 2), std.mem.count(u8, saturated, "\"timestamp\":" ++ max));
-    try testing.expectEqual(@as(usize, 2), std.mem.count(u8, saturated, "\"number\":" ++ max));
+    try testing.expectEqual(@as(usize, 2), count_of(saturated, "\"timestamp\":" ++ max));
     const stalled = "[{\"blockStateCalls\":[{\"blockOverrides\":{\"time\":" ++ max ++ "}}," ++
         "{\"blockOverrides\":{\"time\":" ++ max ++ "}}]}]";
-    try expect_contains(try h.request("eth_simulateV1", stalled), "\"code\":-38021");
-    const validation = "[{\"blockStateCalls\":[],\"validation\":true}]";
-    try expect_contains(try h.request("eth_simulateV1", validation), "not supported");
-    const fee = "[{\"blockStateCalls\":[{\"blockOverrides\":{\"baseFeePerGas\":\"0x1\"}}]}]";
-    try expect_contains(try h.request("eth_simulateV1", fee), "unsupported block override");
-    try expect_contains(try h.request("eth_simulateV1", "[{}]"), "invalid params");
-    const empty = try h.request("eth_simulateV1", "[{\"blockStateCalls\":[]}]");
-    try testing.expectEqualStrings("\"result\":[]", empty);
+    try expect_contains(try h.request("eth_simulateV1", stalled), "\"result\":[");
 }
+
+test "eth: eth_simulateV1 call errors and validation" {
+    const h = try Harness.create();
+    defer h.destroy();
+    const blocks = "[{\"blockStateCalls\":[{\"stateOverrides\":{" ++ override_target ++
+        ":{\"code\":\"" ++ revert_nope_code ++ "\"}},\"calls\":[";
+    const reverted = try h.request("eth_simulateV1", blocks ++ "{\"to\":" ++ override_target ++
+        "}]}]}]");
+    try expect_contains(reverted, "\"returnData\":\"0x\"");
+    const reverted_error = "\"error\":{\"code\":3,\"message\":\"execution reverted: nope\"," ++
+        "\"data\":\"" ++ revert_nope_data ++ "\"}";
+    try expect_contains(reverted, reverted_error);
+    const loop = "[{\"blockStateCalls\":[{\"stateOverrides\":{" ++ override_target ++
+        ":{\"code\":\"0x5b5f56\"}},\"calls\":[{\"to\":" ++ override_target ++
+        ",\"gas\":\"0x5300\"}]}]}]";
+    try expect_contains(try h.request("eth_simulateV1", loop), "\"error\":{\"code\":-32015," ++
+        "\"message\":\"out of gas: gas required exceeds: 21248\"}");
+    const poor = "[{\"blockStateCalls\":[{\"calls\":[{\"from\":" ++ poor_sender ++
+        ",\"to\":" ++ address_target ++ ",\"value\":\"0x1\"}]}]}]";
+    try expect_contains(try h.request("eth_simulateV1", poor), "\"gasUsed\":\"0x5208\"," ++
+        "\"status\":\"0x0\",\"error\":{\"code\":-32015,\"message\":\"EVM error: OutOfFunds\"}");
+    // With validation the fee, nonce and balance checks apply.
+    const validated = "[{\"validation\":true,\"blockStateCalls\":[{\"calls\":[{\"from\":" ++
+        poor_sender ++ ",\"to\":" ++ address_target;
+    const low_fee = "max fee per gas less than block base fee\"}";
+    try expect_failure(h, "eth_simulateV1", validated ++ "}]}]}]", "-38012", low_fee);
+    const priced = validated ++ ",\"maxFeePerGas\":\"0x10000000000\"";
+    const nonce = priced ++ ",\"nonce\":\"0x5\"}]}]}]";
+    try expect_failure(h, "eth_simulateV1", nonce, "-38011", "nonce too high\"}");
+    const funds = "insufficient funds for gas * price + value: have 0 want ";
+    try expect_failure(h, "eth_simulateV1", priced ++ "}]}]}]", "-38014", funds);
+}
+
+/// Reverts with `Error("nope")`: CODECOPY the 100 bytes after the 10-byte prefix, REVERT.
+const revert_nope_code = "0x6064600a5f39" ++ "60645ffd" ++ revert_nope_data[2..];
+const revert_nope_data = "0x08c379a0" ++ zeros_62 ++ "20" ++ zeros_62 ++ "04" ++
+    "6e6f7065" ++ "00000000000000000000000000000000000000000000000000000000";
+const poor_sender = "\"0x000000000000000000000000000000000000dead\"";
 
 fn simulate_scenario(seed: u64) !void {
     var prng = Prng.init(seed);
@@ -1175,9 +1264,9 @@ test "eth: calls without gas default under the Osaka per-transaction cap" {
     try expect_contains(call_result, "\"result\":\"0x\"");
     const estimate = try h.request("eth_estimateGas", "[{" ++ to ++ "}]");
     try expect_contains(estimate, "\"result\":\"0x5208\"");
-    // An explicit gas above the cap is still the caller's error.
+    // An explicit gas above the cap runs: reth lifts the cap for calls.
     const over = try h.request("eth_call", "[{" ++ to ++ ",\"gas\":\"0x1c9c380\"},\"latest\"]");
-    try expect_contains(over, "gas_cap_exceeded");
+    try expect_contains(over, "\"result\":\"0x\"");
     const head = h.node.chain.header(h.node.chain.head_hash()).?;
     const env = chain_module.env_of(&head);
     try testing.expect(head.gas_limit > 1 << 24);
@@ -1693,7 +1782,64 @@ test "eth: eth_call, eth_estimateGas and debug_traceCall apply state and block o
     // Malformed overrides are invalid params.
     const bad = "{" ++ override_target ++ ":{\"colour\":\"0x01\"}}]";
     try expect_contains(try h.request("eth_call", call ++ bad), "-32602");
-    try expect_contains(try h.request("eth_call", call ++ "null,{\"bogus\":1}]"), "-32602");
+    // Unknown block override members are ignored, as serde ignores them.
+    try expect_contains(try h.request("eth_call", call ++ "null,{\"bogus\":1}]"), "\"result\"");
+    const both = "{" ++ override_target ++ ":{\"state\":{},\"stateDiff\":{}}}]";
+    try expect_contains(try h.request("eth_call", call ++ both), "{\"code\":-32602,\"message\":" ++
+        "\"account 0x0000000000000000000000000000000000007777 has both 'state' and 'stateDiff'\"}");
+}
+
+test "eth: eth_call, eth_estimateGas and eth_createAccessList report reth's call errors" {
+    const h = try Harness.create();
+    defer h.destroy();
+    const call = "[{\"to\":" ++ override_target;
+    const nope = "\"latest\",{" ++ override_target ++ ":{\"code\":\"" ++ revert_nope_code ++
+        "\"}}]";
+    const reverted = "{\"code\":3,\"message\":\"execution reverted: nope\",\"data\":\"" ++
+        revert_nope_data ++ "\"}";
+    try expect_contains(try h.request("eth_call", call ++ "}," ++ nope), reverted);
+    try expect_contains(try h.request("eth_estimateGas", call ++ "}," ++ nope), reverted);
+    const limited = call ++ ",\"gas\":\"0x7530\"}," ++ nope;
+    try expect_contains(try h.request("eth_estimateGas", limited), reverted);
+    const listed = try h.request("eth_createAccessList", call ++ "}," ++ nope);
+    try expect_contains(listed, "\"error\":\"execution reverted: nope\"}");
+    // Halts are -32003 with reth's text.
+    const fe = "\"latest\",{" ++ override_target ++ ":{\"code\":\"0xfe\"}}]";
+    try expect_contains(try h.request("eth_call", call ++ "}," ++ fe), "{\"code\":-32003," ++
+        "\"message\":\"EVM error: InvalidFEOpcode\"}");
+    const loop = "\"latest\",{" ++ override_target ++ ":{\"code\":\"0x5b5f56\"}}]";
+    const out_of_gas = "out of gas: gas required exceeds: 21248\"}";
+    const looping = call ++ ",\"gas\":\"0x5300\"}," ++ loop;
+    try expect_failure(h, "eth_call", looping, "-32003", out_of_gas);
+    // Fee fields: the base fee check, conflicts, and the caller's allowance.
+    const low_fee = "max fee per gas less than block base fee\"}";
+    try expect_failure(h, "eth_call", call ++ ",\"maxFeePerGas\":\"0x1\"}]", "-32000", low_fee);
+    try expect_contains(try h.request("eth_call", call ++ ",\"gasPrice\":\"0x1\"," ++
+        "\"maxFeePerGas\":\"0x1\"}]"), "{\"code\":-32602,\"message\":\"both gasPrice and " ++
+        "(maxFeePerGas or maxPriorityFeePerGas) specified\"}");
+    const poor = "[{\"from\":" ++ poor_sender ++ ",\"to\":" ++ override_target;
+    const priced = poor ++ ",\"gasPrice\":\"0x1\"}]";
+    // A plain transfer takes reth's 21000 shortcut, which the allowance does not cap.
+    try expect_contains(try h.request("eth_estimateGas", priced), "\"result\":\"0x5208\"");
+    const priced_create = "[{\"from\":" ++ poor_sender ++ ",\"gasPrice\":\"0x1\"}]";
+    const allowance = "gas required exceeds allowance (0)\"}";
+    try expect_failure(h, "eth_estimateGas", priced_create, "-32000", allowance);
+    try expect_contains(try h.request("eth_call", poor ++ ",\"gasPrice\":\"0x1\"," ++
+        "\"value\":\"0x1\"}]"), "{\"code\":-32003,\"message\":\"insufficient funds for gas * " ++
+        "price + value: have 0 want 1\"}");
+    try expect_failure(h, "eth_createAccessList", priced, "-32000", "intrinsic gas too low\"}");
+    const short = poor ++ ",\"value\":\"0x1\"}]";
+    try expect_failure(h, "eth_call", short, "-32003", "EVM error: OutOfFunds\"}");
+    // The RPC gas cap (50M) is the default gas and bounds a larger one (GAS returns the
+    // cap less 21000 and the GAS opcode's 2).
+    const gas_left = "\"latest\",{" ++ override_target ++ ":{\"code\":\"0x5a5f5260205ff3\"}}]";
+    const capped = "\"result\":\"0x" ++ zeros_62[0..57] ++ "2fa9e76\"";
+    try expect_contains(try h.request("eth_call", call ++ "}," ++ gas_left), capped);
+    const above = call ++ ",\"gas\":\"0x5f5e100\"}," ++ gas_left;
+    try expect_contains(try h.request("eth_call", above), capped);
+    // reth's estimate stops within 1.5%: a bare create needs 53000 and reports 53793.
+    const create = try h.request("eth_estimateGas", "[{\"from\":" ++ poor_sender ++ "}]");
+    try expect_contains(create, "\"result\":\"0xd221\"");
 }
 
 test "eth: seeded fuzz of eth_call storage overrides" {
