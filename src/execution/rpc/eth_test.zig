@@ -1889,6 +1889,14 @@ test "eth: debug_trace struct logger honours its config" {
         "debug_traceCall",
         "[{\"to\":" ++ counter_at ++ "},\"latest\",{\"tracer\":\"muxTracer\"}]",
     ), "unsupported tracer");
+    // The block parameter fails first; the tracer is refused once the block is found.
+    const latests = "{\"tracer\":\"latests\"}]";
+    const by_tag = try h.request("debug_traceBlockByNumber", "[\"latests\"," ++ latests);
+    try expect_contains(by_tag, "-32602");
+    const by_number = try h.request("debug_traceBlockByNumber", "[\"0x7777\"," ++ latests);
+    try expect_contains(by_number, "block not found");
+    const found = try h.request("debug_traceBlockByNumber", "[\"latest\"," ++ latests);
+    try expect_contains(found, "JS Tracer is not enabled");
     try testing.expect(h.node.chain.executor.machine.tracer == null);
 }
 

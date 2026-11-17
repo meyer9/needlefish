@@ -86,11 +86,15 @@ fn element(body: *Body, prng: *Prng) Expected {
         },
         1 => {
             body.print("{{\"method\":\"echo\",\"id\":1}}", .{}); // No jsonrpc member.
-            return .{ .respond = true, .error_code = rpc.code.invalid_request };
+            // jsonrpsee keeps the id of an invalid request.
+            const invalid = rpc.code.invalid_request;
+            return .{ .respond = true, .id = .number, .id_number = 1, .error_code = invalid };
         },
         2 => {
             body.print("{{\"jsonrpc\":\"2.0\",\"method\":7,\"id\":1}}", .{});
-            return .{ .respond = true, .error_code = rpc.code.invalid_request };
+            // jsonrpsee keeps the id of an invalid request.
+            const invalid = rpc.code.invalid_request;
+            return .{ .respond = true, .id = .number, .id_number = 1, .error_code = invalid };
         },
         else => return request_call(body, prng),
     }

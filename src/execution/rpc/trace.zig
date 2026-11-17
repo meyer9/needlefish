@@ -518,41 +518,58 @@ fn parse_config(scanner: *json.Scanner, options: *Options) error{InvalidParams}!
 }
 
 fn options_of(call: *Call, raw: ?[]const u8) HandlerError!Options {
-    return parse_options(raw) catch |err| switch (err) {
-        error.InvalidParams => return error.InvalidParams,
-        // reth: `EthApiError::Unsupported`, an internal error.
-        error.Unsupported => return call.fail(rpc.code.internal_error, "unsupported tracer"),
-        error.JsTracer => return call.fail(rpc.code.internal_error, "JS Tracer is not enabled"),
+    return options_or_refuse(call, try options_deferred(raw));
+}
+
+/// Trace options, or the refusal of a tracer reth only refuses while tracing, after the
+/// block or transaction is found; a malformed config fails with the params.
+const Deferred = union(enum) { options: Options, refused: []const u8 };
+
+fn options_deferred(raw: ?[]const u8) HandlerError!Deferred {
+    const options = parse_options(raw) catch |err| return switch (err) {
+        error.InvalidParams => error.InvalidParams,
+        error.Unsupported => .{ .refused = "unsupported tracer" },
+        error.JsTracer => .{ .refused = "JS Tracer is not enabled" },
+    };
+    return .{ .options = options };
+}
+
+/// reth: `EthApiError::Unsupported`, an internal error.
+fn options_or_refuse(call: *Call, deferred: Deferred) HandlerError!Options {
+    return switch (deferred) {
+        .options => |options| options,
+        .refused => |message| call.fail(rpc.code.internal_error, message),
     };
 }
 
 fn trace_transaction(api: *Api, call: *Call) HandlerError!void {
     const tx_hash = try call.params.fixed(32);
-    const options = try options_of(call, try call.params.optional_raw());
+    const deferred = try options_deferred(try call.params.optional_raw());
     try call.params.finish();
     const location = api.chain.find_transaction(tx_hash) orelse {
         return call.fail(rpc.code.server_error, "transaction not found");
     };
+    const options = try options_or_refuse(call, deferred);
     try trace(api, call, location.block_hash, location.index, options);
 }
 
 fn trace_block_by_number(api: *Api, call: *Call) HandlerError!void {
     const raw = try call.params.raw();
-    const options = try options_of(call, try call.params.optional_raw());
+    const deferred = try options_deferred(try call.params.optional_raw());
     try call.params.finish();
     const hash = eth.resolve_block(api, call, raw) catch |err| switch (err) {
         error.Failed => return call.fail(rpc.code.server_error, "block not found"),
         else => return err,
     };
-    try trace(api, call, hash, null, options);
+    try trace(api, call, hash, null, try options_or_refuse(call, deferred));
 }
 
 fn trace_block_by_hash(api: *Api, call: *Call) HandlerError!void {
     const hash = try call.params.fixed(32);
-    const options = try options_of(call, try call.params.optional_raw());
+    const deferred = try options_deferred(try call.params.optional_raw());
     try call.params.finish();
     if (api.chain.record(hash) == null) return call.fail(rpc.code.server_error, "block not found");
-    try trace(api, call, hash, null, options);
+    try trace(api, call, hash, null, try options_or_refuse(call, deferred));
 }
 
 fn trace_call(api: *Api, call: *Call) HandlerError!void {
@@ -649,7 +666,7 @@ fn trace_raw_block(api: *Api, call: *Call) HandlerError!void {
         return call.fail(rpc.code.internal_error, "scratch too small");
     // The block's bytes take the first quarter of the scratch; the traces use the rest.
     const raw = try call.params.data(api.scratch[0 .. tail / 4]);
-    const options = try options_of(call, try call.params.optional_raw());
+    const deferred = try options_deferred(try call.params.optional_raw());
     try call.params.finish();
     const block = consensus.block.Block.decode(raw) catch
         return call.fail(rpc.code.invalid_params, "invalid block RLP");
@@ -658,6 +675,7 @@ fn trace_raw_block(api: *Api, call: *Call) HandlerError!void {
     }
     const reserved = @intFromPtr(raw.ptr) - @intFromPtr(api.scratch.ptr) + raw.len;
     const transactions = rlp.Decoder.init(block.body.transactions.payload);
+    const options = try options_or_refuse(call, deferred);
     try trace_block(api, call, &block.header, transactions, null, options, reserved);
 }
 

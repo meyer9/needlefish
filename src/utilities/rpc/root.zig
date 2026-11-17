@@ -313,14 +313,19 @@ pub fn Router(comptime Context: type, comptime methods: []const Method(Context))
         fn handle_single(context: Context, scanner: *json.Scanner, out: *std.Io.Writer) Outcome {
             const object_depth = scanner.depth;
             assert(object_depth > 0);
+            const object_start = scanner.offset() - 1;
             const request = parse_request(scanner) catch |err| {
                 // Skip the rest of a malformed object so a batch can continue.
                 skip_object_rest(scanner, object_depth);
-                const error_code = switch (err) {
-                    error.ParseError => code.parse_error,
-                    error.InvalidRequest => code.invalid_request,
-                };
-                return write_bare_error(out, error_code);
+                switch (err) {
+                    error.ParseError => return write_bare_error(out, code.parse_error),
+                    error.InvalidRequest => {},
+                }
+                // jsonrpsee `prepare_error`: the response keeps the id when it reads as one.
+                const object = scanner.input[object_start..scanner.offset()];
+                const id = recover_id(object);
+                write_error(out, id, code.invalid_request, "invalid request") catch return .empty;
+                return .response;
             };
             const notification = request.id.len == 0;
             const start = out.end;
@@ -396,6 +401,32 @@ pub fn Router(comptime Context: type, comptime methods: []const Method(Context))
             return .response;
         }
     };
+}
+
+/// The raw id of an invalid request object, as jsonrpsee's `InvalidRequest` reads it: a
+/// string, `null`, or a number that fits a u64; "" (written as null) for anything else.
+fn recover_id(object: []const u8) []const u8 {
+    assert(object.len >= 2 and object[0] == '{');
+    var scanner = json.Scanner.init(object);
+    _ = scanner.next() catch unreachable; // A validated object.
+    var id: []const u8 = "";
+    var keys: u32 = 0;
+    while (keys < object.len) : (keys += 1) {
+        const key = scanner.next() catch unreachable; // A validated object.
+        if (key.tag == .object_end) break;
+        const value = scanner.next() catch unreachable;
+        const start = value_start(&scanner, value);
+        scanner.skip(value) catch unreachable;
+        if (!std.mem.eql(u8, key.bytes, "id")) continue;
+        if (id.len > 0) return ""; // serde refuses a duplicate field.
+        const raw = scanner.input[start..scanner.offset()];
+        id = switch (value.tag) {
+            .string, .null => raw,
+            .number => if (std.fmt.parseInt(u64, raw, 10)) |_| raw else |_| return "",
+            else => return "",
+        };
+    }
+    return id;
 }
 
 /// Advances past the end of the object opened at `object_depth`, if not already past it.

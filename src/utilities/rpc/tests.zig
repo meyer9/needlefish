@@ -102,8 +102,24 @@ test "rpc: protocol errors" {
             "{bad",
             \\{"jsonrpc":"2.0","id":null,"error":{"code":-32700,"message":"parse error"}}
         },
+        // jsonrpsee keeps an invalid request's id when it reads as a u64, string or null.
         .{
-            \\{"id":1,"method":"eth_chainId"}
+            \\{"method":"eth_chainId","jsonrpc":"","id":1}
+            ,
+            \\{"jsonrpc":"2.0","id":1,"error":{"code":-32600,"message":"invalid request"}}
+        },
+        .{
+            \\{"id":"a","method":7,"jsonrpc":"2.0"}
+            ,
+            \\{"jsonrpc":"2.0","id":"a","error":{"code":-32600,"message":"invalid request"}}
+        },
+        .{
+            \\{"id":-1,"method":"eth_chainId"}
+            ,
+            invalid_request,
+        },
+        .{
+            \\{"id":{},"jsonrpc":"2.0","method":"eth_chainId"}
             ,
             invalid_request,
         },
