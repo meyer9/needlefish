@@ -9,6 +9,7 @@
 const std = @import("std");
 const assert = std.debug.assert;
 const native = @import("native.zig");
+const native_abi = @import("native_abi.zig");
 const primitives = @import("primitives.zig");
 const Address = primitives.Address;
 const B256 = primitives.B256;
@@ -83,10 +84,11 @@ pub fn dispatch(context: *Context, input: []const u8) Error![]const u8 {
         return native.write_word(context, native.address_word(try admin(context)));
     }
     if (eql(u8, &selector, &selector_set_admin)) {
+        const kinds = [_]native_abi.Kind{.address};
         const word = native.argument(input, 0) orelse
-            return context.revert_decode(selector, "(address)", .overrun);
+            return context.revert_decode(selector, "(address)", .overrun, input[4..], &kinds);
         const new_admin = native.argument_address(word) orelse
-            return context.revert_decode(selector, "(address)", .type_check);
+            return context.revert_decode(selector, "(address)", .type_check, input[4..], &kinds);
         try set_admin(context, new_admin);
         return context.out[0..0];
     }
@@ -96,7 +98,7 @@ pub fn dispatch(context: *Context, input: []const u8) Error![]const u8 {
         eql(u8, &selector, &selector_deactivate);
     if (!is_known) return context.revert_selector(selector);
     const feature = (native.argument(input, 0) orelse
-        return context.revert_decode(selector, "(bytes32)", .overrun)).*;
+        return context.revert_decode(selector, "(bytes32)", .overrun, input[4..], &.{.bytes32})).*;
     if (eql(u8, &selector, &selector_activate)) return set_activated(context, feature, true);
     if (eql(u8, &selector, &selector_deactivate)) return set_activated(context, feature, false);
     const activated = try context.sload(feature_slot(feature)) != 0;

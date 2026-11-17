@@ -99,7 +99,6 @@ pub const Invalid = enum {
     blob_fee_too_low,
     authorization_empty,
     authorization_create,
-    deposit_system_transaction,
     /// EIP-8130 pre-call rejection (authorization, nonce, intrinsic gas, fees, payer).
     eip8130_rejected,
 };
@@ -282,9 +281,9 @@ fn warm_addresses(comptime fork: Fork, evm: *Evm, tx: *const TxEnv) state_module
     if (tx.to) |to| _ = try evm.state.access(to);
     try warm_system_addresses(fork, evm);
     for (tx.access_list) |item| {
-        const access = try evm.state.access(item.address);
+        _ = try evm.state.access(item.address);
         for (item.storage_keys) |key| {
-            _ = try evm.state.storage_access(access.account, primitives.b256_to_u256(key));
+            try evm.state.warm_listed_slot(item.address, primitives.b256_to_u256(key));
         }
     }
 }
@@ -294,17 +293,18 @@ fn warm_addresses(comptime fork: Fork, evm: *Evm, tx: *const TxEnv) state_module
 pub fn warm_system_addresses(comptime fork: Fork, evm: *Evm) state_module.Error!void {
     evm.state.static_warm = .{};
     if (!fork.at_least(.berlin)) return;
-    if (fork.at_least(.shanghai)) _ = try evm.state.access(evm.block.coinbase);
     const op_upgrade = evm.op_upgrade();
-    if (evm.static_warm_cache) |cache| {
-        if (cache.fork == fork and cache.upgrade == op_upgrade) {
-            evm.state.static_warm = cache.warm;
-            return;
-        }
+    const cached = if (evm.static_warm_cache) |cache|
+        cache.fork == fork and cache.upgrade == op_upgrade
+    else
+        false;
+    if (!cached) {
+        const warm = static_warm_set(fork, op_upgrade);
+        evm.static_warm_cache = .{ .fork = fork, .upgrade = op_upgrade, .warm = warm };
     }
-    const warm = static_warm_set(fork, op_upgrade);
-    evm.static_warm_cache = .{ .fork = fork, .upgrade = op_upgrade, .warm = warm };
-    evm.state.static_warm = warm;
+    evm.state.static_warm = evm.static_warm_cache.?.warm;
+    assert(evm.state.static_warm.coinbase == null);
+    if (fork.at_least(.shanghai)) evm.state.static_warm.coinbase = evm.block.coinbase;
 }
 
 fn static_warm_set(comptime fork: Fork, op_upgrade: ?op.Upgrade) state_module.StaticWarm {
@@ -418,10 +418,12 @@ fn execute_top(
 fn transact_deposit(comptime fork: Fork, evm: *Evm, tx: *const TxEnv) evm_module.Error!Result {
     assert(tx.tx_type == .deposit);
     const context = evm.block.op orelse return .{ .invalid = .type_not_supported };
-    if (context.rules().at_least(.regolith) and tx.is_system_transaction) {
-        return .{ .invalid = .deposit_system_transaction };
-    }
     evm.state.begin_transaction();
+    // base/base `validate_env` rejects a system deposit since Regolith, and `catch_error`
+    // turns that transaction error into a failed deposit like any other.
+    if (context.rules().at_least(.regolith) and tx.is_system_transaction) {
+        return .{ .executed = try fail_deposit(fork, evm, tx, .revert) };
+    }
     const intrinsic = intrinsic_gas(fork, tx);
     if (intrinsic.gas > tx.gas_limit or intrinsic.floor > tx.gas_limit) {
         return .{ .executed = try fail_deposit(fork, evm, tx, .out_of_gas) };

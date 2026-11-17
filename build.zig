@@ -9,6 +9,7 @@
 //!   zig build fuzz         build fuzz smoke tests (use `zig build test --fuzz`)
 //!   zig build sim -- SEED  run the deterministic simulator (DST) for SEED
 //!   zig build bench        run micro benchmarks (ReleaseFast recommended)
+//!   zig build -Ddiff-coverage  instrument `base diff-adapter` for coverage-guided fuzzing
 
 const std = @import("std");
 
@@ -24,29 +25,13 @@ pub fn build(b: *std.Build) void {
     const optimize = b.standardOptimizeOption(.{});
     const test_filter = b.option([]const u8, "test-filter", "Only run tests matching");
 
-    const options = b.addOptions();
-    options.addOption([]const u8, "version", "0.0.0");
-    const git_rev = b.option([]const u8, "git-rev", "Git revision baked into binaries");
-    options.addOption([]const u8, "git_rev", git_rev orelse "unknown");
-    const slow_tests = b.option(bool, "slow-tests", "Also run large simulation tests") orelse false;
-    options.addOption(bool, "slow_tests", slow_tests);
-    const require_io_uring = b.option(
-        bool,
-        "require-io-uring",
-        "Fail (instead of skip) OS IO tests when io_uring is unavailable",
-    ) orelse false;
-    options.addOption(bool, "require_io_uring", require_io_uring);
-    const fuzz_soak = b.option(u32, "fuzz-soak", "Multiply seeded fuzz iterations") orelse 1;
-    options.addOption(u32, "fuzz_soak", fuzz_soak);
-    const fuzz_seed = b.option(u64, "fuzz-seed", "Mixed into every seeded fuzz seed") orelse 0;
-    options.addOption(u64, "fuzz_seed", fuzz_seed);
-    const opcode_profile = b.option(bool, "evm-opcode-profile", "Time EVM opcodes") orelse false;
-    options.addOption(bool, "evm_opcode_profile", opcode_profile);
-
+    const configured = build_options(b);
+    const options = configured.options;
     const base = b.addModule("base", .{
         .root_source_file = b.path("src/base.zig"),
         .target = target,
         .optimize = optimize,
+        .fuzz = if (configured.diff_coverage) true else null,
     });
     base.addOptions("build_options", options);
 
@@ -57,7 +42,9 @@ pub fn build(b: *std.Build) void {
     const test_step = b.step("test", "Run unit tests");
     test_step.dependOn(&run_unit_tests.step);
 
-    add_binaries(b, base, target, optimize, test_step, filters);
+    // The edge counters (`-ffuzz`) need the LLVM backend and linker.
+    const use_llvm: ?bool = if (configured.diff_coverage) true else null;
+    add_binaries(b, base, target, optimize, test_step, filters, use_llvm);
 
     // Deterministic simulation testing and micro benchmarks.
     const sim = add_tool(b, base, target, optimize, .{
@@ -88,6 +75,36 @@ pub fn build(b: *std.Build) void {
     check_step.dependOn(&sim.step);
     check_step.dependOn(&bench.step);
     check_step.dependOn(&statetest.step);
+}
+
+const Configured = struct { options: *std.Build.Step.Options, diff_coverage: bool };
+
+/// Build options shared by every compilation (`build_options`).
+fn build_options(b: *std.Build) Configured {
+    const options = b.addOptions();
+    options.addOption([]const u8, "version", "0.0.0");
+    const git_rev = b.option([]const u8, "git-rev", "Git revision baked into binaries");
+    options.addOption([]const u8, "git_rev", git_rev orelse "unknown");
+    const slow_tests = b.option(bool, "slow-tests", "Also run large simulation tests") orelse false;
+    options.addOption(bool, "slow_tests", slow_tests);
+    const require_io_uring = b.option(
+        bool,
+        "require-io-uring",
+        "Fail (instead of skip) OS IO tests when io_uring is unavailable",
+    ) orelse false;
+    options.addOption(bool, "require_io_uring", require_io_uring);
+    const fuzz_soak = b.option(u32, "fuzz-soak", "Multiply seeded fuzz iterations") orelse 1;
+    options.addOption(u32, "fuzz_soak", fuzz_soak);
+    const fuzz_seed = b.option(u64, "fuzz-seed", "Mixed into every seeded fuzz seed") orelse 0;
+    options.addOption(u64, "fuzz_seed", fuzz_seed);
+    const opcode_profile = b.option(bool, "evm-opcode-profile", "Time EVM opcodes") orelse false;
+    options.addOption(bool, "evm_opcode_profile", opcode_profile);
+    // `base diff-adapter` coverage (BASE_DIFF_COVERAGE): semantic hooks plus the compiler's
+    // edge counters on the `base` module (`-ffuzz` instrumentation).
+    const diff_coverage = b.option(bool, "diff-coverage", "Diff-adapter coverage") orelse false;
+    options.addOption(bool, "diff_coverage", diff_coverage);
+
+    return .{ .options = options, .diff_coverage = diff_coverage };
 }
 
 /// Runners over public vectors fetched by `just vectors`.
@@ -177,10 +194,12 @@ fn add_binaries(
     optimize: std.builtin.OptimizeMode,
     test_step: *std.Build.Step,
     filters: []const []const u8,
+    use_llvm: ?bool,
 ) void {
     for (binaries) |name| {
         const exe = b.addExecutable(.{
             .name = name,
+            .use_llvm = use_llvm,
             .root_module = b.createModule(.{
                 .root_source_file = b.path(b.fmt("bin/{s}/main.zig", .{name})),
                 .target = target,

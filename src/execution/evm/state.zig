@@ -301,8 +301,14 @@ pub const StaticWarm = struct {
     precompiles: u32 = 0,
     p256: bool = false,
     natives: []const Address = &.{},
+    /// EIP-3651's warm coinbase, warm without being loaded (as in revm): a block of
+    /// deposits never reads the fee recipient, so a stateless witness need not hold it.
+    coinbase: ?Address = null,
 
     pub fn contains(warm: *const StaticWarm, address: Address) bool {
+        if (warm.coinbase) |coinbase| {
+            if (std.mem.eql(u8, &coinbase, &address)) return true;
+        }
         if (std.mem.allEqual(u8, address[0..18], 0)) {
             const number = std.mem.readInt(u16, address[18..20], .big);
             if (number < 32) return (warm.precompiles >> @intCast(number)) & 1 == 1;
@@ -333,6 +339,9 @@ pub const State = struct {
     account_list: []*Account,
     slot_list: []SlotEntry,
     transient: StorageKeyMap(u256) = .empty,
+    /// EIP-2930 storage keys of the current transaction: warm without being read (as in
+    /// revm), so a stateless witness need not hold a listed slot the EVM never reads.
+    listed_slots: StorageKeyMap(void) = .empty,
     journal: []Entry,
     journal_len: u32 = 0,
     logs: []Log,
@@ -362,6 +371,7 @@ pub const State = struct {
         try state.accounts.ensureTotalCapacity(allocator, limits.accounts_max);
         try state.slots.ensureTotalCapacity(allocator, limits.slots_max);
         try state.transient.ensureTotalCapacity(allocator, limits.transient_slots_max);
+        try state.listed_slots.ensureTotalCapacity(allocator, limits.slots_max);
         return state;
     }
 
@@ -369,6 +379,7 @@ pub const State = struct {
         state.accounts.deinit(allocator);
         state.slots.deinit(allocator);
         state.transient.deinit(allocator);
+        state.listed_slots.deinit(allocator);
         allocator.free(state.journal);
         allocator.free(state.logs);
         allocator.free(state.log_data);
@@ -386,6 +397,7 @@ pub const State = struct {
         state.slots.clearRetainingCapacity();
         // As in `begin_transaction`: an empty map has no tombstones, so skip the memset.
         if (state.transient.count() > 0) state.transient.clearRetainingCapacity();
+        if (state.listed_slots.count() > 0) state.listed_slots.clearRetainingCapacity();
         state.journal_len = 0;
         state.logs_len = 0;
         state.log_data_len = 0;
@@ -409,6 +421,20 @@ pub const State = struct {
         // never TSTORE).
         if (state.transient.count() > 0) state.transient.clearRetainingCapacity();
         assert(state.transient.count() == 0);
+        if (state.listed_slots.count() > 0) state.listed_slots.clearRetainingCapacity();
+        assert(state.listed_slots.count() == 0);
+    }
+
+    /// Warm an EIP-2930 storage key for the current transaction without reading it.
+    pub fn warm_listed_slot(state: *State, address: Address, slot: u256) Error!void {
+        if (state.listed_slots.count() >= state.limits.slots_max) return error.StateFull;
+        state.listed_slots.putAssumeCapacity(.{ .address = address, .slot = slot }, {});
+        assert(state.listed_slots.count() <= state.limits.slots_max);
+    }
+
+    fn is_listed(state: *const State, address: Address, slot: u256) bool {
+        if (state.listed_slots.count() == 0) return false;
+        return state.listed_slots.contains(.{ .address = address, .slot = slot });
     }
 
     pub fn checkpoint(state: *const State) Checkpoint {
@@ -547,6 +573,14 @@ pub const State = struct {
         if (state.static_warm.contains(address)) return true;
         const account = state.accounts.getPtr(address) orelse return false;
         return account.warm_tx == state.tx_id;
+    }
+
+    /// Whether a slot of `account` is warm in the current transaction, without loading it.
+    pub fn is_slot_warm(state: *State, account: *const Account, slot: u256) bool {
+        if (state.is_listed(account.address, slot)) return true;
+        const key = StorageKey{ .address = account.address, .slot = slot };
+        const cached = state.slots.getPtr(key) orelse return false;
+        return cached.warm_tx == state.tx_id;
     }
 
     pub fn code(state: *State, account: *Account) Error![]const u8 {
@@ -751,7 +785,8 @@ pub const State = struct {
     /// Load and warm a storage slot of `account`.
     pub fn storage_access(state: *State, account: *Account, slot: u256) Error!SlotAccess {
         const cached = try state.slot_for(account, slot);
-        const is_cold = cached.warm_tx != state.tx_id;
+        const is_cold = cached.warm_tx != state.tx_id and
+            !state.is_listed(account.address, slot);
         if (is_cold) {
             try state.record(.slot_warmed, @intFromPtr(cached), 0, 0);
             cached.warm_tx = state.tx_id;

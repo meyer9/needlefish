@@ -355,6 +355,45 @@ test "transaction: value transfer pays fees and tip" {
     try std.testing.expectEqual(@as(u256, 21_000 * 2), (try h.state.load(coinbase)).info.balance);
 }
 
+test "transaction: access-list storage keys are warm without being read" {
+    var h: Harness = undefined;
+    try h.init(std.testing.allocator);
+    defer h.deinit(std.testing.allocator);
+    try h.database.put_account(caller, 1_000_000_000, 0, &.{});
+    // `other` stops at once; `contract` reads slot 5 (SLOAD then STOP).
+    try h.database.put_account(other, 0, 1, &.{op.STOP});
+    try h.database.put_account(contract, 0, 1, &.{ op.PUSH1, 5, op.SLOAD, op.STOP });
+    const key: primitives.B256 = primitives.u256_to_b256(5);
+    var tx = transaction.TxEnv{
+        .tx_type = .eip2930,
+        .caller = caller,
+        .gas_limit = 100_000,
+        .gas_price = 1,
+        .to = other,
+    };
+    const unread = [_]transaction.AccessListItem{.{ .address = other, .storage_keys = &.{key} }};
+    tx.access_list = &unread;
+    const skipped = (try transact(&h, &tx)).executed;
+    try std.testing.expectEqual(evm_module.Status.success, skipped.status);
+    // Never read: a stateless witness without the slot still executes (mainnet 58525016).
+    const unread_key = state_module.StorageKey{ .address = other, .slot = 5 };
+    try std.testing.expect(h.state.slots.getPtr(unread_key) == null);
+    // A listed slot the code reads costs a warm SLOAD (100), not a cold one (2100).
+    const read = [_]transaction.AccessListItem{.{ .address = contract, .storage_keys = &.{key} }};
+    tx = .{
+        .tx_type = .eip2930,
+        .caller = caller,
+        .nonce = 1,
+        .gas_limit = 100_000,
+        .gas_price = 1,
+        .to = contract,
+        .access_list = &read,
+    };
+    const warm = (try transact(&h, &tx)).executed;
+    try std.testing.expectEqual(evm_module.Status.success, warm.status);
+    try std.testing.expectEqual(@as(u64, 21_000 + 2_400 + 1_900 + 3 + 100), warm.gas_used);
+}
+
 test "transaction: invalid transactions change nothing" {
     var h: Harness = undefined;
     try h.init(std.testing.allocator);
@@ -446,7 +485,9 @@ test "transaction: precompiles are warm by predicate, without loading, for one t
     h.state.begin_transaction();
     try std.testing.expect(!h.state.is_warm(ecrecover));
     try transaction.warm_system_addresses(.osaka, &h.evm);
-    try std.testing.expectEqual(@as(u32, 1), h.state.accounts.count()); // The coinbase only.
+    // Nothing loaded: the coinbase is warm by predicate too (EIP-3651, as in revm).
+    try std.testing.expectEqual(@as(u32, 0), h.state.accounts.count());
+    try std.testing.expect(h.state.is_warm(h.evm.block.coinbase));
     try std.testing.expect(h.state.is_warm(ecrecover));
     try std.testing.expect(h.state.is_warm(point_evaluation));
     try std.testing.expect(!(try h.state.access(ecrecover)).is_cold);
@@ -535,4 +576,56 @@ test "evm: tracer sees nested calls, logs, selfdestruct, and create in order" {
     try std.testing.expectEqualSlices(u8, &created, &recorder.outcomes[2].created.?);
     // The top frame's exit comes last and reports the transaction's outcome.
     try std.testing.expectEqual(outcome.gas_remaining, recorder.outcomes[3].gas_remaining);
+}
+
+/// Runs `code` at `contract` with `gas` and reports whether it ran out of gas and whether
+/// it loaded `target` from the database.
+fn cold_load_run(code: []const u8, gas: u64, target: Address) !struct { bool, bool } {
+    var h: Harness = undefined;
+    try h.init(std.testing.allocator);
+    defer h.deinit(std.testing.allocator);
+    try h.database.put_account(contract, 10, 0, code);
+    try h.database.put_account(target, 1, 0, &.{});
+    const outcome = try h.call(.prague, contract, &.{}, gas);
+    const loaded = h.state.accounts.getPtr(target) != null;
+    return .{ outcome.exit == .out_of_gas, loaded };
+}
+
+test "evm: an unaffordable cold access runs out of gas without reading the account" {
+    // revm (base/base) skips the database read of a cold account the frame cannot pay
+    // for; its stateless witnesses lack that account, so needlefish must not read it.
+    const target = primitives.address_from_int(0x7a26e7);
+    const push_target = [_]u8{0x73} ++ target; // PUSH20
+    const balance = push_target ++ [_]u8{ op.BALANCE, op.STOP };
+    const selfdestruct = push_target ++ [_]u8{op.SELFDESTRUCT};
+    // CALL(gas, target, value, 0, 0, 0, 0) with value 0 and 1.
+    const zeros = [_]u8{ op.PUSH1, 0, op.PUSH1, 0, op.PUSH1, 0, op.PUSH1, 0 };
+    const call_free = zeros ++ [_]u8{ op.PUSH1, 0 } ++ push_target ++
+        [_]u8{ op.PUSH1, 0, op.CALL, op.STOP };
+    const call_value = zeros ++ [_]u8{ op.PUSH1, 1 } ++ push_target ++
+        [_]u8{ op.PUSH1, 0, op.CALL, op.STOP };
+    const cases = [_]struct { code: []const u8, affordable: u64 }{
+        .{ .code = &balance, .affordable = 3 + 2600 },
+        .{ .code = &selfdestruct, .affordable = 3 + 5000 + 2600 },
+        .{ .code = &call_free, .affordable = 7 * 3 + 2600 },
+        .{ .code = &call_value, .affordable = 7 * 3 + 9000 + 2600 },
+    };
+    for (cases) |case| {
+        const short = try cold_load_run(case.code, case.affordable - 1, target);
+        try std.testing.expect(short[0]);
+        try std.testing.expect(!short[1]);
+        const enough = try cold_load_run(case.code, case.affordable + 40_000, target);
+        try std.testing.expect(!enough[0]);
+        try std.testing.expect(enough[1]);
+    }
+    // SLOAD: a cold slot below the cold surcharge is not read either.
+    const sload = [_]u8{ op.PUSH1, 7, op.SLOAD, op.STOP };
+    var h: Harness = undefined;
+    try h.init(std.testing.allocator);
+    defer h.deinit(std.testing.allocator);
+    try h.database.put_account(contract, 0, 0, &sload);
+    const outcome = try h.call(.prague, contract, &.{}, 3 + 2100 - 1);
+    try std.testing.expectEqual(evm_module.Exit.out_of_gas, outcome.exit);
+    const key: state_module.StorageKey = .{ .address = contract, .slot = 7 };
+    try std.testing.expect(h.state.slots.getPtr(key) == null);
 }

@@ -23,6 +23,7 @@ const memory_module = @import("memory.zig");
 const stack_module = @import("stack.zig");
 const bytecode = @import("bytecode.zig");
 const opcode_profile = @import("opcode_profile.zig");
+const coverage = @import("coverage.zig");
 const state_module = @import("state.zig");
 const evm_module = @import("evm.zig");
 const Fork = @import("fork.zig").Fork;
@@ -75,9 +76,19 @@ pub fn run(comptime fork: Fork, evm: *Evm, frame: *Frame) Exit {
                 defer opcode_profile.record(opcode, start);
                 if (comptime bytecode.fusion(opcode)) |parts| {
                     inline for (parts) |part| {
-                        if (!step(fork, part, r, &analyzed, f, evm, &exit)) break :loop;
+                        coverage.step(fork, part, f.depth);
+                        if (!step(fork, part, r, &analyzed, f, evm, &exit)) {
+                            coverage.halt(part, exit);
+                            break :loop;
+                        }
                     }
-                } else if (!step(fork, opcode, r, &analyzed, f, evm, &exit)) break :loop;
+                } else {
+                    coverage.step(fork, opcode, f.depth);
+                    if (!step(fork, opcode, r, &analyzed, f, evm, &exit)) {
+                        coverage.halt(opcode, exit);
+                        break :loop;
+                    }
+                }
                 continue :dispatch ops[r.pc];
             },
         }
@@ -735,9 +746,37 @@ fn charge_cold_account(comptime fork: Fork, f: *Frame, is_cold: bool) bool {
     return true;
 }
 
+/// A cold account access the frame cannot pay for: the instruction runs out of gas
+/// without reading the account (revm's `skip_cold_load`). The outcome is the same either
+/// way, but base/base's stateless witnesses lack such accounts, so the read must not happen.
+fn cold_account_unaffordable(
+    comptime fork: Fork,
+    evm: *Evm,
+    address: primitives.Address,
+    gas_available: u64,
+    cold_cost: u64,
+) bool {
+    if (!fork.at_least(.berlin) or gas_available >= cold_cost) return false;
+    return !evm.state.is_warm(address);
+}
+
+/// `cold_account_unaffordable` for a storage slot of the frame's account.
+fn cold_slot_unaffordable(
+    comptime fork: Fork,
+    f: *Frame,
+    evm: *Evm,
+    key: u256,
+    cold_cost: u64,
+) bool {
+    if (!fork.at_least(.berlin) or f.gas >= cold_cost) return false;
+    return !evm.state.is_slot_warm(f.account, key);
+}
+
 fn external_account(comptime fork: Fork, comptime opcode: u8, f: *Frame, evm: *Evm) ?Exit {
     const s = &f.stack;
     const address = primitives.u256_to_address(s.pop());
+    const extra = gas.cold_account_access_extra;
+    if (cold_account_unaffordable(fork, evm, address, f.gas, extra)) return .out_of_gas;
     const access = evm.state.access(address) catch |err| return evm.fail(err);
     if (!charge_cold_account(fork, f, access.is_cold)) return .out_of_gas;
     const account = access.account;
@@ -780,6 +819,7 @@ fn block_hash(f: *Frame, evm: *Evm) ?Exit {
 
 fn sload(comptime fork: Fork, f: *Frame, evm: *Evm) ?Exit {
     const key = f.stack.peek(0);
+    if (cold_slot_unaffordable(fork, f, evm, key.*, gas.cold_sload_extra)) return .out_of_gas;
     const access = evm.state.storage_access(f.account, key.*) catch |err| return evm.fail(err);
     if (fork.at_least(.berlin) and access.is_cold) {
         if (f.gas < gas.cold_sload_extra) return .out_of_gas;
@@ -794,6 +834,9 @@ fn sstore(comptime fork: Fork, f: *Frame, evm: *Evm) ?Exit {
     if (gas.sstore_requires_stipend(fork) and f.gas <= gas.call_stipend) return .out_of_gas;
     const key = f.stack.pop();
     const value = f.stack.pop();
+    // revm charges the warm read first, then skips the load below the cold surcharge.
+    const cold_store = gas.warm_storage_read + gas.cold_sload;
+    if (cold_slot_unaffordable(fork, f, evm, key, cold_store)) return .out_of_gas;
     const access = evm.state.storage_access(f.account, key) catch |err| return evm.fail(err);
     const slot = access.slot;
     const cost = gas.sstore(fork, slot.original, slot.present, value, access.is_cold);
@@ -876,6 +919,13 @@ fn call(comptime fork: Fork, comptime kind: CallKind, f: *Frame, evm: *Evm) ?Exi
         return .out_of_gas;
     const out_range = memory_range(&f.memory, &f.gas, out_offset, out_size) orelse
         return .out_of_gas;
+    // revm charges the value transfer before loading the target, and loads it (and its
+    // EIP-7702 delegate) only when the rest of the frame's gas covers the cold surcharge.
+    const value_cost: u64 = if (value != 0) gas.call_value else 0;
+    if (f.gas < value_cost) return .out_of_gas;
+    const after_value = f.gas - value_cost;
+    const extra = gas.cold_account_access_extra;
+    if (cold_account_unaffordable(fork, evm, target, after_value, extra)) return .out_of_gas;
     const access = evm.state.access(target) catch |err| return evm.fail(err);
     var cost: u64 = 0;
     if (fork.at_least(.berlin) and access.is_cold) cost += gas.cold_account_access_extra;
@@ -888,6 +938,12 @@ fn call(comptime fork: Fork, comptime kind: CallKind, f: *Frame, evm: *Evm) ?Exi
     if (fork.at_least(.prague)) {
         const code = evm.state.code(access.account) catch |err| return evm.fail(err);
         if (bytecode.delegation_target(code)) |delegate| {
+            const target_cold: u64 = if (access.is_cold) extra else 0;
+            if (after_value < target_cold + gas.warm_storage_read) return .out_of_gas;
+            const delegate_cold = target_cold + gas.cold_account_access;
+            if (cold_account_unaffordable(fork, evm, delegate, after_value, delegate_cold)) {
+                return .out_of_gas;
+            }
             const delegated = evm.state.access(delegate) catch |err| return evm.fail(err);
             cost += if (delegated.is_cold) gas.cold_account_access else gas.warm_storage_read;
             code_address = delegate;
@@ -930,6 +986,9 @@ fn call_creates_account(
 fn self_destruct(comptime fork: Fork, f: *Frame, evm: *Evm) ?Exit {
     if (f.is_static) return .static_violation;
     const target = primitives.u256_to_address(f.stack.pop());
+    if (cold_account_unaffordable(fork, evm, target, f.gas, gas.cold_account_access)) {
+        return .out_of_gas;
+    }
     const balance = f.account.info.balance;
     const result = evm.state.self_destruct(fork, f.address, target) catch |err| {
         return evm.fail(err);

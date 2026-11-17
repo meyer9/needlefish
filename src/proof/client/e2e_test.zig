@@ -963,7 +963,7 @@ const Fixture = struct {
             .intermediate = &self.sampler,
         }) catch |err| {
             const last = self.handler.last_error;
-            std.debug.print("client failed: {t}, host error: {?}\n", .{ err, last });
+            std.log.debug("client failed: {t}, host error: {?}", .{ err, last });
             return err;
         };
         var scratch: [program.boot.rollup_config_bytes_max]u8 = undefined;

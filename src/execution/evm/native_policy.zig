@@ -256,11 +256,16 @@ pub fn dispatch(context: *Context, input: []const u8) Error![]const u8 {
     const version = version_of(context);
     const function = find(selector, version) orelse return context.revert_selector(selector);
     assert(input.len >= 4);
+    // The V1 surface has no argument-free function: shorter calldata fails the interface.
+    // Later surfaces have some, so their minimum is 0.
+    if (version == .v1 and input.len < 4 + 32) {
+        return context.revert_decode(selector, "IPolicyRegistryCalls", .short, input, &.{});
+    }
     var failure: native.DecodeFailure = .overrun;
     const enumeration_max = if (version == .v1) type_allowlist else type_intersect;
     const kinds = function.kinds;
     const arguments = abi.decode_arguments(input[4..], kinds, enumeration_max, &failure) orelse
-        return context.revert_decode(selector, function.parameters, failure);
+        return context.revert_decode(selector, function.parameters, failure, input[4..], kinds);
     if (function.mutating) try ensure_activated(context);
     return route(context, function.tag, &arguments);
 }
@@ -273,6 +278,7 @@ fn ensure_activated(context: *Context) Error!void {
 }
 
 fn route(context: *Context, tag: Tag, arguments: *const Arguments) Error![]const u8 {
+    // Zero for the argument-free functions (`Arguments` defaults absent heads to zero).
     const id = arguments.uint64(0);
     const version = version_of(context);
     switch (tag) {

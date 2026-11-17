@@ -67,6 +67,10 @@ pub const ChainSpec = struct {
     gas_limit: u64,
     /// Base fee of the genesis block (London active at genesis).
     genesis_base_fee: u64 = 1_000_000_000,
+    /// L2: the ActivationRegistry admin the EVM falls back to (Beryl+; base/base
+    /// `activation_admin_address`: the built-in chain's Beryl admin, or a genesis file's
+    /// `config.activationAdminAddress`).
+    activation_admin: ?[20]u8 = null,
 
     pub const presets = @import("presets.zig");
 

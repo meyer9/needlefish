@@ -570,16 +570,7 @@ pub const Chain = struct {
 
     /// The chain's Denim timestamp schedule, when Denim is scheduled on an L2.
     pub fn denim_schedule(chain: *const Chain) ?base_time.Schedule {
-        if (chain.spec.mode != .l2) return null;
-        const activation = chain.spec.upgrades[@backingInt(chainspec.Upgrade.denim)] orelse
-            return null;
-        assert(chain.spec.block_time_seconds > 0);
-        return .{
-            .genesis_block_number = chain.genesis_number,
-            .genesis_timestamp = chain.genesis_timestamp,
-            .legacy_interval_seconds = chain.spec.block_time_seconds,
-            .denim_activation_timestamp = activation,
-        };
+        return denim_schedule_of(chain.spec, chain.genesis_number, chain.genesis_timestamp);
     }
 
     /// Denim subsecond blocks: the header timestamp is the schedule's (selected by block
@@ -592,56 +583,11 @@ pub const Chain = struct {
         child: *const Header,
         transactions: []const []const u8,
     ) ?[]const u8 {
-        const schedule = chain.denim_schedule() orelse return null;
-        if (child.number == schedule.genesis_block_number) return null;
-        if (!schedule.subsecond_at(child.number)) return null;
-        const expected = schedule.parts(child.number);
-        if (child.timestamp != expected.seconds) return "timestamp off the subsecond schedule";
-        const second: ?consensus.Envelope = if (transactions.len > 1)
-            consensus.Envelope.decode(transactions[1]) catch return "invalid BaseTime deposit"
-        else
-            null;
-        const millis_part = consensus.base_time.extract(second, child.number) catch
-            return "invalid BaseTime deposit";
-        if (millis_part != expected.millis_part) return "BaseTime millisecond part off schedule";
-        return null;
+        return check_subsecond_schedule(chain.denim_schedule(), child, transactions);
     }
 
-    /// Consensus checks of `child` against `parent` that do not need execution.
     fn check_header(chain: *const Chain, parent: *const Header, child: *const Header) ?[]const u8 {
-        if (child.gas_used > child.gas_limit) return "gas used above gas limit";
-        const expected_base_fee = chain.spec.next_base_fee(.{
-            .timestamp = parent.timestamp,
-            .gas_used = parent.gas_used,
-            .gas_limit = parent.gas_limit,
-            .base_fee = parent.base_fee_per_gas orelse 0,
-            .blob_gas_used = parent.blob_gas_used orelse 0,
-            .excess_blob_gas = parent.excess_blob_gas orelse 0,
-            .extra_data = parent.extra_data,
-        }, child.timestamp) catch return "invalid parent extra data";
-        if (child.base_fee_per_gas != expected_base_fee) return "invalid base fee";
-        if (chain.spec.mode == .l1) {
-            const limit = parent.gas_limit / 1024;
-            const high = @max(child.gas_limit, parent.gas_limit);
-            const delta = high - @min(child.gas_limit, parent.gas_limit);
-            if (delta >= limit or child.gas_limit < 5000) return "invalid gas limit";
-        } else if (chain.spec.is_upgrade_active(.holocene, child.timestamp)) {
-            const jovian = chain.spec.is_upgrade_active(.jovian, child.timestamp);
-            const valid = if (jovian)
-                chainspec.basefee.decode_jovian(child.extra_data)
-            else
-                chainspec.basefee.decode_holocene(child.extra_data);
-            _ = valid catch return "invalid extra data";
-        }
-        if (chain.spec.blob_params_at(child.timestamp)) |params| {
-            const expected = params.next_excess_blob_gas(
-                parent.excess_blob_gas orelse 0,
-                parent.blob_gas_used orelse 0,
-                parent.base_fee_per_gas orelse 0,
-            );
-            if (child.excess_blob_gas != expected) return "invalid excess blob gas";
-        }
-        return null;
+        return check_parent(chain.spec, parent, child);
     }
 
     fn check_executed(
@@ -649,31 +595,15 @@ pub const Chain = struct {
         child: *const Header,
         executed: *const executor_module.Executed,
     ) ?[]const u8 {
-        if (child.gas_used != executed.gas_used) return "gas used mismatch";
-        if (!child.logs_bloom.eql(executed.logs_bloom)) return "logs bloom mismatch";
-        if (!std.mem.eql(u8, &child.receipts_root.bytes, &executed.receipts_root)) {
-            return "receipts root mismatch";
-        }
-        if (!std.mem.eql(u8, &child.state_root.bytes, &executed.state_root)) {
-            return "state root mismatch";
-        }
-        if (child.blob_gas_used) |used| if (used != executed.blob_gas_used) {
-            return "blob gas used mismatch";
-        };
-        if (chain.spec.mode == .l1) {
-            if (child.requests_hash) |hash| {
-                if (!hash.eql(consensus.block.requests_hash(executed.requests))) {
-                    return "requests hash mismatch";
-                }
-            }
-        } else if (chain.spec.is_upgrade_active(.isthmus, child.timestamp)) {
-            const key = primitives.keccak256(&l2_to_l1_message_passer).bytes;
-            const root = chain.db.trie().storage_root(key);
-            if (!std.mem.eql(u8, &child.withdrawals_root.?.bytes, &root)) {
-                return "withdrawals root mismatch";
-            }
-        }
-        return null;
+        return check_results(chain.spec, child, executed, chain.message_passer_root(child));
+    }
+
+    /// The L2ToL1MessagePasser storage root of the current state (the withdrawals root of
+    /// an Isthmus `child`; zero before Isthmus, where nothing reads it).
+    fn message_passer_root(chain: *Chain, child: *const Header) Hash {
+        if (!chain.spec.is_upgrade_active(.isthmus, child.timestamp)) return @splat(0);
+        const key = primitives.keccak256(&l2_to_l1_message_passer).bytes;
+        return chain.db.trie().storage_root(key);
     }
 
     fn store_block(
@@ -1224,26 +1154,8 @@ pub const Chain = struct {
         withdrawals: ?[]const payload.Withdrawal,
         executed: *const executor_module.Executed,
     ) void {
-        child.state_root = .{ .bytes = executed.state_root };
-        child.transactions_root = .{ .bytes = ordered.ordered_trie_root(transactions) };
-        child.receipts_root = .{ .bytes = executed.receipts_root };
-        child.logs_bloom = executed.logs_bloom;
-        child.gas_used = executed.gas_used;
-        if (child.parent_beacon_block_root != null) child.blob_gas_used = executed.blob_gas_used;
-        if (withdrawals) |list| {
-            child.withdrawals_root = withdrawals_root(list);
-        }
-        const prague = chain.spec.is_ethereum_fork_active(.prague, child.timestamp);
-        if (prague) {
-            if (chain.spec.mode == .l1) {
-                child.requests_hash = consensus.block.requests_hash(executed.requests);
-            } else {
-                child.requests_hash = consensus.block.empty_requests_hash;
-                const key = primitives.keccak256(&l2_to_l1_message_passer).bytes;
-                child.withdrawals_root = .{ .bytes = chain.db.trie().storage_root(key) };
-            }
-        }
-        assert(child.optionals_contiguous());
+        const root = chain.message_passer_root(child);
+        seal_header(chain.spec, child, transactions, withdrawals, executed, root);
     }
 
     // ---- Records --------------------------------------------------------------------
@@ -1303,6 +1215,149 @@ fn ref_of(child: *const Header, hash: Hash) block_store.Ref {
         .number = child.number,
         .timestamp = child.timestamp,
     };
+}
+
+/// The Denim timestamp schedule of an L2 chain with this genesis, when Denim is scheduled.
+pub fn denim_schedule_of(
+    spec: *const chainspec.ChainSpec,
+    genesis_number: u64,
+    genesis_timestamp: u64,
+) ?base_time.Schedule {
+    if (spec.mode != .l2) return null;
+    const activation = spec.upgrades[@backingInt(chainspec.Upgrade.denim)] orelse return null;
+    assert(spec.block_time_seconds > 0);
+    return .{
+        .genesis_block_number = genesis_number,
+        .genesis_timestamp = genesis_timestamp,
+        .legacy_interval_seconds = spec.block_time_seconds,
+        .denim_activation_timestamp = activation,
+    };
+}
+
+pub fn check_subsecond_schedule(
+    denim_schedule: ?base_time.Schedule,
+    child: *const Header,
+    transactions: []const []const u8,
+) ?[]const u8 {
+    const schedule = denim_schedule orelse return null;
+    if (child.number == schedule.genesis_block_number) return null;
+    if (!schedule.subsecond_at(child.number)) return null;
+    const expected = schedule.parts(child.number);
+    if (child.timestamp != expected.seconds) return "timestamp off the subsecond schedule";
+    const second: ?consensus.Envelope = if (transactions.len > 1)
+        consensus.Envelope.decode(transactions[1]) catch return "invalid BaseTime deposit"
+    else
+        null;
+    const millis_part = consensus.base_time.extract(second, child.number) catch
+        return "invalid BaseTime deposit";
+    if (millis_part != expected.millis_part) return "BaseTime millisecond part off schedule";
+    return null;
+}
+
+/// Consensus checks of `child` against `parent` that do not need execution.
+pub fn check_parent(
+    spec: *const chainspec.ChainSpec,
+    parent: *const Header,
+    child: *const Header,
+) ?[]const u8 {
+    if (child.gas_used > child.gas_limit) return "gas used above gas limit";
+    const expected_base_fee = spec.next_base_fee(.{
+        .timestamp = parent.timestamp,
+        .gas_used = parent.gas_used,
+        .gas_limit = parent.gas_limit,
+        .base_fee = parent.base_fee_per_gas orelse 0,
+        .blob_gas_used = parent.blob_gas_used orelse 0,
+        .excess_blob_gas = parent.excess_blob_gas orelse 0,
+        .extra_data = parent.extra_data,
+    }, child.timestamp) catch return "invalid parent extra data";
+    if (child.base_fee_per_gas != expected_base_fee) return "invalid base fee";
+    if (spec.mode == .l1) {
+        const limit = parent.gas_limit / 1024;
+        const high = @max(child.gas_limit, parent.gas_limit);
+        const delta = high - @min(child.gas_limit, parent.gas_limit);
+        if (delta >= limit or child.gas_limit < 5000) return "invalid gas limit";
+    } else if (spec.is_upgrade_active(.holocene, child.timestamp)) {
+        const jovian = spec.is_upgrade_active(.jovian, child.timestamp);
+        const valid = if (jovian)
+            chainspec.basefee.decode_jovian(child.extra_data)
+        else
+            chainspec.basefee.decode_holocene(child.extra_data);
+        _ = valid catch return "invalid extra data";
+    }
+    if (spec.blob_params_at(child.timestamp)) |params| {
+        const expected = params.next_excess_blob_gas(
+            parent.excess_blob_gas orelse 0,
+            parent.blob_gas_used orelse 0,
+            parent.base_fee_per_gas orelse 0,
+        );
+        if (child.excess_blob_gas != expected) return "invalid excess blob gas";
+    }
+    return null;
+}
+
+/// Post-execution checks of `child` against its execution results; `message_passer_root` is
+/// the L2ToL1MessagePasser storage root of the post-state (the Isthmus withdrawals root).
+pub fn check_results(
+    spec: *const chainspec.ChainSpec,
+    child: *const Header,
+    executed: *const executor_module.Executed,
+    message_passer_root: Hash,
+) ?[]const u8 {
+    if (child.gas_used != executed.gas_used) return "gas used mismatch";
+    if (!child.logs_bloom.eql(executed.logs_bloom)) return "logs bloom mismatch";
+    if (!std.mem.eql(u8, &child.receipts_root.bytes, &executed.receipts_root)) {
+        return "receipts root mismatch";
+    }
+    if (!std.mem.eql(u8, &child.state_root.bytes, &executed.state_root)) {
+        return "state root mismatch";
+    }
+    if (child.blob_gas_used) |used| if (used != executed.blob_gas_used) {
+        return "blob gas used mismatch";
+    };
+    if (spec.mode == .l1) {
+        if (child.requests_hash) |hash| {
+            if (!hash.eql(consensus.block.requests_hash(executed.requests))) {
+                return "requests hash mismatch";
+            }
+        }
+    } else if (spec.is_upgrade_active(.isthmus, child.timestamp)) {
+        const root = child.withdrawals_root orelse return "withdrawals root missing";
+        if (!std.mem.eql(u8, &root.bytes, &message_passer_root)) {
+            return "withdrawals root mismatch";
+        }
+    }
+    return null;
+}
+
+/// Fills the execution results into `child`; `message_passer_root` is the
+/// L2ToL1MessagePasser storage root of the post-state (the Isthmus withdrawals root).
+pub fn seal_header(
+    spec: *const chainspec.ChainSpec,
+    child: *Header,
+    transactions: []const []const u8,
+    withdrawals: ?[]const payload.Withdrawal,
+    executed: *const executor_module.Executed,
+    message_passer_root: Hash,
+) void {
+    child.state_root = .{ .bytes = executed.state_root };
+    child.transactions_root = .{ .bytes = ordered.ordered_trie_root(transactions) };
+    child.receipts_root = .{ .bytes = executed.receipts_root };
+    child.logs_bloom = executed.logs_bloom;
+    child.gas_used = executed.gas_used;
+    if (child.parent_beacon_block_root != null) child.blob_gas_used = executed.blob_gas_used;
+    if (withdrawals) |list| {
+        child.withdrawals_root = withdrawals_root(list);
+    }
+    const prague = spec.is_ethereum_fork_active(.prague, child.timestamp);
+    if (prague) {
+        if (spec.mode == .l1) {
+            child.requests_hash = consensus.block.requests_hash(executed.requests);
+        } else {
+            child.requests_hash = consensus.block.empty_requests_hash;
+            child.withdrawals_root = .{ .bytes = message_passer_root };
+        }
+    }
+    assert(child.optionals_contiguous());
 }
 
 pub fn env_of(child: *const Header) executor_module.BlockEnv {

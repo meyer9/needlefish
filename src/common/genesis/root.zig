@@ -95,17 +95,21 @@ pub const Config = struct {
         return if (time) |activation| timestamp >= activation else false;
     }
 
-    /// OP chains imply Shanghai at Canyon, Cancun at Ecotone, Prague at Isthmus.
+    /// OP chains take Shanghai from Canyon, Cancun from Ecotone, Prague from Isthmus and
+    /// ignore the Ethereum fork times (base/base `BaseChainSpec::try_from_genesis`).
     pub fn is_shanghai(config: Config, timestamp: u64) bool {
-        return active(config.shanghai_time, timestamp) or active(config.canyon_time, timestamp);
+        if (config.is_optimism()) return active(config.canyon_time, timestamp);
+        return active(config.shanghai_time, timestamp);
     }
 
     pub fn is_cancun(config: Config, timestamp: u64) bool {
-        return active(config.cancun_time, timestamp) or active(config.ecotone_time, timestamp);
+        if (config.is_optimism()) return active(config.ecotone_time, timestamp);
+        return active(config.cancun_time, timestamp);
     }
 
     pub fn is_prague(config: Config, timestamp: u64) bool {
-        return active(config.prague_time, timestamp) or active(config.isthmus_time, timestamp);
+        if (config.is_optimism()) return active(config.isthmus_time, timestamp);
+        return active(config.prague_time, timestamp);
     }
 
     pub fn is_isthmus(config: Config, timestamp: u64) bool {
@@ -155,7 +159,8 @@ pub const Genesis = struct {
             .difficulty = genesis.difficulty,
             .number = genesis.number,
             .gas_limit = genesis.gas_limit,
-            .gas_used = genesis.gas_used,
+            // reth's genesis header never carries gas used (alloy's genesis has none).
+            .gas_used = 0,
             .timestamp = timestamp,
             .extra_data = genesis.extra_data,
             .mix_hash = genesis.mix_hash,

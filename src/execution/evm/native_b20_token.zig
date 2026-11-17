@@ -211,7 +211,13 @@ fn decode(context: *Context, function: *const Function, input: []const u8) Error
     const kinds = function.kinds;
     const maximum = enumeration_max(version_of(context));
     return abi.decode_arguments(input[4..], kinds, maximum, &failure) orelse
-        return context.revert_decode(function.selector, function.parameters, failure);
+        return context.revert_decode(
+            function.selector,
+            function.parameters,
+            failure,
+            input[4..],
+            kinds,
+        );
 }
 
 /// Every call except `announce` (which runs its internal calls through here).
@@ -259,7 +265,10 @@ fn internal_call(context: *Context, call: []const u8, privileged: bool) Error!vo
         return revert_with_bytes(context, error_internal_call_failed, call);
     if (function.tag == .announce) return context.revert_selector(error_announcement_in_progress);
     _ = execute(context, function, call, privileged) catch |err| switch (err) {
-        error.Revert => return revert_with_bytes(context, error_internal_call_failed, call),
+        error.Revert => {
+            if (context.panicked()) return error.Revert;
+            return revert_with_bytes(context, error_internal_call_failed, call);
+        },
         else => |other| return other,
     };
 }
@@ -406,9 +415,11 @@ fn view_extension(context: *Context, tag: Tag, arguments: *const Arguments) Erro
             return write_bool(context, supported);
         },
         .to_raw_balance, .from_ui_amount => {
+            // base/base reads the multiplier before the overflow check (its gas is spent).
+            const divisor = try multiplier(context);
             const product = std.math.mul(u256, arguments.uint256(0), wad) catch
                 return b20.overflow(context);
-            return write_u256(context, product / try multiplier(context));
+            return write_u256(context, product / divisor);
         },
         .scaled_balance_of, .balance_of_ui => {
             const balance = try b20.balance_of(context, arguments.address(0));
@@ -1358,19 +1369,19 @@ pub const functions = [_]Function{
     .{
         .tag = .is_paused,
         .selector = .{ 0xbc, 0x61, 0xe7, 0x33 },
-        .parameters = "(PausableFeature)",
+        .parameters = "(uint8)",
         .kinds = &.{.enumeration},
     },
     .{
         .tag = .pause,
         .selector = .{ 0xa2, 0x90, 0x24, 0x9c },
-        .parameters = "(PausableFeature[])",
+        .parameters = "(uint8[])",
         .kinds = &.{.enumeration_array},
     },
     .{
         .tag = .unpause,
         .selector = .{ 0x8b, 0x93, 0xdd, 0x63 },
-        .parameters = "(PausableFeature[])",
+        .parameters = "(uint8[])",
         .kinds = &.{.enumeration_array},
     },
     .{

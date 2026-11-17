@@ -16,6 +16,9 @@ pub const Error = error{
     InvalidForkOrder,
     InvalidBaseFeeParams,
     InvalidBlockTime,
+    /// Beryl is scheduled without a non-zero `activationAdminAddress` (base/base
+    /// `validate_beryl_activation_admin`).
+    MissingActivationAdmin,
 };
 
 pub fn from_genesis(parsed: *const genesis.Genesis) Error!ChainSpec {
@@ -70,9 +73,17 @@ fn set_upgrades(spec: *ChainSpec, config: genesis.Config) Error!void {
     inline for (base_pairs) |pair| {
         upgrades[@backingInt(pair[0])] = config.base_upgrade_time(pair[1]);
     }
+    if (config.activation_admin_address) |address| spec.activation_admin = address.bytes;
+    if (upgrades[@backingInt(root.Upgrade.beryl)] != null) {
+        const address = spec.activation_admin orelse return error.MissingActivationAdmin;
+        if (std.mem.allEqual(u8, &address, 0)) return error.MissingActivationAdmin;
+    }
     if (config.block_time) |seconds| {
         if (seconds == 0) return error.InvalidBlockTime;
         spec.block_time_seconds = seconds;
+    } else if (upgrades[@backingInt(root.Upgrade.denim)] != null) {
+        // base/base anchors the Denim schedule on `blockTime` and rejects blocks without it.
+        return error.InvalidBlockTime;
     }
     const elasticity = config.eip1559_elasticity orelse 6;
     const denominator = config.eip1559_denominator orelse 50;
@@ -147,7 +158,12 @@ test "chainspec: Base upgrades and block time from config.base and blockTime" {
     l2.config.base_upgrade_times[@backingInt(genesis.BaseUpgrade.beryl)] = 0;
     l2.config.base_upgrade_times[@backingInt(genesis.BaseUpgrade.cobalt)] = 0;
     l2.config.base_upgrade_times[@backingInt(genesis.BaseUpgrade.denim)] = 10;
+    try testing.expectError(error.MissingActivationAdmin, from_genesis(&l2));
+    l2.config.activation_admin_address = .{ .bytes = @splat(0) };
+    try testing.expectError(error.MissingActivationAdmin, from_genesis(&l2));
+    l2.config.activation_admin_address = .{ .bytes = @splat(0x18) };
     const spec = try from_genesis(&l2);
+    try testing.expectEqual(@as(?[20]u8, @splat(0x18)), spec.activation_admin);
     try testing.expect(spec.is_upgrade_active(.azul, 0));
     try testing.expect(spec.is_ethereum_fork_active(.osaka, 0));
     try testing.expect(!spec.is_upgrade_active(.denim, 9));
@@ -157,5 +173,8 @@ test "chainspec: Base upgrades and block time from config.base and blockTime" {
     try testing.expect(spec.timestamp_follows(10, 10));
     try testing.expect(!spec.timestamp_follows(9, 9));
     l2.config.block_time = 0;
+    try testing.expectError(error.InvalidBlockTime, from_genesis(&l2));
+    // Denim anchors its schedule on `blockTime`; base/base rejects blocks without it.
+    l2.config.block_time = null;
     try testing.expectError(error.InvalidBlockTime, from_genesis(&l2));
 }

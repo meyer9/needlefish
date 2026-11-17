@@ -45,6 +45,9 @@ test "op: deposit mints, skips fees, and refunds normally" {
     const tx = deposit(target, 100_000);
     const executed = (try transaction.transact(&h.evm, .prague, &tx)).executed;
     try testing.expectEqual(evm_module.Status.success, executed.status);
+    // The coinbase is warm but never read (a deposit-only block's witness lacks it).
+    try testing.expect(h.state.accounts.getPtr(coinbase) == null);
+    try testing.expect(h.state.is_warm(coinbase));
     try testing.expectEqual(@as(u64, 21_000 + 22_106), executed.gas_used);
     try testing.expectEqual(@as(u256, 995), try balance(&h, depositor));
     try testing.expectEqual(@as(u256, 5), try balance(&h, target));
@@ -105,7 +108,7 @@ test "op: deposit whose value exceeds balance plus mint fails with its whole gas
     try testing.expectEqual(@as(u256, 5), try balance(&h, target));
 }
 
-test "op: deposits need OP rules and reject system transactions since Regolith" {
+test "op: deposits need OP rules; a system deposit since Regolith is a failed deposit" {
     var h: Harness = undefined;
     try h.init(testing.allocator);
     defer h.deinit(testing.allocator);
@@ -114,9 +117,15 @@ test "op: deposits need OP rules and reject system transactions since Regolith" 
     try testing.expectEqual(transaction.Invalid.type_not_supported, plain.invalid);
     h.evm.block.op = .{ .upgrade = .regolith };
     tx.is_system_transaction = true;
-    const system = try transaction.transact(&h.evm, .shanghai, &tx);
-    try testing.expectEqual(transaction.Invalid.deposit_system_transaction, system.invalid);
-    try testing.expectEqual(@as(u256, 0), try balance(&h, depositor));
+    // base/base: `validate_env` rejects it, `catch_error` includes it as a failed deposit
+    // (mint and nonce bump kept, no value transfer, the whole gas limit used).
+    const system = (try transaction.transact(&h.evm, .shanghai, &tx)).executed;
+    try testing.expectEqual(evm_module.Status.halt, system.status);
+    try testing.expectEqual(@as(u64, 100_000), system.gas_used);
+    try testing.expectEqual(@as(u256, 1_000), try balance(&h, depositor));
+    try testing.expectEqual(@as(u256, 0), try balance(&h, target));
+    const account = (try h.state.load(depositor)).info;
+    try testing.expectEqual(@as(u64, 1), account.nonce);
 }
 
 fn put_l1_block(h: *Harness) !void {
@@ -369,7 +378,12 @@ fn fuzz_native(h: *Harness, smith: *testing.Smith) anyerror!void {
     try testing.expect(executed.gas_used <= gas_limit);
     switch (executed.status) {
         .success => try testing.expect(executed.output.len == 0 or executed.output.len == 32),
-        .revert => try testing.expect(executed.output.len <= 4 + 64),
+        .revert => {
+            // An error is at most two words; only a Beryl decode failure carries text.
+            const text = executed.output[@min(4, executed.output.len)..];
+            const decode = std.mem.startsWith(u8, text, "type check failed for ");
+            try testing.expect(executed.output.len <= 4 + 64 or (decode and upgrade == .beryl));
+        },
         .halt => try testing.expectEqual(gas_limit, executed.gas_used),
     }
 }
@@ -540,11 +554,62 @@ test "op: PolicyRegistry rejects value and reports Beryl decode failures" {
     const words = [_]u256{ address_int(sender_address), 2 };
     const bad_type = policy_input(&buffer, .create_policy, &words, null);
     const failed = try native_call(&h, policy.address, bad_type, 0);
-    const message = "type check failed for \"(address,uint8)\"";
+    // A static tuple's data is its two words, the enum word as given.
+    const message = "type check failed for \"(address,uint8)\" with data: " ++
+        "00000000000000000000000000000000000000000000000000000000005e4de2" ++
+        "0000000000000000000000000000000000000000000000000000000000000002";
     const expected = policy_selector(.create_policy) ++ message.*;
     try testing.expectEqualSlices(u8, &expected, failed.output);
     const paid = try native_call(&h, policy.address, bad_type, 1);
     try testing.expectEqualSlices(u8, &native.selector_non_payable, paid.output);
+    // Calldata shorter than the V1 interface minimum (one word) fails the whole interface,
+    // with the calldata as data, before any argument decodes.
+    const short_input = policy_selector(.create_policy) ++ [_]u8{ 0xab, 0xcd };
+    const short = try native_call(&h, policy.address, &short_input, 0);
+    const short_message = "type check failed for \"IPolicyRegistryCalls\" with data: ";
+    var short_expected: [4 + short_message.len + 12]u8 = undefined;
+    _ = try std.fmt.bufPrint(&short_expected, "{s}{s}{x}", .{
+        &policy_selector(.create_policy),
+        short_message,
+        &short_input,
+    });
+    try testing.expectEqualSlices(u8, &short_expected, short.output);
+}
+
+test "op: B-20 factory calldata below the interface minimum fails the interface type check" {
+    var h: Harness = undefined;
+    try h.init(testing.allocator);
+    defer h.deinit(testing.allocator);
+    h.evm.block.op = .{ .upgrade = .beryl, .activation_admin = sender_address };
+    const selector = b20_factory.selector_of(.create_b20);
+    // 16 bytes, as in the fuzz finding: alloy reports the interface, not a field overrun.
+    const input = selector ++ @as([12]u8, @splat(0x11));
+    const beryl = try create_call(&h, &input);
+    try testing.expect(beryl.status == .revert);
+    const message = "type check failed for \"IB20FactoryCalls\" with data: ";
+    var expected: [4 + message.len + 32]u8 = undefined;
+    _ = try std.fmt.bufPrint(&expected, "{s}{s}{x}", .{ &selector, message, &input });
+    try testing.expectEqualSlices(u8, &expected, beryl.output);
+    // From Cobalt the error is the bare selector.
+    h.evm.block.op = .{ .upgrade = .cobalt, .activation_admin = sender_address };
+    const cobalt = try create_call(&h, &input);
+    try testing.expectEqualSlices(u8, &selector, cobalt.output);
+}
+
+test "op: PolicyRegistry argument-free views answer a bare selector (Denim)" {
+    var h: Harness = undefined;
+    try h.init(testing.allocator);
+    defer h.deinit(testing.allocator);
+    h.evm.block.op = .{ .upgrade = .denim, .activation_admin = sender_address };
+    // A 4-byte call once read the absent policy id through an undefined argument pointer.
+    const minimum = policy_selector(.min_composite_child_policies);
+    const low = try native_call(&h, policy.address, &minimum, 0);
+    try testing.expectEqual(evm_module.Status.success, low.status);
+    try testing.expectEqual(@as(u256, policy.children_min), output_word(low));
+    const maximum = policy_selector(.max_composite_child_policies);
+    const high = try native_call(&h, policy.address, &maximum, 0);
+    try testing.expectEqual(evm_module.Status.success, high.status);
+    try testing.expectEqual(@as(u256, policy.children_max), output_word(high));
 }
 
 fn policy_call(h: *Harness, input: []const u8) !transaction.Executed {
@@ -758,9 +823,18 @@ test "op: B-20 asset pause flags, roles, and views" {
     const features = try token_call(&h, .paused_features, &.{});
     try testing.expectEqual(@as(usize, 96), features.output.len);
     // Out-of-range enum is a decode failure; empty arrays revert EmptyFeatureSet.
-    const bad_input = token_input(&buffer, .pause, &.{ 0x20, 1, 3 });
+    // Before Cobalt it reverts with alloy's message: the Solidity type (an enum is uint8) and
+    // the decoded tuple re-encoded, so a non-canonical offset (0x40 here) comes back as 0x20.
+    const bad_input = token_input(&buffer, .pause, &.{ 0x40, 0xdead, 1, 3 });
     const bad = try native_call(&h, token_address, bad_input, 0);
     try testing.expect(bad.status == .revert);
+    const bad_message = "type check failed for \"(uint8[])\" with data: " ++
+        "0000000000000000000000000000000000000000000000000000000000000020" ++
+        "0000000000000000000000000000000000000000000000000000000000000020" ++
+        "0000000000000000000000000000000000000000000000000000000000000001" ++
+        "0000000000000000000000000000000000000000000000000000000000000003";
+    const bad_expected = b20_asset.selector_of(.pause) ++ bad_message.*;
+    try testing.expectEqualSlices(u8, &bad_expected, bad.output);
     const empty_input = token_input(&buffer, .pause, &.{ 0x20, 0 });
     const empty = try native_call(&h, token_address, empty_input, 0);
     try testing.expectEqual(@as(usize, 4), empty.output.len);
@@ -781,6 +855,23 @@ test "op: B-20 asset pause flags, roles, and views" {
     try testing.expectEqualSlices(u8, &.{ 0xde, 0xad, 0xbe, 0xef }, unknown.output);
     const payable = try native_call(&h, token_address, token_input(&buffer, .name, &.{}), 1);
     try testing.expectEqualSlices(u8, &native.selector_non_payable, payable.output);
+}
+
+test "op: B-20 toRawBalance (fromUIAmount) reads the multiplier before its overflow check" {
+    var h: Harness = undefined;
+    try token_setup(&h);
+    defer h.deinit(testing.allocator);
+    var buffer: [4 + 32]u8 = undefined;
+    const fine_input = token_input(&buffer, .to_raw_balance, &.{1});
+    const fine = try native_call(&h, token_address, fine_input, 0);
+    try testing.expect(fine.status == .success);
+    const fine_gas = fine.gas_used - 21_000 - calldata_gas(fine_input);
+    // base/base: the multiplier read (a cold SLOAD) is paid before the product overflows.
+    const max_input = token_input(&buffer, .to_raw_balance, &.{std.math.maxInt(u256)});
+    const overflow = try native_call(&h, token_address, max_input, 0);
+    try testing.expect(overflow.status == .revert);
+    try testing.expectEqualSlices(u8, &native.error_panic, overflow.output[0..4]);
+    try testing.expectEqual(fine_gas, overflow.gas_used - 21_000 - calldata_gas(max_input));
 }
 
 test "op: B-20 asset metadata, multiplier, allowances, and permit failures" {
@@ -991,6 +1082,23 @@ test "op: B-20 asset announce runs internal calls atomically" {
     try testing.expectEqual(@as(usize, 4 + 64 + 96), failed.output.len);
 }
 
+/// `Panic(0x11)`, the revert of base/base's checked arithmetic.
+const panic_overflow = native.error_panic ++ native.u256_word(0x11);
+
+test "op: B-20 announce passes an internal call's Panic through unwrapped" {
+    var h: Harness = undefined;
+    try token_setup(&h);
+    defer h.deinit(testing.allocator);
+    _ = try token_call(&h, .grant_role, &.{ b20_asset.role_operator, address_int(sender_address) });
+    var call_buffer: [4 + 32]u8 = undefined;
+    const overflow = token_input(&call_buffer, .to_raw_balance, &.{std.math.maxInt(u256)});
+    var buffer: [4 + 32 * 16]u8 = undefined;
+    const id = short_string("p") & ~@as(u256, 0xff);
+    const failed = try native_call(&h, token_address, announce_input(&buffer, overflow, id), 0);
+    try testing.expect(failed.status == .revert);
+    try testing.expectEqualSlices(u8, &panic_overflow, failed.output);
+}
+
 const b20_factory = @import("native_b20_factory.zig");
 
 const Writer = struct {
@@ -1098,6 +1206,14 @@ test "op: B-20 factory creates activated asset tokens with init calls" {
     const unknown = try create_call(&h, create_input(&buffer, 8, 1, 6, &.{ 1, 2, 3, 4 }));
     try testing.expect(unknown.status == .revert);
     try testing.expectEqual(@as(usize, 36), unknown.output.len);
+    // A Panic in an init call is base/base's system error: it passes through, not as
+    // InitCallFailed (fuzz: a mint whose total supply overflows).
+    var overflow_buffer: [4 + 32]u8 = undefined;
+    const maximum = std.math.maxInt(u256);
+    const overflow = token_input(&overflow_buffer, .to_raw_balance, &.{maximum});
+    const panicked = try create_call(&h, create_input(&buffer, 9, 1, 6, overflow));
+    try testing.expect(panicked.status == .revert);
+    try testing.expectEqualSlices(u8, &panic_overflow, panicked.output);
     const fresh = try create_call(&h, create_input(&buffer, 8, 1, 6, null));
     try testing.expect(fresh.status == .success);
 }

@@ -1251,7 +1251,11 @@ pub const Executor = struct {
 
     fn receipts_root(executor: *Executor, receipts: []const Receipt) Error!Hash {
         const items = try executor.alloc([]const u8, receipts.len);
-        for (receipts, 0..) |receipt, index| {
+        for (receipts, 0..) |stored, index| {
+            // op-geth's Regolith receipts root leaves out the deposit nonce; Canyon (which
+            // adds the receipt version) puts it back. base/base: `calculate_receipt_root`.
+            var receipt = stored;
+            if (receipt.deposit_receipt_version == null) receipt.deposit_nonce = null;
             const buffer = try executor.alloc(u8, receipt.encoded_length());
             items[index] = receipt.encode_to(buffer);
         }

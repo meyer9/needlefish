@@ -1,8 +1,9 @@
 //! Calldata decoding for native precompiles with alloy's validating decoder semantics
 //! (`abi_decode_validate`, non-strict): trailing bytes are allowed, offsets need not be
 //! canonical, a short buffer is an overrun, an offset or length word above 64 bits is an
-//! "offset (usize)" type-check failure, and invalid values (dirty address bits, a bool above
-//! 1, an out-of-range enum) fail the whole parameter tuple's type check after decoding.
+//! "offset (usize)" type-check failure, and invalid values (dirty address bits, a bool with
+//! dirty high bytes, an out-of-range enum) fail the whole parameter tuple's type check after
+//! decoding.
 
 const std = @import("std");
 const assert = std.debug.assert;
@@ -31,6 +32,10 @@ pub const Kind = enum {
     uint256_array,
     /// `bytes[]`: element offsets are relative to the word after the length.
     bytes_array,
+
+    fn is_dynamic(kind: Kind) bool {
+        return kind.is_array() or kind == .string or kind == .bytes or kind == .bytes_array;
+    }
 
     fn is_array(kind: Kind) bool {
         return switch (kind) {
@@ -61,8 +66,12 @@ pub const Array = struct {
     }
 };
 
+/// The head word of an argument a function does not take: reading past a function's
+/// parameters (as `route` code shared between functions may) reads zero, never garbage.
+const zero_word: [32]u8 = @splat(0);
+
 pub const Arguments = struct {
-    words: [arguments_max]*const [32]u8 = undefined,
+    words: [arguments_max]*const [32]u8 = @splat(&zero_word),
     /// The first dynamic array argument.
     array: Array = .{ .words = &.{} },
     /// Dynamic payload per argument: array words or string bytes.
@@ -115,6 +124,19 @@ pub fn decode_arguments(
     enumeration_max: u8,
     failure: *native.DecodeFailure,
 ) ?Arguments {
+    const arguments = decode_tokens(data, kinds, failure) orelse return null;
+    for (kinds, 0..) |kind, index| {
+        const payload = arguments.list(index);
+        if (!valid(kind, arguments.words[index], payload, enumeration_max)) {
+            failure.* = .type_check;
+            return null;
+        }
+    }
+    return arguments;
+}
+
+/// Decode the tokens of `kinds` (alloy's `abi::decode_sequence`) without type checks.
+fn decode_tokens(data: []const u8, kinds: []const Kind, failure: *native.DecodeFailure) ?Arguments {
     assert(kinds.len <= arguments_max);
     var arguments = Arguments{};
     var array_count: u32 = 0;
@@ -140,14 +162,81 @@ pub fn decode_arguments(
         if (array_count == 0) arguments.array = .{ .words = words };
         array_count += 1;
     }
+    return arguments;
+}
+
+/// The hex data of alloy's type-check message for the tuple `kinds` decoded from `data`:
+/// `abi::encode` of the decoded token, so the decoded words (dirty bits kept) re-encoded with
+/// canonical offsets and zero padding, behind a 0x20 offset word when the tuple is dynamic.
+/// `data` must decode as `kinds` (it failed only the type check).
+pub fn write_tuple_hex(
+    writer: *std.Io.Writer,
+    data: []const u8,
+    kinds: []const Kind,
+) std.Io.Writer.Error!void {
+    var failure: native.DecodeFailure = .overrun;
+    const arguments = decode_tokens(data, kinds, &failure).?;
+    var dynamic = false;
+    for (kinds) |kind| dynamic = dynamic or kind.is_dynamic();
+    if (dynamic) try write_int(writer, 32);
+    var tail: u64 = 32 * @as(u64, kinds.len);
     for (kinds, 0..) |kind, index| {
-        const payload = arguments.list(index);
-        if (!valid(kind, arguments.words[index], payload, enumeration_max)) {
-            failure.* = .type_check;
-            return null;
+        if (kind.is_dynamic()) {
+            try write_int(writer, tail);
+            tail += tail_length(kind, &arguments, index);
+        } else {
+            try writer.print("{x}", .{arguments.words[index]});
         }
     }
-    return arguments;
+    for (kinds, 0..) |kind, index| {
+        if (!kind.is_dynamic()) continue;
+        const payload = arguments.dynamic[index];
+        if (kind != .bytes_array) {
+            const count = if (kind.is_array()) payload.len / 32 else payload.len;
+            try write_int(writer, count);
+            try write_padded(writer, payload);
+            continue;
+        }
+        const count = arguments.bytes_count(index);
+        try write_int(writer, count);
+        var offset: u64 = 32 * @as(u64, count);
+        for (0..count) |item| {
+            try write_int(writer, offset);
+            offset += 32 + padded_length(arguments.bytes_item(index, @intCast(item)).len);
+        }
+        for (0..count) |item| {
+            const element = arguments.bytes_item(index, @intCast(item));
+            try write_int(writer, element.len);
+            try write_padded(writer, element);
+        }
+    }
+}
+
+fn tail_length(kind: Kind, arguments: *const Arguments, index: usize) u64 {
+    assert(kind.is_dynamic());
+    if (kind != .bytes_array) return 32 + padded_length(arguments.dynamic[index].len);
+    const count = arguments.bytes_count(index);
+    var length: u64 = 32 + 32 * @as(u64, count);
+    for (0..count) |item| {
+        length += 32 + padded_length(arguments.bytes_item(index, @intCast(item)).len);
+    }
+    return length;
+}
+
+fn padded_length(length: usize) u64 {
+    return std.mem.alignForward(u64, length, 32);
+}
+
+fn write_int(writer: *std.Io.Writer, value: u64) std.Io.Writer.Error!void {
+    var word: [32]u8 = @splat(0);
+    std.mem.writeInt(u64, word[24..32], value, .big);
+    try writer.print("{x}", .{&word});
+}
+
+fn write_padded(writer: *std.Io.Writer, bytes: []const u8) std.Io.Writer.Error!void {
+    try writer.print("{x}", .{bytes});
+    const padding = padded_length(bytes.len) - bytes.len;
+    try writer.splatBytesAll("00", padding);
 }
 
 fn head_word(data: []const u8, index: usize) ?*const [32]u8 {
@@ -241,7 +330,9 @@ fn valid(kind: Kind, word: *const [32]u8, elements: Array, enumeration_max: u8) 
     return switch (kind) {
         .address => zero(word[0..12]),
         .uint64 => zero(word[0..24]),
-        .bool => zero(word[0..31]) and word[31] <= 1,
+        // alloy 1.6.1 `Bool::valid_token` checks only the high 31 bytes; any nonzero low
+        // byte is `true`.
+        .bool => zero(word[0..31]),
         .enumeration => zero(word[0..31]) and word[31] <= enumeration_max,
         .bytes32, .uint256 => true,
         .uint8 => zero(word[0..31]),
@@ -292,7 +383,9 @@ test "native abi: dynamic address arrays follow alloy's decoder" {
     try testing.expectEqual(null, decode_arguments(&data, &kinds, 1, &failure));
     try testing.expectEqual(native.DecodeFailure.type_check, failure);
     data[160] = 0;
-    data[63] = 2; // Bool above 1.
+    data[63] = 0xdc; // A bool's low byte may be anything nonzero: true, as in alloy.
+    try testing.expect(decode_arguments(&data, &kinds, 1, &failure).?.flag(1));
+    data[62] = 1; // A dirty high byte fails the type check.
     try testing.expectEqual(null, decode_arguments(&data, &kinds, 1, &failure));
     try testing.expectEqual(native.DecodeFailure.type_check, failure);
 }

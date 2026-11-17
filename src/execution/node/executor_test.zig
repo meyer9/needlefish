@@ -348,6 +348,45 @@ test "executor: L2 deposit mints, records its nonce, and fees go to the vaults" 
     try testing.expectError(error.TxTypeNotSupported, rejected);
 }
 
+/// Base devnet with only Regolith active (before Canyon).
+const regolith_spec: chainspec.ChainSpec = blk: {
+    var result = chainspec.ChainSpec.presets.base_devnet;
+    result.upgrades = @splat(null);
+    result.upgrades[@backingInt(chainspec.Upgrade.regolith)] = 0;
+    break :blk result;
+};
+
+test "executor: a Regolith receipts root leaves out the deposit nonce (base/base)" {
+    var f: Fixture = undefined;
+    try f.init_with(&regolith_spec);
+    defer f.deinit();
+    const deposit: consensus.Envelope = .{ .deposit = .{
+        .source_hash = .{ .bytes = @splat(1) },
+        .from = .{ .bytes = @splat(0xde) },
+        .to = .{ .call = .{ .bytes = @splat(0x33) } },
+        .mint = 5000,
+        .value = 0,
+        .gas_limit = 100_000,
+        .is_system_transaction = false,
+        .input = &.{},
+    } };
+    var deposit_buffer: [256]u8 = undefined;
+    const deposit_raw = deposit.encode_to(&deposit_buffer);
+    const out = try f.executor.execute_block(&block_env(1), &.{deposit_raw}, &.{});
+    // The stored receipt keeps the nonce; only the root's encoding drops it.
+    var receipt = out.receipts[0];
+    try testing.expectEqual(@as(?u64, 0), receipt.deposit_nonce);
+    try testing.expectEqual(@as(?u64, null), receipt.deposit_receipt_version);
+    var bytes: [1024]u8 = undefined;
+    var items: [1][]const u8 = undefined;
+    const scratch: consensus.block.RootScratch = .{ .bytes = &bytes, .items = &items };
+    const with_nonce = consensus.block.receipts_root(&.{receipt}, scratch);
+    receipt.deposit_nonce = null;
+    const without_nonce = consensus.block.receipts_root(&.{receipt}, scratch);
+    try testing.expect(!with_nonce.eql(without_nonce));
+    try testing.expectEqualSlices(u8, &without_nonce.bytes, &out.receipts_root);
+}
+
 const eip8130 = consensus.tx.eip8130;
 
 /// Base devnet with every upgrade through Everest active at genesis.
@@ -537,6 +576,20 @@ test "executor: Denim installs the BaseTime implementation once, behind the prox
     defer early.deinit();
     _ = try early.executor.execute_block(&block_env(1), &.{}, &.{});
     try testing.expect(early.db.get_account(base_time.implementation_address) == null);
+}
+
+test "executor: Denim replaces code already at the BaseTime implementation address" {
+    var f: Fixture = undefined;
+    try f.init_with(&everest_spec);
+    defer f.deinit();
+    // Only a synthetic pre-state has code there; base/base overwrites it, keeping the balance.
+    try f.db.put_account(base_time.implementation_address, 7, 3, &.{ 0x60, 0x00 });
+    _ = try f.executor.execute_block(&block_env(1), &.{}, &.{});
+    const implementation = f.db.get_account(base_time.implementation_address).?;
+    const code_hash = base_time.implementation_code_hash;
+    try testing.expectEqualSlices(u8, &code_hash, &implementation.code_hash);
+    try testing.expectEqual(@as(u256, 7), implementation.balance);
+    try testing.expectEqual(@as(u64, 3), implementation.nonce);
 }
 
 test "executor: a Denim block without the BaseTime proxy or its admin is rejected" {
@@ -767,4 +820,26 @@ fn fuzz_prefetch(_: void, smith: *testing.Smith) anyerror!void {
 
 test "executor: fuzz prefetched recovery" {
     try testing.fuzz({}, fuzz_prefetch, .{});
+}
+
+test "executor: the ActivationRegistry admin falls back to the chain's Beryl admin" {
+    // base/base passes the chain's `activation_admin_address` to the EVM; before Cobalt's
+    // stored admin it is the registry's admin (an admin-gated `activate` depends on it).
+    const mainnet = &chainspec.ChainSpec.presets.base_mainnet;
+    var f: Fixture = undefined;
+    try f.init_with(mainnet);
+    defer f.deinit();
+    var block = block_env(1);
+    block.timestamp = mainnet.upgrades[@backingInt(chainspec.Upgrade.beryl)].?;
+    const native_activation = @import("../evm/native_activation.zig");
+    const result = try f.executor.simulate(&block, .{
+        .to = native_activation.address,
+        .data = &native_activation.selector_admin,
+    });
+    const executed = result.executed;
+    try testing.expect(executed.success);
+    var expected: [32]u8 = @splat(0);
+    expected[12..].* = mainnet.activation_admin.?;
+    try testing.expectEqualSlices(u8, &expected, executed.output);
+    try testing.expect(!std.mem.allEqual(u8, &mainnet.activation_admin.?, 0));
 }
