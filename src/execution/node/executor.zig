@@ -822,10 +822,21 @@ pub const Executor = struct {
                 .status = executed.status,
                 .exit = executed.exit,
                 .gas_used = executed.gas_used,
-                .output = executed.output,
+                .output = try executor.call_output(&executed),
                 .logs = executed.logs,
             } },
         };
+    }
+
+    /// A call's result as revm reports it: a successful creation returns the code it
+    /// deployed (the frame itself returns no data to a parent).
+    fn call_output(
+        executor: *Executor,
+        executed: *const evm.transaction.Executed,
+    ) Error![]const u8 {
+        const created = executed.created orelse return executed.output;
+        assert(executed.output.len == 0);
+        return executor.state.code(try executor.state.load(created));
     }
 
     /// Runs `call` on top of the committed state in `block`'s context, charging no fee (the
@@ -875,8 +886,9 @@ pub const Executor = struct {
             collector.collect(executor.state, &context);
         }
         if (call.inspect) |inspect| inspect.run(inspect.context, executor.state);
-        const output = try executor.alloc(u8, executed.output.len);
-        @memcpy(output, executed.output);
+        const result_output = try executor.call_output(&executed);
+        const output = try executor.alloc(u8, result_output.len);
+        @memcpy(output, result_output);
         return .{ .executed = .{
             .success = executed.status == .success,
             .gas_used = executed.gas_used,

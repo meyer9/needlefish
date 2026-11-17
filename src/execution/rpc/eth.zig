@@ -274,8 +274,19 @@ const reward_percentiles_max = 100;
 /// a count above 1024 is truncated, a range reaching below genesis is an invalid range, the
 /// next block's base and blob fees close the fee lists, and rewards are the effective tips at
 /// each gas-weighted percentile.
+/// The block count as alloy's `U64` reads it: a hex quantity or a plain JSON number.
+fn block_count(call: *Call) HandlerError!u64 {
+    const raw = try call.params.raw();
+    if (raw.len > 0 and raw[0] != '"') {
+        for (raw) |digit| if (!std.ascii.isDigit(digit)) return error.InvalidParams;
+        return std.fmt.parseInt(u64, raw, 10) catch error.InvalidParams;
+    }
+    if (raw.len < 2 or raw[raw.len - 1] != '"') return error.InvalidParams;
+    return json.parse_quantity(u64, raw[1 .. raw.len - 1]) catch error.InvalidParams;
+}
+
 fn fee_history(api: *Api, call: *Call) HandlerError!void {
-    var count = @min(try call.params.quantity(u64), fee_history_blocks_max);
+    var count = @min(try block_count(call), fee_history_blocks_max);
     const newest_raw = try call.params.raw();
     const percentiles_raw = try call.params.optional_raw();
     try call.params.finish();
@@ -1160,9 +1171,6 @@ fn estimate_gas(api: *Api, call: *Call) HandlerError!void {
 
 // ---- Logs -------------------------------------------------------------------------
 
-/// reth's `EthRpcErrorCode::PrunedHistory` (EIP-4444).
-const code_pruned_history = 4444;
-
 pub const Filter = struct {
     from: u64,
     to: u64,
@@ -1278,13 +1286,7 @@ fn get_logs(api: *Api, call: *Call) HandlerError!void {
         if (filter.to < filter.from) {
             return call.fail(rpc.code.invalid_params, "invalid block range params");
         }
-        const earliest = api.chain.genesis_number;
-        if (filter.from < earliest) {
-            const message = std.fmt.bufPrint(&text, "pruned history unavailable: " ++
-                "requested {d}, earliest available {d}", .{ filter.from, earliest }) catch
-                unreachable;
-            return call.fail(code_pruned_history, message);
-        }
+        // Numbers below genesis are unpruned history with no blocks (base/base answers []).
         if (filter.to - filter.from >= logs_blocks_max) {
             return call.fail(rpc.code.server_error, "block range too large");
         }

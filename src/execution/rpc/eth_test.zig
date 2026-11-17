@@ -1026,6 +1026,24 @@ test "eth: getStorageAt reads a full-width slot key and defaults to latest" {
     }
 }
 
+test "eth: eth_call of a creation returns the deployed code" {
+    const h = try Harness.create();
+    defer h.destroy();
+    // Init code storing 0x60ff at memory[30..32] and returning it as the runtime code.
+    const created = try h.request("eth_call", "[{\"input\":\"0x6160ff6000526002601ef3\"}]");
+    try testing.expectEqualStrings("\"result\":\"0x60ff\"", created);
+}
+
+test "eth: feeHistory takes a numeric block count and no percentiles" {
+    const h = try Harness.create();
+    defer h.destroy();
+    const history = try h.request("eth_feeHistory", "[1,\"latest\"]");
+    try expect_contains(history, "\"oldestBlock\":\"0x0\"");
+    try testing.expect(std.mem.indexOf(u8, history, "reward") == null);
+    try expect_contains(try h.request("eth_feeHistory", "[\"+1\",\"latest\"]"), "-32602");
+    try expect_contains(try h.request("eth_feeHistory", "[1.5,\"latest\"]"), "-32602");
+}
+
 fn fuzz_body(h: *Harness, body: []const u8) !void {
     var out: std.Io.Writer = .fixed(&h.out);
     const outcome = eth.Router.handle(&h.api, body, &out);
