@@ -61,6 +61,7 @@ pub fn estimate(api: *Api, call: *Call, request: *const eth.CallRequest) Handler
             .raw = request.state_overrides orelse "",
             .space = request.override_space,
             .gas_price = prices.gas_price,
+            .millis_part = eth.forecast_millis_part(api, request),
         },
     };
     context.message.gas_price = prices.gas_price;

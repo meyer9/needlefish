@@ -151,12 +151,13 @@ fn block_number(api: *Api, call: *Call) HandlerError!void {
 
 /// Base fee of the block after the head.
 fn next_base_fee(api: *Api) u64 {
-    return next_base_fee_after(api, &head_header(api));
+    const head = head_header(api);
+    return next_base_fee_after(api, &head, head.timestamp);
 }
 
 /// Base fee of a block after `parent`, as base/base derives it (`next_block_base_fee` at the
-/// parent's timestamp; zero when the parent's EIP-1559 extra data does not decode).
-fn next_base_fee_after(api: *Api, parent: *const consensus.Header) u64 {
+/// child's `timestamp`; zero when the parent's EIP-1559 extra data does not decode).
+fn next_base_fee_after(api: *Api, parent: *const consensus.Header, timestamp: u64) u64 {
     return api.spec.next_base_fee(.{
         .timestamp = parent.timestamp,
         .gas_used = parent.gas_used,
@@ -165,7 +166,7 @@ fn next_base_fee_after(api: *Api, parent: *const consensus.Header) u64 {
         .blob_gas_used = parent.blob_gas_used orelse 0,
         .excess_blob_gas = parent.excess_blob_gas orelse 0,
         .extra_data = parent.extra_data,
-    }, parent.timestamp) catch 0;
+    }, timestamp) catch 0;
 }
 
 /// Blob base fee of a block after `parent` (null without a blob schedule or blob fields).
@@ -358,7 +359,7 @@ fn write_fee_lists(api: *Api, w: *json.Writer, oldest: u64, newest: u64) !void {
     for (oldest..newest + 1) |number| {
         try w.quantity(canonical_header(api, number).?.base_fee_per_gas orelse 0);
     }
-    try w.quantity(next_base_fee_after(api, &last));
+    try w.quantity(next_base_fee_after(api, &last, last.timestamp));
     try w.end_array();
     try w.key("gasUsedRatio");
     try w.begin_array();
@@ -1012,6 +1013,10 @@ pub const CallRequest = struct {
     view: state_view.View,
     /// The block tag was "pending": the call runs in a block after the head.
     pending: bool = false,
+    /// eth_call and eth_estimateGas: a "pending" call runs at the Denim schedule's time for
+    /// the block after the head, with that block's BaseTime millisecond part (base/base
+    /// `BasePendingForecast`); other methods keep reth's head + 12 seconds.
+    forecast: bool = false,
     /// The request's fee fields (`call_fees`), applied when the call runs.
     fees: call_fees.Fees = .{},
     /// Raw geth `stateOverrides` / `blockOverrides` objects (see `set_overrides`).
@@ -1098,6 +1103,8 @@ pub const Prepared = struct {
     balance: u256 = 0,
     /// What the caller can afford; null when the balance does not cover `value`.
     allowance: ?u64 = null,
+    /// A forecast call's BaseTime millisecond part, written beneath the state overrides.
+    millis_part: ?u16 = null,
 
     pub const Cap = enum {
         none,
@@ -1117,6 +1124,7 @@ pub const Prepared = struct {
         state: *evm.State,
         message: *node.executor.Executor.Call,
     ) simulate_module.OverrideError!void {
+        if (prepared.millis_part) |part| try forecast_base_time(state, part);
         if (prepared.raw.len > 0) {
             try simulate_module.apply_state_overrides(state, prepared.space, prepared.raw);
         }
@@ -1133,9 +1141,29 @@ pub const Prepared = struct {
     }
 
     fn hooked(prepared: *const Prepared) bool {
-        return prepared.raw.len > 0 or prepared.check_callee or prepared.cap != .none;
+        return prepared.raw.len > 0 or prepared.check_callee or prepared.cap != .none or
+            prepared.millis_part != null;
     }
 };
+
+/// Installs BaseTime and stores `millis_part` in the low 16 bits of its packed slot, as the
+/// synthetic override base/base puts beneath a forecast call's own overrides (which then
+/// win per slot, or wholesale for a `state` override).
+fn forecast_base_time(state: *evm.State, millis_part: u16) simulate_module.OverrideError!void {
+    const base_time = node.base_time;
+    base_time.ensure_predeploy(state) catch |err| switch (err) {
+        // A Denim chain installed BaseTime at activation; its proxy cannot be missing.
+        error.BaseTimeMissingProxy,
+        error.BaseTimeCodelessProxy,
+        error.BaseTimeUnexpectedProxyAdmin,
+        => return error.InvalidParams,
+        else => |e| return e,
+    };
+    const proxy = try state.load(base_time.proxy_address);
+    const access = try state.storage_access(proxy, base_time.millis_part_slot);
+    const word = access.slot.present & ~@as(u256, std.math.maxInt(u16));
+    try state.storage_write(proxy, access.slot, word | millis_part);
+}
 
 pub fn parse_call_request(api: *Api, call: *Call) HandlerError!CallRequest {
     const call_raw = try call.params.raw();
@@ -1187,14 +1215,33 @@ pub fn request_env(
     if (request.pending) {
         assert(request.view == .head);
         env.number = header.number + 1;
-        env.timestamp = header.timestamp +| 12;
+        env.timestamp = if (pending_forecast(api, request)) |parts|
+            parts.seconds
+        else
+            header.timestamp +| 12;
         env.parent_hash = header.hash().bytes;
-        env.base_fee = next_base_fee_after(api, &header);
+        env.base_fee = next_base_fee_after(api, &header, @max(env.timestamp, header.timestamp));
         env.prev_randao = @splat(0); // base/base draws it at random.
         // The beacon root stays the parent's, as build_pending_env copies it.
     }
     if (request.block_overrides) |raw| try simulate_module.apply_block_overrides(call, &env, raw);
     return env;
+}
+
+/// base/base `BasePendingForecast::successor`: the scheduled time of the block after the
+/// head, for a "pending" eth_call or eth_estimateGas on a chain with a Denim schedule.
+pub fn pending_forecast(api: *Api, request: *const CallRequest) ?node.base_time.Schedule.Parts {
+    if (!request.pending or !request.forecast) return null;
+    const schedule = api.chain.denim_schedule() orelse return null;
+    return schedule.parts(view_header(api, request.view).number + 1);
+}
+
+/// The BaseTime millisecond part a forecast call sees, once Denim is active at its time
+/// (base/base `BasePendingForecast::state_overrides`).
+pub fn forecast_millis_part(api: *Api, request: *const CallRequest) ?u16 {
+    const parts = pending_forecast(api, request) orelse return null;
+    if (!api.spec.is_upgrade_active(.denim, parts.seconds)) return null;
+    return parts.millis_part;
 }
 
 /// The prices of a call under `base_fee` (reth `CallFees::ensure_fees`).
@@ -1223,6 +1270,7 @@ pub fn simulate(
         .raw = request.state_overrides orelse "",
         .space = request.override_space,
         .gas_price = prices.gas_price,
+        .millis_part = forecast_millis_part(api, &request),
     };
     // The gas cap bounds a given gas silently and is the default; the block's gas limit
     // does not bound it (reth `prepare_call_env`) unless the allowance caps the default.
@@ -1324,6 +1372,7 @@ fn simulate_in(
 fn eth_call(api: *Api, call: *Call) HandlerError!void {
     if (try eip8130_request(api, call, .call)) return;
     var request = try parse_call_request(api, call);
+    request.forecast = true;
     const state_overrides = try call.params.optional_raw();
     const block_overrides = try call.params.optional_raw();
     try call.params.finish();
@@ -1357,6 +1406,7 @@ fn eip8130_request(
 fn estimate_gas(api: *Api, call: *Call) HandlerError!void {
     if (try eip8130_request(api, call, .estimate)) return;
     var request = try parse_call_request(api, call);
+    request.forecast = true;
     const state_overrides = try call.params.optional_raw();
     const block_overrides = try call.params.optional_raw();
     try call.params.finish();

@@ -1072,31 +1072,61 @@ test "eth: a call request's access list is charged and warms its entries" {
     try expect_contains(try h.request("eth_estimateGas", keyless), "-32602");
 }
 
+/// A call to code returning TIMESTAMP and NUMBER, the override installing it, and the
+/// leading zeros of a 32-byte zero_word holding a one-byte value.
+const clock_call = "{\"to\":\"0x00000000000000000000000000000000000c0ffe\"}";
+const clock_code = "{\"0x00000000000000000000000000000000000c0ffe\":" ++
+    "{\"code\":\"0x426000524360205260406000f3\"}}";
+const zero_word = "00000000000000000000000000000000000000000000000000000000000000";
+
 test "eth: a call at a block runs in that block's environment, pending in the next" {
     const h = try Harness.create();
     defer h.destroy();
     _ = try h.mine(2);
     _ = try h.mine(4);
-    // Code returning TIMESTAMP and NUMBER.
-    const clock = "{\"to\":\"0x00000000000000000000000000000000000c0ffe\"}";
-    const code = "{\"0x00000000000000000000000000000000000c0ffe\":" ++
-        "{\"code\":\"0x426000524360205260406000f3\"}}";
+    const code = clock_code;
     // The harness keeps only the head's state, so block 2 is named by number and by tag.
-    const word = "00000000000000000000000000000000000000000000000000000000000000";
-    const head = "\"result\":\"0x" ++ word ++ "04" ++ word ++ "02\"";
+    const head = "\"result\":\"0x" ++ zero_word ++ "04" ++ zero_word ++ "02\"";
     try testing.expectEqualStrings(
         head,
-        try h.request("eth_call", "[" ++ clock ++ ",\"0x2\"," ++ code ++ "]"),
+        try h.request("eth_call", "[" ++ clock_call ++ ",\"0x2\"," ++ code ++ "]"),
     );
     try testing.expectEqualStrings(
         head,
-        try h.request("eth_call", "[" ++ clock ++ ",\"latest\"," ++ code ++ "]"),
+        try h.request("eth_call", "[" ++ clock_call ++ ",\"latest\"," ++ code ++ "]"),
     );
     // base/base derives "pending" from the head: number + 1, timestamp + 12.
     try testing.expectEqualStrings(
-        "\"result\":\"0x" ++ word ++ "10" ++ word ++ "03\"",
-        try h.request("eth_call", "[" ++ clock ++ ",\"pending\"," ++ code ++ "]"),
+        "\"result\":\"0x" ++ zero_word ++ "10" ++ zero_word ++ "03\"",
+        try h.request("eth_call", "[" ++ clock_call ++ ",\"pending\"," ++ code ++ "]"),
     );
+}
+
+test "eth: a pending eth_call runs at the Denim schedule's next block, traceCall at + 12" {
+    const h = try Harness.create_for(&denim_rpc_spec);
+    defer h.destroy();
+    // Block 1 is due 200 ms after genesis (time 0): second 0, millisecond part 200.
+    try testing.expectEqualStrings(
+        "\"result\":\"0x" ++ zero_word ++ "00" ++ zero_word ++ "01\"",
+        try h.request("eth_call", "[" ++ clock_call ++ ",\"pending\"," ++ clock_code ++ "]"),
+    );
+    // BaseTime's packed slot 0 holds the forecast part beneath the caller's own override
+    // (code returning slot 0); latest holds genesis's.
+    const base_time = "\"0x4200000000000000000000000000000000000030\"";
+    const millis = "[{\"to\":" ++ base_time ++ "}";
+    const slot_reader = "{" ++ base_time ++ ":{\"code\":\"0x5f545f5260205ff3\"}}]";
+    try testing.expectEqualStrings(
+        "\"result\":\"0x" ++ zero_word ++ "c8\"",
+        try h.request("eth_call", millis ++ ",\"pending\"," ++ slot_reader),
+    );
+    try testing.expectEqualStrings(
+        "\"result\":\"0x" ++ zero_word ++ "00\"",
+        try h.request("eth_call", millis ++ ",\"latest\"," ++ slot_reader),
+    );
+    // debug_traceCall keeps reth's pending env: head + 12 seconds.
+    const traced = try h.request("debug_traceCall", "[" ++ clock_call ++ ",\"pending\"," ++
+        "{\"tracer\":\"callTracer\",\"stateOverrides\":" ++ clock_code ++ "}]");
+    try expect_contains(traced, "\"output\":\"0x" ++ zero_word ++ "0c" ++ zero_word ++ "01\"");
 }
 
 test "eth: a call request's authorizations are charged as a type-4 transaction" {
