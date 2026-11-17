@@ -44,8 +44,10 @@ const Registers = struct {
     stack: Stack,
 };
 
-/// Run `frame` in place until it exits.
-pub fn run(comptime fork: Fork, evm: *Evm, frame: *Frame) Exit {
+/// Run `frame` in place until it exits. `traced` (the struct logger: `Tracer.step` set)
+/// compiles a second copy that dispatches on the raw code, one instruction per step
+/// (fused instructions run as their parts), and brackets each with the tracer's hooks.
+pub fn run(comptime fork: Fork, comptime traced: bool, evm: *Evm, frame: *Frame) Exit {
     @setEvalBranchQuota(100_000);
     const f = frame;
     // Immutable for the frame's lifetime: loaded once, not through `f` after every store.
@@ -65,7 +67,10 @@ pub fn run(comptime fork: Fork, evm: *Evm, frame: *Frame) Exit {
     assert(analyzed.jumpdests.len == (@as(u64, analyzed.len) + 7) / 8);
     // Dispatch reads `ops`, the code with fused instructions marked (`bytecode.fusions`), at
     // the same offsets and with the same padding.
-    const ops = analyzed.ops.ptr;
+    // A traced run reads the raw code instead, where fusion marker bytes are undefined
+    // opcodes (asserted in `bytecode`).
+    const ops = if (traced) analyzed.code.ptr else analyzed.ops.ptr;
+    if (traced) assert(evm.tracer.?.step != null and evm.tracer.?.step_end != null);
     // Set when a step halts. A plain `bool` continue flag instead of a `?Exit` result: Zig
     // lowered the optional to a load from a constant global, and a branch, on every opcode.
     var exit: Exit = undefined;
@@ -74,17 +79,19 @@ pub fn run(comptime fork: Fork, evm: *Evm, frame: *Frame) Exit {
             inline else => |opcode| {
                 const start = opcode_profile.now();
                 defer opcode_profile.record(opcode, start);
-                if (comptime bytecode.fusion(opcode)) |parts| {
+                if (traced) {
+                    if (!traced_step(fork, opcode, r, &analyzed, f, evm, &exit)) break :loop;
+                } else if (comptime bytecode.fusion(opcode)) |parts| {
                     inline for (parts) |part| {
                         coverage.step(fork, part, f.depth);
-                        if (!step(fork, part, r, &analyzed, f, evm, &exit)) {
+                        if (!step(fork, false, part, r, &analyzed, f, evm, &exit)) {
                             coverage.halt(part, exit);
                             break :loop;
                         }
                     }
                 } else {
                     coverage.step(fork, opcode, f.depth);
-                    if (!step(fork, opcode, r, &analyzed, f, evm, &exit)) {
+                    if (!step(fork, false, opcode, r, &analyzed, f, evm, &exit)) {
                         coverage.halt(opcode, exit);
                         break :loop;
                     }
@@ -103,6 +110,7 @@ pub fn run(comptime fork: Fork, evm: *Evm, frame: *Frame) Exit {
 
 inline fn step(
     comptime fork: Fork,
+    comptime traced: bool,
     comptime opcode: u8,
     r: *Registers,
     analyzed: *const bytecode.Analyzed,
@@ -151,11 +159,10 @@ inline fn step(
             return false;
         }
     }
-    // Cannot wrap: `pc` stays within the padded code (under 2^33 bytes, `Analyzed.len` is a
-    // u32; see `run`).
+    // Cannot wrap: `pc` stays within the padded code (under 2^33 bytes; see `run`).
     r.pc +%= 1;
     if (comptime in_registers(opcode)) {
-        return execute_registers(fork, opcode, r, analyzed, f, evm, exit);
+        return execute_registers(fork, traced, opcode, r, analyzed, f, evm, exit);
     }
     // Sync point: the opcode reads or writes frame state beyond the registers.
     f.pc = @intCast(r.pc);
@@ -170,6 +177,37 @@ inline fn step(
         return false;
     }
     return true;
+}
+
+/// One instruction of a traced run: the registers are written to the frame around it so the
+/// tracer's `step` and `step_end` see the frame current.
+inline fn traced_step(
+    comptime fork: Fork,
+    comptime opcode: u8,
+    r: *Registers,
+    analyzed: *const bytecode.Analyzed,
+    f: *Frame,
+    evm: *Evm,
+    exit: *Exit,
+) bool {
+    const tracer = evm.tracer.?;
+    f.pc = @intCast(r.pc);
+    f.gas = r.gas;
+    f.stack.len = r.stack.len;
+    assert(analyzed.code[f.pc] == opcode);
+    tracer.step.?(tracer.context, f, evm);
+    coverage.step(fork, opcode, f.depth);
+    const running = step(fork, true, opcode, r, analyzed, f, evm, exit);
+    if (!running) coverage.halt(opcode, exit.*);
+    f.pc = @intCast(r.pc);
+    f.gas = r.gas;
+    f.stack.len = r.stack.len;
+    assert(f.stack.len <= stack_module.limit);
+    tracer.step_end.?(tracer.context, f, evm, .{
+        .exit = if (running) null else exit.*,
+        .static_cost = comptime gas.static_cost(fork, opcode),
+    });
+    return running;
 }
 
 comptime {
@@ -197,6 +235,7 @@ fn in_registers(comptime opcode: u8) bool {
 
 inline fn execute_registers(
     comptime fork: Fork,
+    comptime traced: bool,
     comptime opcode: u8,
     r: *Registers,
     analyzed: *const bytecode.Analyzed,
@@ -240,7 +279,7 @@ inline fn execute_registers(
         op.DUP1...op.DUP16 => s.dup(opcode - op.DUP1 + 1),
         op.SWAP1...op.SWAP16 => s.swap(opcode - op.SWAP1 + 1),
         op.POP => _ = s.pop(),
-        op.JUMP, op.JUMPI => return jump(fork, opcode == op.JUMPI, r, analyzed, exit),
+        op.JUMP, op.JUMPI => return jump(fork, traced, opcode == op.JUMPI, r, analyzed, exit),
         op.JUMPDEST => {},
         op.PC => s.push(r.pc - 1),
         op.MSIZE => s.push(f.memory.len),
@@ -592,9 +631,11 @@ inline fn push(comptime size: u8, r: *Registers, analyzed: *const bytecode.Analy
 
 /// JUMP, or JUMPI when `conditional`. A taken jump also runs the JUMPDEST it lands on, which
 /// only charges its gas: every taken jump would otherwise dispatch one (6.6% of the
-/// instructions on Base mainnet blocks). False with `exit` set when the frame halts.
+/// instructions on Base mainnet blocks); a `traced` run lands on it instead. False with
+/// `exit` set when the frame halts.
 inline fn jump(
     comptime fork: Fork,
+    comptime traced: bool,
     comptime conditional: bool,
     r: *Registers,
     analyzed: *const bytecode.Analyzed,
@@ -608,6 +649,12 @@ inline fn jump(
     if (!analyzed.is_jumpdest(destination)) {
         exit.* = .invalid_jump;
         return false;
+    }
+    if (traced) {
+        // A traced run executes (and reports) the JUMPDEST as its own instruction.
+        r.pc = @intCast(destination);
+        assert(r.pc < analyzed.len);
+        return true;
     }
     const remaining = @subWithOverflow(r.gas, comptime gas.static_cost(fork, op.JUMPDEST));
     r.gas = remaining[0];

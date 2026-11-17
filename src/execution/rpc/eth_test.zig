@@ -1557,6 +1557,8 @@ test "eth: debug_trace callTracer reports nested calls, logs and reverts" {
     const nested_hash = primitives.keccak256(nested).bytes;
     const text = try trace_request(h, "debug_traceTransaction", &nested_hash, call_tracer);
     try testing.expectEqual(@as(usize, 2), count_of(text, "\"type\":\"CALL\""));
+    // A CALL reports its value even when zero.
+    try testing.expectEqual(@as(usize, 2), count_of(text, "\"value\":\"0x0\""));
     try expect_contains(text, "\"calls\":[{");
     try expect_contains(text, "\"gas\":\"0x30d40\""); // The transaction's gas limit.
     try expect_contains(text, "\"logs\":[{");
@@ -1574,9 +1576,30 @@ test "eth: debug_trace callTracer reports nested calls, logs and reverts" {
         "[\"latest\",{\"tracer\":\"callTracer\"}]",
     );
     try testing.expectEqual(@as(usize, 2), count_of(by_number, "\"txHash\""));
-    // The default struct logger is not supported.
+    // No tracer: geth's struct logger, one frame per transaction.
     const default = try h.request("debug_traceBlockByNumber", "[\"latest\"]");
-    try expect_contains(default, "only callTracer");
+    try testing.expectEqual(@as(usize, 2), count_of(default, "\"structLogs\":[{"));
+    try testing.expectEqual(@as(usize, 2), count_of(default, "\"txHash\""));
+    // The most common call: a transaction with no options. The CALL forwards all but 1/64
+    // of the gas left after its 2600 (cold account); the counter runs at depth 2.
+    const logs = try trace_request(h, "debug_traceTransaction", &nested_hash, "{}");
+    try expect_contains(logs, "{\"failed\":false,\"gas\":46377,\"returnValue\":\"0x\",");
+    try expect_contains(logs, "{\"pc\":27,\"op\":\"CALL\",\"gas\":178985," ++
+        "\"gasCost\":176229,\"depth\":1,");
+    try expect_contains(logs, "{\"pc\":0,\"op\":\"PUSH0\",\"gas\":173629,\"gasCost\":2," ++
+        "\"depth\":2,\"stack\":[],\"refund\":0}");
+    try expect_contains(logs, "{\"pc\":28,\"op\":\"STOP\",\"gas\":153623,\"gasCost\":0," ++
+        "\"depth\":1,\"stack\":[\"0x1\"],\"refund\":0}]}");
+    // flatCallTracer locates each trace in the block.
+    const flat = "{\"tracer\":\"flatCallTracer\"}";
+    const flat_text = try trace_request(h, "debug_traceTransaction", &reverting_hash, flat);
+    var block_hash: [2 + 64]u8 = undefined;
+    _ = try std.fmt.bufPrint(&block_hash, "0x{x}", .{&block.bytes});
+    try expect_contains(flat_text, "\"blockHash\":\"");
+    try expect_contains(flat_text, &block_hash);
+    try expect_contains(flat_text, "\"error\":\"Reverted\",\"result\":{\"gasUsed\":\"0x4\"," ++
+        "\"output\":\"0x\"},\"subtraces\":0,\"traceAddress\":[],\"transactionHash\":\"");
+    try expect_contains(flat_text, "\"transactionPosition\":1,\"type\":\"call\"}]");
 }
 
 test "eth: debug_traceCall traces a call against the head state" {
@@ -1613,10 +1636,208 @@ test "eth: debug_traceCall traces a call against the head state" {
     try expect_contains(try h.request(
         "debug_traceCall",
         "[{\"to\":" ++ caller_at ++ "},\"latest\"]",
-    ), "only callTracer");
+    ), "\"structLogs\":[{");
     // The executor's tracer is detached afterwards: a plain call still runs.
     try expect_contains(try h.request("eth_call", "[{\"to\":" ++ caller_at ++ "}]"), "result");
     try testing.expect(h.node.chain.executor.machine.tracer == null);
+}
+
+/// One struct log as revm-inspectors writes it (no error, refund counter 0).
+fn struct_step(
+    comptime pc: u32,
+    comptime name: []const u8,
+    comptime gas: u64,
+    comptime cost: u64,
+    comptime stack: []const u8,
+    comptime storage: []const u8,
+) []const u8 {
+    const format = "{{\"pc\":{d},\"op\":\"{s}\",\"gas\":{d},\"gasCost\":{d},\"depth\":1," ++
+        "\"stack\":[{s}]{s},\"refund\":0}}";
+    return std.fmt.comptimePrint(format, .{ pc, name, gas, cost, stack, storage });
+}
+
+const invalid_at = "\"0x0000000000000000000000000000000000000058\"";
+
+/// The counter, the reverter, an INVALID contract and a caller of the counter.
+fn put_trace_contracts(h: *Harness) !void {
+    const counter = primitives.hex.decode_array(20, counter_at[3..43]) catch unreachable;
+    const counter_code = primitives.hex.decode_array(18, counter_hex[2..]) catch unreachable;
+    try h.node.db.put_account(counter, 0, 0, &counter_code);
+    const reverter = primitives.hex.decode_array(20, reverter_at[3..43]) catch unreachable;
+    try h.node.db.put_account(reverter, 0, 0, &.{ 0x5f, 0x5f, 0xfd });
+    const invalid = primitives.hex.decode_array(20, invalid_at[3..43]) catch unreachable;
+    try h.node.db.put_account(invalid, 0, 0, &.{0xfe});
+    const caller_code = [_]u8{ 0x5f, 0x5f, 0x5f, 0x5f, 0x5f, 0x73 } ++ counter ++
+        [_]u8{ 0x5a, 0xf1, 0x00 };
+    try h.node.db.put_account(@splat(0x57), 0, 0, &caller_code);
+}
+
+/// The counter called with 200000 gas, by hand: 179000 after the 21000 intrinsic. The cold
+/// SLOAD costs 2100, setting the (now warm) slot from 0 to 1 costs 20000, the MSTORE 3 plus
+/// one word of memory, the LOG0 375 plus 8 per byte of its 32; 22762 in all.
+const slot_zero = ",\"storage\":{" ++ word_zero ++ ":" ++ word_zero ++ "}";
+const slot_one = ",\"storage\":{" ++ word_zero ++ ":" ++ word_one ++ "}";
+const counter_struct_logs = "{\"failed\":false,\"gas\":43762,\"returnValue\":" ++ word_one ++
+    ",\"structLogs\":[" ++
+    struct_step(0, "PUSH0", 179000, 2, "", "") ++ "," ++
+    struct_step(1, "SLOAD", 178998, 2100, "\"0x0\"", slot_zero) ++ "," ++
+    struct_step(2, "PUSH1", 176898, 3, "\"0x0\"", "") ++ "," ++
+    struct_step(4, "ADD", 176895, 3, "\"0x0\",\"0x1\"", "") ++ "," ++
+    struct_step(5, "DUP1", 176892, 3, "\"0x1\"", "") ++ "," ++
+    struct_step(6, "PUSH0", 176889, 2, "\"0x1\",\"0x1\"", "") ++ "," ++
+    struct_step(7, "SSTORE", 176887, 20000, "\"0x1\",\"0x1\",\"0x0\"", slot_one) ++ "," ++
+    struct_step(8, "PUSH0", 156887, 2, "\"0x1\"", "") ++ "," ++
+    struct_step(9, "MSTORE", 156885, 6, "\"0x1\",\"0x0\"", "") ++ "," ++
+    struct_step(10, "PUSH1", 156879, 3, "", "") ++ "," ++
+    struct_step(12, "PUSH0", 156876, 2, "\"0x20\"", "") ++ "," ++
+    struct_step(13, "LOG0", 156874, 631, "\"0x20\",\"0x0\"", "") ++ "," ++
+    struct_step(14, "PUSH1", 156243, 3, "", "") ++ "," ++
+    struct_step(16, "PUSH0", 156240, 2, "\"0x20\"", "") ++ "," ++
+    struct_step(17, "RETURN", 156238, 0, "\"0x20\",\"0x0\"", "") ++ "]}";
+const reverter_struct_logs = "\"result\":{\"failed\":true,\"gas\":21004," ++
+    "\"returnValue\":\"0x\",\"structLogs\":[" ++
+    struct_step(0, "PUSH0", 179000, 2, "", "") ++ "," ++
+    struct_step(1, "PUSH0", 178998, 2, "\"0x0\"", "") ++ "," ++
+    struct_step(2, "REVERT", 178996, 0, "\"0x0\",\"0x0\"", "") ++ "]}";
+
+test "eth: debug_trace struct logger writes geth's default frame" {
+    const h = try Harness.create();
+    defer h.destroy();
+    try put_trace_contracts(h);
+    const gas = "\"gas\":\"0x30d40\"},\"latest\"";
+    try testing.expectEqualStrings("\"result\":" ++ counter_struct_logs, try h.request(
+        "debug_traceCall",
+        "[{\"to\":" ++ counter_at ++ "," ++ gas ++ "]",
+    ));
+    // An empty tracer name is the struct logger too.
+    try testing.expectEqualStrings("\"result\":" ++ counter_struct_logs, try h.request(
+        "debug_traceCall",
+        "[{\"to\":" ++ counter_at ++ "," ++ gas ++ ",{\"tracer\":\"\"}]",
+    ));
+    // REVERT is no step error; the frame failed and returned nothing.
+    try testing.expectEqualStrings(reverter_struct_logs, try h.request(
+        "debug_traceCall",
+        "[{\"to\":" ++ reverter_at ++ "," ++ gas ++ "]",
+    ));
+    // INVALID halts with revm's error text, and the halt spends all the gas.
+    try testing.expectEqualStrings("\"result\":{\"failed\":true,\"gas\":200000," ++
+        "\"returnValue\":\"0x\",\"structLogs\":[{\"pc\":0,\"op\":\"INVALID\",\"gas\":179000," ++
+        "\"gasCost\":0,\"depth\":1,\"error\":\"Some(InvalidFEOpcode)\",\"stack\":[]," ++
+        "\"refund\":0}]}", try h.request(
+        "debug_traceCall",
+        "[{\"to\":" ++ invalid_at ++ "," ++ gas ++ "]",
+    ));
+}
+
+test "eth: debug_trace struct logger honours its config" {
+    const h = try Harness.create();
+    defer h.destroy();
+    try put_trace_contracts(h);
+    const gas = "\"gas\":\"0x30d40\"},\"latest\"";
+    // Memory (after the MSTORE of 1 at 0) and return data on; stack and storage off; ten
+    // steps at most.
+    const config = "{\"disableStack\":true,\"disableStorage\":true,\"enableMemory\":true," ++
+        "\"enableReturnData\":true,\"limit\":10}";
+    const text = try h.request(
+        "debug_traceCall",
+        "[{\"to\":" ++ counter_at ++ "," ++ gas ++ "," ++ config ++ "]",
+    );
+    try testing.expectEqual(@as(usize, 10), count_of(text, "\"pc\":"));
+    try testing.expect(std.mem.indexOf(u8, text, "\"stack\"") == null);
+    try testing.expect(std.mem.indexOf(u8, text, "\"storage\"") == null);
+    try expect_contains(text, "{\"pc\":1,\"op\":\"SLOAD\",\"gas\":178998,\"gasCost\":2100," ++
+        "\"depth\":1,\"returnData\":\"0x\",\"memory\":[],\"refund\":0}");
+    try expect_contains(text, "{\"pc\":10,\"op\":\"PUSH1\",\"gas\":156879,\"gasCost\":3," ++
+        "\"depth\":1,\"returnData\":\"0x\",\"memory\":[" ++ word_one ++ "],\"refund\":0}]}");
+    // After the counter returns, the caller's STOP sees its output as return data.
+    const caller_at = "\"0x5757575757575757575757575757575757575757\"";
+    const nested = try h.request(
+        "debug_traceCall",
+        "[{\"to\":" ++ caller_at ++ "," ++ gas ++ ",{\"enableReturnData\":true}]",
+    );
+    try expect_contains(nested, "\"depth\":2,");
+    try expect_contains(nested, "{\"pc\":28,\"op\":\"STOP\",\"gas\":153623,\"gasCost\":0," ++
+        "\"depth\":1,\"stack\":[\"0x1\"],\"returnData\":" ++ word_one ++ ",\"refund\":0}]}");
+    // Tracers reth serves only as JavaScript, or that needlefish lacks, are internal errors.
+    const js = try h.request(
+        "debug_traceCall",
+        "[{\"to\":" ++ counter_at ++ "},\"latest\",{\"tracer\":\"{result: 1}\"}]",
+    );
+    try expect_contains(js, "-32603");
+    try expect_contains(js, "JS Tracer is not enabled");
+    try expect_contains(try h.request(
+        "debug_traceCall",
+        "[{\"to\":" ++ counter_at ++ "},\"latest\",{\"tracer\":\"muxTracer\"}]",
+    ), "unsupported tracer");
+    try testing.expect(h.node.chain.executor.machine.tracer == null);
+}
+
+test "eth: debug_trace callTracer values follow revm-inspectors" {
+    const h = try Harness.create();
+    defer h.destroy();
+    const counter = primitives.hex.decode_array(20, counter_at[3..43]) catch unreachable;
+    const counter_code = primitives.hex.decode_array(18, counter_hex[2..]) catch unreachable;
+    try h.node.db.put_account(counter, 0, 0, &counter_code);
+    // DELEGATECALL(gas, counter, 0, 0, 0, 0); POP; STATICCALL(gas, counter, 0, 0, 0, 0); STOP.
+    const call_counter = [_]u8{ 0x5f, 0x5f, 0x5f, 0x5f, 0x73 } ++ counter ++ [_]u8{0x5a};
+    const code = call_counter ++ [_]u8{ 0xf4, 0x50 } ++ call_counter ++ [_]u8{ 0xfa, 0x00 };
+    try h.node.db.put_account(@splat(0x59), 0, 0, &code);
+    const text = try h.request(
+        "debug_traceCall",
+        "[{\"from\":\"0x7e5f4552091a69125d5dfcb7b8c2659029395bdf\"," ++
+            "\"to\":\"0x5959595959595959595959595959595959595959\",\"value\":\"0x7\"}," ++
+            "\"latest\",{\"tracer\":\"callTracer\"}]",
+    );
+    try expect_contains(text, "\"type\":\"DELEGATECALL\"");
+    try expect_contains(text, "\"type\":\"STATICCALL\"");
+    // The DELEGATECALL reports its parent's value; only the STATICCALL has none.
+    try testing.expectEqual(@as(usize, 2), count_of(text, "\"value\":\"0x7\""));
+    try testing.expectEqual(@as(usize, 2), count_of(text, "\"value\""));
+}
+
+test "eth: debug_trace 4byteTracer, noopTracer and flatCallTracer" {
+    const h = try Harness.create();
+    defer h.destroy();
+    try put_trace_contracts(h);
+    const four = "{\"tracer\":\"4byteTracer\"}";
+    try testing.expectEqualStrings("\"result\":{\"0x12345678-2\":1}", try h.request(
+        "debug_traceCall",
+        "[{\"to\":" ++ counter_at ++ ",\"input\":\"0x12345678aabb\"},\"latest\"," ++ four ++ "]",
+    ));
+    // The caller's CALL passes no input: nothing to count.
+    const caller_at = "\"0x5757575757575757575757575757575757575757\"";
+    try testing.expectEqualStrings("\"result\":{}", try h.request(
+        "debug_traceCall",
+        "[{\"to\":" ++ caller_at ++ "},\"latest\"," ++ four ++ "]",
+    ));
+    try testing.expectEqualStrings("\"result\":{}", try h.request(
+        "debug_traceCall",
+        "[{\"to\":" ++ caller_at ++ "},\"latest\",{\"tracer\":\"noopTracer\"}]",
+    ));
+    // By hand: the caller spends 15 on pushes and GAS, 2600 on the cold CALL and the 22762
+    // the counter uses (0x6321); the counter gets all but 1/64 of the 176385 left (0x2a63d).
+    const flat = try h.request(
+        "debug_traceCall",
+        "[{\"to\":" ++ caller_at ++ ",\"gas\":\"0x30d40\"},\"latest\"," ++
+            "{\"tracer\":\"flatCallTracer\"}]",
+    );
+    try expect_contains(flat, "\"result\":[{\"action\":{\"from\":");
+    try expect_contains(flat, "\"callType\":\"call\",\"gas\":\"0x30d40\",\"input\":\"0x\"," ++
+        "\"to\":" ++ caller_at ++ ",\"value\":\"0x0\"},\"blockNumber\":");
+    try expect_contains(flat, "\"result\":{\"gasUsed\":\"0x6321\",\"output\":\"0x\"}," ++
+        "\"subtraces\":1,\"traceAddress\":[],\"transactionHash\":null," ++
+        "\"transactionPosition\":null,\"type\":\"call\"},{\"action\":{\"from\":" ++ caller_at ++
+        ",\"callType\":\"call\",\"gas\":\"0x2a63d\",\"input\":\"0x\",\"to\":" ++ counter_at ++
+        ",\"value\":\"0x0\"},\"blockNumber\":");
+    try expect_contains(flat, "\"result\":{\"gasUsed\":\"0x58ea\",\"output\":" ++ word_one ++
+        "},\"subtraces\":0,\"traceAddress\":[0],\"transactionHash\":null," ++
+        "\"transactionPosition\":null,\"type\":\"call\"}]");
+    try testing.expect(std.mem.indexOf(u8, flat, "blockHash") == null);
+    // A halt other than a revert has a parity error and no result.
+    try expect_contains(try h.request(
+        "debug_traceCall",
+        "[{\"to\":" ++ invalid_at ++ "},\"latest\",{\"tracer\":\"flatCallTracer\"}]",
+    ), "\"error\":\"Bad instruction\",\"result\":null,\"subtraces\":0");
 }
 
 const zeros_62 = "00000000000000000000000000000000000000000000000000000000000000";
@@ -1993,6 +2214,10 @@ test "eth: debug_traceBlock traces an RLP block like debug_traceBlockByNumber" {
     const configs = [_][]const u8{
         "{\"tracer\":\"callTracer\"}",
         "{\"tracer\":\"prestateTracer\"}",
+        "{\"tracer\":\"4byteTracer\"}",
+        "{\"tracer\":\"noopTracer\"}",
+        "{\"tracer\":\"flatCallTracer\"}",
+        "{\"disableStack\":true}",
     };
     for (configs) |config| {
         var copy: [8192]u8 = undefined;

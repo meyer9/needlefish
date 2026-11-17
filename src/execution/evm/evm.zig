@@ -157,9 +157,15 @@ pub const Outcome = struct {
 const Step = union(enum) { frame, done: Outcome };
 
 /// Call-frame tracing hook (debug_trace* callTracer). Every `enter` is matched by exactly
-/// one `exit` carrying that frame's outcome, in stack order; `log` fires as each LOG runs
-/// (a later revert of the frame is visible from its `exit` status). Null costs one branch
-/// per frame.
+/// one `exit` carrying that frame's outcome, in stack order (a successful creation's output
+/// is the deployed code); `log` fires as each LOG runs (a later revert of the frame is
+/// visible from its `exit` status). Null costs one branch per frame.
+///
+/// `step` and `step_end` (the struct logger) bracket every executed instruction: `step`
+/// sees the frame before it runs (`pc`, `gas`, stack, memory current), `step_end` after.
+/// With `step` set, frames run in a separately compiled interpreter (`interpreter.run`
+/// with `traced`), so untraced execution pays one branch per frame run and nothing per
+/// instruction.
 pub const Tracer = struct {
     context: *anyopaque,
     enter: *const fn (context: *anyopaque, frame: TraceFrame) void,
@@ -170,6 +176,23 @@ pub const Tracer = struct {
         topics: []const primitives.B256,
         data: []const u8,
     ) void,
+    step: ?*const fn (context: *anyopaque, frame: *const Frame, evm: *const Evm) void = null,
+    step_end: ?*const fn (
+        context: *anyopaque,
+        frame: *const Frame,
+        evm: *const Evm,
+        end: StepEnd,
+    ) void = null,
+};
+
+/// What `Tracer.step_end` learns about the instruction that just ran.
+pub const StepEnd = struct {
+    /// The exit when the instruction ended the frame's run (a halt, STOP/RETURN/REVERT, or a
+    /// CALL/CREATE suspending it); null when execution continues.
+    exit: ?Exit,
+    /// The opcode's static gas (charged before it runs; an out-of-gas halt may leave the
+    /// frame's `gas` wrapped).
+    static_cost: u64,
 };
 
 pub const StaticWarmCache = struct {
@@ -199,6 +222,8 @@ pub const TraceFrame = struct {
     input: []const u8,
     /// Call depth of the new frame (0 for the transaction's top frame).
     depth: u16,
+    /// A call whose target is a precompile or a native contract.
+    precompile: bool = false,
 };
 
 pub const Evm = struct {
@@ -319,14 +344,18 @@ pub const Evm = struct {
         while (true) {
             switch (step) {
                 .done => |outcome| {
-                    if (evm.tracer) |tracer| tracer.exit(tracer.context, outcome);
+                    if (evm.tracer) |tracer| try evm.trace_exit(tracer, outcome);
                     if (evm.frames_len == 0) return outcome;
                     evm.resume_parent(outcome);
                 },
                 .frame => {},
             }
             const frame = &evm.frames[evm.frames_len - 1];
-            const exit = interpreter.run(fork, evm, frame);
+            const stepping = evm.tracer != null and evm.tracer.?.step != null;
+            const exit = if (stepping)
+                interpreter.run(fork, true, evm, frame)
+            else
+                interpreter.run(fork, false, evm, frame);
             step = switch (exit) {
                 .fatal => return evm.fatal_error.?,
                 .call => try evm.traced_call(fork, evm.pending.call, frame, frame.address),
@@ -354,9 +383,23 @@ pub const Evm = struct {
                 .gas = request.gas_limit,
                 .input = request.input,
                 .depth = if (parent) |p| p.depth + 1 else 0,
+                .precompile = precompiles.lookup(fork, evm.op_upgrade(), request.target) != null or
+                    native.lookup(evm.op_upgrade(), request.target) != null,
             });
         }
         return evm.start_call(fork, request, parent, caller_address);
+    }
+
+    /// Reports a frame's outcome to the tracer; a successful creation reports the code it
+    /// deposited as its output (geth and revm-inspectors do; the frame itself returns none).
+    fn trace_exit(evm: *Evm, tracer: *const Tracer, outcome: Outcome) Error!void {
+        var traced = outcome;
+        if (outcome.created) |address| {
+            assert(outcome.status == .success);
+            assert(outcome.output.len == 0);
+            traced.output = try evm.state.code(try evm.state.load(address));
+        }
+        tracer.exit(tracer.context, traced);
     }
 
     fn traced_create(

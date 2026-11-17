@@ -1,5 +1,6 @@
-//! `debug_traceTransaction`, `debug_traceBlockByNumber` and `debug_traceBlockByHash` with
-//! geth's `callTracer` (config `onlyTopCall`, `withLog`).
+//! `debug_traceTransaction`, `debug_traceBlockByNumber`, `debug_traceBlockByHash`,
+//! `debug_traceBlock` and `debug_traceCall` with geth's `callTracer` (config `onlyTopCall`,
+//! `withLog`) and the other built-in tracers.
 //!
 //! The block is re-executed on its parent's state (`HistoryDatabase`, so the history window
 //! bounds what can be traced) in an executor session that commits nothing; the evm's
@@ -8,9 +9,12 @@
 //! is written from that list with an explicit stack (no recursion). As geth: the top frame
 //! reports the transaction's gas limit and gas used, logs of failed frames (and their
 //! descendants) are dropped, and `revertReason` decodes `Error(string)`. An EIP-8130
-//! transaction's later top-level phase calls nest under its first. Other tracers
-//! (struct logger, prestateTracer) are not supported. `debug_traceCall` runs the call as
-//! `eth_call` does (same view, gas default and simulation) with the recorder attached.
+//! transaction's later top-level phase calls nest under its first. The same frames feed
+//! `4byteTracer`, `noopTracer` and `flatCallTracer` (`flat_call.zig`); `prestateTracer`
+//! (`prestate.zig`) and the default struct logger (`struct_log.zig`, no `tracer`) run their
+//! own loops. Other names fail as reth does: muxTracer, erc7562Tracer and stateGasTracer as
+//! unsupported, anything else as a JavaScript tracer. `debug_traceCall` runs the call as
+//! `eth_call` does (same view, gas default and simulation) with the tracer attached.
 
 const std = @import("std");
 const assert = std.debug.assert;
@@ -25,6 +29,8 @@ const node = @import("../node/root.zig");
 const eth = @import("eth.zig");
 const eth_proof = @import("eth_proof.zig");
 const prestate = @import("prestate.zig");
+const struct_log = @import("struct_log.zig");
+const flat_call = @import("flat_call.zig");
 
 const Api = eth.Api;
 const Call = rpc.Call;
@@ -60,6 +66,8 @@ pub const Frame = struct {
     depth: u16,
     /// The transaction this frame belongs to (block traces).
     transaction: u32,
+    /// A call to a precompile or native contract (4byteTracer and flatCallTracer skip them).
+    precompile: bool = false,
 };
 
 pub const Log = struct {
@@ -142,6 +150,7 @@ pub const Recorder = struct {
             .input = recorder.copy(frame.input),
             .depth = frame.depth + recorder.shift,
             .transaction = recorder.transaction,
+            .precompile = frame.precompile,
         };
         recorder.frame_count += 1;
     }
@@ -254,16 +263,24 @@ pub fn revert_reason(output: []const u8) ?[]const u8 {
 /// The top frame's gas limit and gas used, from the transaction (geth reports these).
 pub const TopGas = struct { limit: u64, used: u64 };
 
-fn write_fields(w: *json.Writer, frame: *const Frame, top: ?TopGas) json.Writer.WriteError!void {
+/// One frame's fields; `value` is what it reports (a DELEGATECALL's parent's value). As
+/// revm-inspectors' `geth_empty_call_frame`, only a STATICCALL omits `value` (a zero value
+/// is written as "0x0").
+fn write_fields(
+    w: *json.Writer,
+    frame: *const Frame,
+    value: u256,
+    top: ?TopGas,
+) json.Writer.WriteError!void {
     try w.key("type");
     try w.string(kind_name(frame.kind));
     try w.key("from");
     try w.data(&frame.from);
     try w.key("to");
     try w.data(&frame.to);
-    if (frame.kind != .staticcall and frame.kind != .delegatecall) {
+    if (frame.kind != .staticcall) {
         try w.key("value");
-        try w.quantity(frame.value);
+        try w.quantity(value);
     }
     try w.key("gas");
     try w.quantity(if (top) |gas| gas.limit else frame.gas);
@@ -321,7 +338,7 @@ pub fn write_tree(
 ) json.Writer.WriteError!void {
     assert(first < end and end <= recorder.frame_count);
     const frames = recorder.frames;
-    var stack: [depth_max]struct { frame: u32, failed: bool } = undefined;
+    var stack: [depth_max]struct { frame: u32, failed: bool, value: u256 } = undefined;
     var stack_count: u32 = 0;
     const last = if (only_top_call) first + 1 else end;
     var index = first;
@@ -334,14 +351,17 @@ pub fn write_tree(
         }
         const parent_failed = stack_count > 0 and stack[stack_count - 1].failed;
         const failed = parent_failed or error_text(frame.exit) != null;
+        // revm-inspectors gives a DELEGATECALL its parent's value.
+        const inherits = frame.kind == .delegatecall and stack_count > 0;
+        const value = if (inherits) stack[stack_count - 1].value else frame.value;
         try w.begin_object();
-        try write_fields(w, frame, if (index == first) top else null);
+        try write_fields(w, frame, value, if (index == first) top else null);
         if (!failed) try write_logs(w, recorder, index);
         const has_children = index + 1 < last and frames[index + 1].depth > frame.depth;
         if (has_children) {
             try w.key("calls");
             try w.begin_array();
-            stack[stack_count] = .{ .frame = index, .failed = failed };
+            stack[stack_count] = .{ .frame = index, .failed = failed, .value = value };
             stack_count += 1;
         } else {
             try w.end_object();
@@ -355,44 +375,125 @@ pub fn write_tree(
 
 // ---- Handlers ---------------------------------------------------------------------
 
+pub const TracerKind = enum { call, prestate, struct_log, four_byte, noop, flat_call };
+
 pub const Options = struct {
-    tracer: enum { call, prestate } = .call,
+    /// No `tracer` (or an empty one) selects geth's default struct logger.
+    tracer: TracerKind = .struct_log,
     only_top_call: bool = false,
     with_logs: bool = false,
     diff_mode: bool = false,
+    /// flatCallTracer `includePrecompiles`.
+    include_precompiles: bool = false,
+    struct_log: struct_log.Config = .{},
 };
 
-/// Parses `{"tracer":"callTracer","tracerConfig":{...}}` (absent: an error, since the
-/// default struct logger is not supported).
-pub fn parse_options(raw: ?[]const u8) error{ InvalidParams, Unsupported }!Options {
-    const text = raw orelse return error.Unsupported;
-    var options: Options = .{};
-    var scanner = json.Scanner.init(text);
-    if ((scanner.next() catch return error.InvalidParams).tag != .object_begin) {
-        return error.InvalidParams;
+pub const OptionsError = error{
+    InvalidParams,
+    /// A built-in tracer reth serves that needlefish does not (muxTracer, erc7562Tracer,
+    /// stateGasTracer).
+    Unsupported,
+    /// Any other name: reth reads it as JavaScript, which base/base builds without.
+    JsTracer,
+};
+
+/// The struct logger's flags as alloy's `GethDefaultTracingOptions` reads them (unset
+/// until given).
+const DefaultFlags = struct {
+    enable_memory: ?bool = null,
+    disable_memory: ?bool = null,
+    disable_stack: ?bool = null,
+    disable_storage: ?bool = null,
+    enable_return_data: ?bool = null,
+    disable_return_data: ?bool = null,
+    limit: u64 = 0,
+
+    fn config(flags: DefaultFlags) struct_log.Config {
+        const memory = flags.enable_memory orelse
+            if (flags.disable_memory) |disable| !disable else false;
+        const return_data = flags.enable_return_data orelse
+            if (flags.disable_return_data) |disable| !disable else false;
+        return .{
+            .stack = !(flags.disable_stack orelse false),
+            .memory = memory,
+            .storage = !(flags.disable_storage orelse false),
+            .return_data = return_data,
+            .limit = flags.limit,
+        };
     }
-    var named = false;
+};
+
+/// Parses geth tracing options: `tracer`, its `tracerConfig`, and the struct logger's
+/// flags (absent options: the struct logger with its defaults).
+pub fn parse_options(raw: ?[]const u8) OptionsError!Options {
+    var options: Options = .{};
+    const text = raw orelse return options;
+    var scanner = json.Scanner.init(text);
+    const first = scanner.next() catch return error.InvalidParams;
+    if (first.tag == .null) return options;
+    if (first.tag != .object_begin) return error.InvalidParams;
+    var flags: DefaultFlags = .{};
     while (true) {
         const name = scanner.next() catch return error.InvalidParams;
         if (name.tag == .object_end) break;
         if (name.tag != .string) return error.InvalidParams;
         const value = scanner.next() catch return error.InvalidParams;
         if (std.mem.eql(u8, name.bytes, "tracer")) {
-            if (value.tag != .string) return error.InvalidParams;
-            named = true;
-            if (std.mem.eql(u8, value.bytes, "prestateTracer")) {
-                options.tracer = .prestate;
-            } else if (!std.mem.eql(u8, value.bytes, "callTracer")) {
-                return error.Unsupported;
-            }
+            options.tracer = try tracer_of(value);
         } else if (std.mem.eql(u8, name.bytes, "tracerConfig") and value.tag == .object_begin) {
             try parse_config(&scanner, &options);
-        } else {
+        } else if (!try parse_flag(&flags, name.bytes, value)) {
             scanner.skip(value) catch return error.InvalidParams;
         }
     }
-    if (!named) return error.Unsupported;
+    options.struct_log = flags.config();
     return options;
+}
+
+fn tracer_of(value: json.Token) OptionsError!TracerKind {
+    if (value.tag == .null) return .struct_log;
+    if (value.tag != .string) return error.InvalidParams;
+    const names = [_]struct { []const u8, TracerKind }{
+        .{ "", .struct_log },
+        .{ "callTracer", .call },
+        .{ "prestateTracer", .prestate },
+        .{ "4byteTracer", .four_byte },
+        .{ "noopTracer", .noop },
+        .{ "flatCallTracer", .flat_call },
+    };
+    for (names) |entry| if (std.mem.eql(u8, value.bytes, entry[0])) return entry[1];
+    const unsupported = [_][]const u8{ "muxTracer", "erc7562Tracer", "stateGasTracer" };
+    for (unsupported) |name| if (std.mem.eql(u8, value.bytes, name)) return error.Unsupported;
+    return error.JsTracer;
+}
+
+/// Reads one struct logger flag; false when `name` is not one (the caller skips it).
+fn parse_flag(flags: *DefaultFlags, name: []const u8, value: json.Token) OptionsError!bool {
+    if (std.mem.eql(u8, name, "limit")) {
+        if (value.tag == .null) return true;
+        if (value.tag != .number) return error.InvalidParams;
+        flags.limit = std.fmt.parseInt(u64, value.bytes, 10) catch return error.InvalidParams;
+        return true;
+    }
+    const fields = [_]struct { []const u8, *?bool }{
+        .{ "enableMemory", &flags.enable_memory },
+        .{ "disableMemory", &flags.disable_memory },
+        .{ "disableStack", &flags.disable_stack },
+        .{ "disableStorage", &flags.disable_storage },
+        .{ "enableReturnData", &flags.enable_return_data },
+        .{ "disableReturnData", &flags.disable_return_data },
+    };
+    for (fields) |field| {
+        if (!std.mem.eql(u8, name, field[0])) continue;
+        field[1].* = switch (value.tag) {
+            .true => true,
+            .false => false,
+            .null => null,
+            else => return error.InvalidParams,
+        };
+        return true;
+    }
+    return false;
 }
 
 fn parse_config(scanner: *json.Scanner, options: *Options) error{InvalidParams}!void {
@@ -410,6 +511,8 @@ fn parse_config(scanner: *json.Scanner, options: *Options) error{InvalidParams}!
             options.with_logs = flag;
         } else if (std.mem.eql(u8, name.bytes, "diffMode")) {
             options.diff_mode = flag;
+        } else if (std.mem.eql(u8, name.bytes, "includePrecompiles")) {
+            options.include_precompiles = flag;
         }
     }
 }
@@ -417,9 +520,9 @@ fn parse_config(scanner: *json.Scanner, options: *Options) error{InvalidParams}!
 fn options_of(call: *Call, raw: ?[]const u8) HandlerError!Options {
     return parse_options(raw) catch |err| switch (err) {
         error.InvalidParams => return error.InvalidParams,
-        error.Unsupported => {
-            return call.fail(rpc.code.invalid_params, "only callTracer and prestateTracer");
-        },
+        // reth: `EthApiError::Unsupported`, an internal error.
+        error.Unsupported => return call.fail(rpc.code.internal_error, "unsupported tracer"),
+        error.JsTracer => return call.fail(rpc.code.internal_error, "JS Tracer is not enabled"),
     };
 }
 
@@ -458,11 +561,13 @@ fn trace_call(api: *Api, call: *Call) HandlerError!void {
     const options = try options_of(call, config);
     try call.params.finish();
     // geth reads `stateOverrides` and `blockOverrides` from the trace config.
-    const state_overrides = json.find_path(config.?, &.{"stateOverrides"}) catch
-        return error.InvalidParams;
-    const block_overrides = json.find_path(config.?, &.{"blockOverrides"}) catch
-        return error.InvalidParams;
-    try eth.set_overrides(api, call, &request, state_overrides, block_overrides);
+    if (config) |text| {
+        const state_overrides = json.find_path(text, &.{"stateOverrides"}) catch
+            return error.InvalidParams;
+        const block_overrides = json.find_path(text, &.{"blockOverrides"}) catch
+            return error.InvalidParams;
+        try eth.set_overrides(api, call, &request, state_overrides, block_overrides);
+    }
     // The recorder sits between the request's scratch (call data, override code) and the
     // proof tail.
     const data_end = eth.scratch_used(api, &request);
@@ -471,10 +576,28 @@ fn trace_call(api: *Api, call: *Call) HandlerError!void {
         .historical => eth.proof_tail_offset(api).?, // Checked by `parse_call_request`.
     };
     if (data_end >= end) return call.fail(rpc.code.internal_error, "scratch too small");
-    if (options.tracer == .prestate) {
-        return trace_call_prestate(api, call, request, api.scratch[data_end..end], options);
-    }
-    var recorder = recorder_in(api.scratch[data_end..end]) orelse
+    const space = api.scratch[data_end..end];
+    return switch (options.tracer) {
+        .prestate => trace_call_prestate(api, call, request, space, options),
+        .struct_log => trace_call_struct(api, call, request, space, options),
+        .call, .four_byte, .noop, .flat_call => trace_call_frames(
+            api,
+            call,
+            request,
+            space,
+            options,
+        ),
+    };
+}
+
+fn trace_call_frames(
+    api: *Api,
+    call: *Call,
+    request: eth.CallRequest,
+    space: []u8,
+    options: Options,
+) HandlerError!void {
+    var recorder = recorder_in(space) orelse
         return call.fail(rpc.code.internal_error, "scratch too small");
     recorder.with_logs = options.with_logs;
     const tracer = recorder.tracer();
@@ -487,13 +610,38 @@ fn trace_call(api: *Api, call: *Call) HandlerError!void {
         .executed => |executed| executed,
     };
     if (recorder.full) return call.fail(rpc.code.server_error, "trace exceeds the trace buffers");
-    if (recorder.frame_count == 0) return call.writer.null_value();
     var header = eth.view_header(api, request.view);
     var env = node.chain.env_of(&header);
     env.timestamp += 1; // As `eth.simulate` runs it.
     const limit = request.message.gas orelse executor.default_call_gas(&env);
     const top: TopGas = .{ .limit = limit, .used = executed.gas_used };
-    try write_tree(call.writer, &recorder, 0, recorder.frame_count, top, options.only_top_call);
+    // A call has no block hash or transaction; it runs in the block after the view's.
+    const locator: flat_call.Locator = .{ .block_number = header.number + 1 };
+    const range: Range = .{ .first = 0, .end = recorder.frame_count };
+    try write_frames(call.writer, &recorder, range, top, locator, options);
+}
+
+fn trace_call_struct(
+    api: *Api,
+    call: *Call,
+    request: eth.CallRequest,
+    space: []u8,
+    options: Options,
+) HandlerError!void {
+    var logger = struct_log.Logger.init(space, options.struct_log) orelse
+        return call.fail(rpc.code.internal_error, "scratch too small");
+    logger.begin_transaction();
+    const tracer = logger.tracer();
+    const executor = api.chain.executor;
+    executor.machine.tracer = &tracer;
+    const simulated = eth.simulate(api, call, request);
+    executor.machine.tracer = null;
+    const executed = switch (try simulated) {
+        .invalid => |reason| return call.fail(rpc.code.server_error, @tagName(reason)),
+        .executed => |executed| executed,
+    };
+    if (logger.full) return call.fail(rpc.code.server_error, "trace exceeds the trace buffers");
+    try logger.write(call.writer, executed.gas_used);
 }
 
 /// `debug_traceBlock(rlp, options)`: traces an RLP block (canonical or not) on its
@@ -578,8 +726,10 @@ fn trace_block(
     };
     const env = node.chain.env_of(header);
     const database = history.database();
-    if (options.tracer == .prestate) {
-        return trace_prestate(api, call, &env, transactions, only, options, &history, space);
+    // These two run their own execution loops.
+    if (options.tracer == .prestate or options.tracer == .struct_log) {
+        const run = if (options.tracer == .prestate) &trace_prestate else &trace_struct;
+        return run(api, call, &env, transactions, only, options, &history, space);
     }
     const per_transaction = run_count * (@sizeOf(u32) + @sizeOf(u64)) + 16;
     if (per_transaction >= space.len) {
@@ -594,7 +744,7 @@ fn trace_block(
         return call.fail(rpc.code.server_error, @errorName(err));
     };
     if (recorder.full) return call.fail(rpc.code.server_error, "trace exceeds the trace buffers");
-    try write_result(call.writer, &recorder, transactions, only, ranges, options);
+    try write_result(call.writer, &recorder, transactions, only, ranges, header, options);
 }
 
 fn carve_ranges(space: []u8, count: usize) Ranges {
@@ -634,22 +784,33 @@ fn execute(
     ranges.first[transactions.len] = recorder.frame_count;
 }
 
+/// The traced block's hash (computed for flatCallTracer only) and number.
+const Block = struct { hash: Hash, number: u64 };
+
 fn write_result(
     w: *json.Writer,
     recorder: *const Recorder,
     transactions: []const []const u8,
     only: ?u32,
     ranges: Ranges,
+    header: *const consensus.Header,
     options: Options,
 ) json.Writer.WriteError!void {
-    if (only) |index| return write_one(w, recorder, transactions[index], index, ranges, options);
+    // flatCallTracer locates each trace in its block.
+    const block: Block = .{
+        .hash = if (options.tracer == .flat_call) header.hash().bytes else @splat(0),
+        .number = header.number,
+    };
+    if (only) |index| {
+        return write_one(w, recorder, transactions[index], index, ranges, block, options);
+    }
     try w.begin_array();
     for (transactions, 0..) |raw, index| {
         try w.begin_object();
         try w.key("txHash");
         try w.data(&primitives.keccak256(raw).bytes);
         try w.key("result");
-        try write_one(w, recorder, raw, @intCast(index), ranges, options);
+        try write_one(w, recorder, raw, @intCast(index), ranges, block, options);
         try w.end_object();
     }
     try w.end_array();
@@ -661,15 +822,53 @@ fn write_one(
     raw: []const u8,
     index: u32,
     ranges: Ranges,
+    block: Block,
     options: Options,
 ) json.Writer.WriteError!void {
-    const first = ranges.first[index];
-    const end = ranges.first[index + 1];
-    // A transaction that made no call (an invalid one never applies) has no frames.
-    if (first == end) return w.null_value();
+    const range: Range = .{ .first = ranges.first[index], .end = ranges.first[index + 1] };
     const envelope = consensus.Envelope.decode(raw) catch unreachable; // Executed.
     const top: TopGas = .{ .limit = envelope.gas_limit(), .used = ranges.gas[index] };
-    try write_tree(w, recorder, first, end, top, options.only_top_call);
+    const locator: flat_call.Locator = .{
+        .block_hash = block.hash,
+        .block_number = block.number,
+        .transaction_hash = primitives.keccak256(raw).bytes,
+        .transaction_position = index,
+    };
+    try write_frames(w, recorder, range, top, locator, options);
+}
+
+/// A transaction's frames in the recorder: `first..end`.
+pub const Range = struct { first: u32, end: u32 };
+
+/// Writes one transaction's result for the tracers built from call frames.
+fn write_frames(
+    w: *json.Writer,
+    recorder: *const Recorder,
+    range: Range,
+    top: TopGas,
+    locator: flat_call.Locator,
+    options: Options,
+) json.Writer.WriteError!void {
+    assert(range.first <= range.end and range.end <= recorder.frame_count);
+    switch (options.tracer) {
+        .call => {
+            // A transaction that made no call (an invalid one never applies) has no frames.
+            if (range.first == range.end) return w.null_value();
+            try write_tree(w, recorder, range.first, range.end, top, options.only_top_call);
+        },
+        .four_byte => try flat_call.write_four_byte(w, recorder.frames[range.first..range.end]),
+        .noop => {
+            try w.begin_object();
+            try w.end_object();
+        },
+        .flat_call => try flat_call.write_flat(w, .{
+            .frames = recorder.frames[range.first..range.end],
+            .top = top,
+            .locator = locator,
+            .include_precompiles = options.include_precompiles,
+        }),
+        .prestate, .struct_log => unreachable, // Written by their own paths.
+    }
 }
 
 // ---- Tests ------------------------------------------------------------------------
@@ -696,10 +895,35 @@ test "trace: options select callTracer and its config" {
     const parsed = try parse_options(
         "{\"tracer\":\"callTracer\",\"tracerConfig\":{\"onlyTopCall\":true,\"withLog\":false}}",
     );
+    try testing.expect(parsed.tracer == .call);
     try testing.expect(parsed.only_top_call and !parsed.with_logs);
-    try testing.expectError(error.Unsupported, parse_options(null));
-    try testing.expectError(error.Unsupported, parse_options("{\"tracer\":\"4byteTracer\"}"));
-    try testing.expectError(error.Unsupported, parse_options("{}"));
+    // No tracer (or an empty one) is the struct logger: stack and storage on, memory and
+    // return data off.
+    for ([_]?[]const u8{ null, "{}", "null", "{\"tracer\":\"\"}" }) |raw| {
+        const default = try parse_options(raw);
+        try testing.expect(default.tracer == .struct_log);
+        try testing.expect(default.struct_log.stack and default.struct_log.storage);
+        try testing.expect(!default.struct_log.memory and !default.struct_log.return_data);
+        try testing.expectEqual(@as(u64, 0), default.struct_log.limit);
+    }
+    const flags = try parse_options("{\"disableStack\":true,\"disableStorage\":true," ++
+        "\"enableMemory\":true,\"disableReturnData\":false,\"limit\":5,\"timeout\":\"1s\"}");
+    try testing.expect(!flags.struct_log.stack and !flags.struct_log.storage);
+    try testing.expect(flags.struct_log.memory and flags.struct_log.return_data);
+    try testing.expectEqual(@as(u64, 5), flags.struct_log.limit);
+    // `enableMemory` wins over `disableMemory`.
+    const memory = try parse_options("{\"enableMemory\":false,\"disableMemory\":false}");
+    try testing.expect(!memory.struct_log.memory);
+    try testing.expect((try parse_options("{\"tracer\":\"4byteTracer\"}")).tracer == .four_byte);
+    try testing.expect((try parse_options("{\"tracer\":\"noopTracer\"}")).tracer == .noop);
+    const flat = try parse_options(
+        "{\"tracer\":\"flatCallTracer\",\"tracerConfig\":{\"includePrecompiles\":true}}",
+    );
+    try testing.expect(flat.tracer == .flat_call and flat.include_precompiles);
+    try testing.expectError(error.Unsupported, parse_options("{\"tracer\":\"muxTracer\"}"));
+    try testing.expectError(error.JsTracer, parse_options("{\"tracer\":\"{step: 1}\"}"));
+    try testing.expectError(error.InvalidParams, parse_options("{\"tracer\":1}"));
+    try testing.expectError(error.InvalidParams, parse_options("{\"disableStack\":1}"));
     const pre = try parse_options(
         "{\"tracer\":\"prestateTracer\",\"tracerConfig\":{\"diffMode\":true}}",
     );
@@ -907,6 +1131,71 @@ fn run_prestate(
             try w.key("result");
         }
         try prestate.write(w, collected, options.diff_mode);
+        if (only == null) try w.end_object();
+    }
+    if (only == null) try w.end_array();
+}
+
+/// The struct logger over a stored block: each traced transaction's logs are staged while
+/// it executes, then written with its result (`failed`, `gas`, `returnValue`) straight into
+/// the response (a failure later rewinds the whole response).
+fn trace_struct(
+    api: *Api,
+    call: *Call,
+    env: *const node.executor.BlockEnv,
+    transactions: []const []const u8,
+    only: ?u32,
+    options: Options,
+    history: *node.HistoryDatabase,
+    space: []u8,
+) HandlerError!void {
+    var logger = struct_log.Logger.init(space, options.struct_log) orelse
+        return call.fail(rpc.code.internal_error, "scratch too small");
+    const executor = api.chain.executor;
+    const database = history.database();
+    run_struct(executor, env, transactions, only, &logger, call.writer, database) catch |err| {
+        if (history.failure) |failure| return eth_proof.fail_history(call, failure);
+        return switch (err) {
+            error.WriteFailed => error.WriteFailed,
+            error.TraceFull => call.fail(rpc.code.server_error, "trace exceeds the trace buffers"),
+            else => call.fail(rpc.code.server_error, @errorName(err)),
+        };
+    };
+}
+
+fn run_struct(
+    executor: *node.executor.Executor,
+    env: *const node.executor.BlockEnv,
+    transactions: []const []const u8,
+    only: ?u32,
+    logger: *struct_log.Logger,
+    w: *json.Writer,
+    database: evm.state.Database,
+) !void {
+    const session = executor.session_begin(database);
+    defer executor.session_end(session);
+    try executor.recover_all(transactions);
+    var building = try executor.begin_block(env);
+    defer executor.known_sender = null;
+    const tracer = logger.tracer();
+    defer executor.machine.tracer = null;
+    if (only == null) try w.begin_array();
+    for (transactions, 0..) |raw, index| {
+        const traced = only == null or only.? == index;
+        if (traced) logger.begin_transaction();
+        executor.known_sender = executor.senders[index];
+        executor.machine.tracer = if (traced) &tracer else null;
+        const before = building.gas_used;
+        try executor.apply(&building, raw);
+        if (!traced) continue;
+        if (logger.full) return error.TraceFull;
+        if (only == null) {
+            try w.begin_object();
+            try w.key("txHash");
+            try w.data(&primitives.keccak256(raw).bytes);
+            try w.key("result");
+        }
+        try logger.write(w, building.gas_used - before);
         if (only == null) try w.end_object();
     }
     if (only == null) try w.end_array();
