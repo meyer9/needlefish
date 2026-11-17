@@ -369,7 +369,12 @@ fn fuzz_native(h: *Harness, smith: *testing.Smith) anyerror!void {
     try testing.expect(executed.gas_used <= gas_limit);
     switch (executed.status) {
         .success => try testing.expect(executed.output.len == 0 or executed.output.len == 32),
-        .revert => try testing.expect(executed.output.len <= 4 + 64),
+        .revert => {
+            // An error is at most two words; only a Beryl decode failure carries text.
+            const text = executed.output[@min(4, executed.output.len)..];
+            const decode = std.mem.startsWith(u8, text, "type check failed for ");
+            try testing.expect(executed.output.len <= 4 + 64 or (decode and upgrade == .beryl));
+        },
         .halt => try testing.expectEqual(gas_limit, executed.gas_used),
     }
 }
@@ -540,7 +545,10 @@ test "op: PolicyRegistry rejects value and reports Beryl decode failures" {
     const words = [_]u256{ address_int(sender_address), 2 };
     const bad_type = policy_input(&buffer, .create_policy, &words, null);
     const failed = try native_call(&h, policy.address, bad_type, 0);
-    const message = "type check failed for \"(address,uint8)\"";
+    // A static tuple's data is its two words, the enum word as given.
+    const message = "type check failed for \"(address,uint8)\" with data: " ++
+        "00000000000000000000000000000000000000000000000000000000005e4de2" ++
+        "0000000000000000000000000000000000000000000000000000000000000002";
     const expected = policy_selector(.create_policy) ++ message.*;
     try testing.expectEqualSlices(u8, &expected, failed.output);
     const paid = try native_call(&h, policy.address, bad_type, 1);
@@ -758,9 +766,18 @@ test "op: B-20 asset pause flags, roles, and views" {
     const features = try token_call(&h, .paused_features, &.{});
     try testing.expectEqual(@as(usize, 96), features.output.len);
     // Out-of-range enum is a decode failure; empty arrays revert EmptyFeatureSet.
-    const bad_input = token_input(&buffer, .pause, &.{ 0x20, 1, 3 });
+    // Before Cobalt it reverts with alloy's message: the Solidity type (an enum is uint8) and
+    // the decoded tuple re-encoded, so a non-canonical offset (0x40 here) comes back as 0x20.
+    const bad_input = token_input(&buffer, .pause, &.{ 0x40, 0xdead, 1, 3 });
     const bad = try native_call(&h, token_address, bad_input, 0);
     try testing.expect(bad.status == .revert);
+    const bad_message = "type check failed for \"(uint8[])\" with data: " ++
+        "0000000000000000000000000000000000000000000000000000000000000020" ++
+        "0000000000000000000000000000000000000000000000000000000000000020" ++
+        "0000000000000000000000000000000000000000000000000000000000000001" ++
+        "0000000000000000000000000000000000000000000000000000000000000003";
+    const bad_expected = b20_asset.selector_of(.pause) ++ bad_message.*;
+    try testing.expectEqualSlices(u8, &bad_expected, bad.output);
     const empty_input = token_input(&buffer, .pause, &.{ 0x20, 0 });
     const empty = try native_call(&h, token_address, empty_input, 0);
     try testing.expectEqual(@as(usize, 4), empty.output.len);

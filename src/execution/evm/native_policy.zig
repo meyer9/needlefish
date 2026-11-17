@@ -260,7 +260,7 @@ pub fn dispatch(context: *Context, input: []const u8) Error![]const u8 {
     const enumeration_max = if (version == .v1) type_allowlist else type_intersect;
     const kinds = function.kinds;
     const arguments = abi.decode_arguments(input[4..], kinds, enumeration_max, &failure) orelse
-        return context.revert_decode(selector, function.parameters, failure);
+        return context.revert_decode(selector, function.parameters, failure, input[4..], kinds);
     if (function.mutating) try ensure_activated(context);
     return route(context, function.tag, &arguments);
 }

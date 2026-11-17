@@ -88,7 +88,7 @@ pub fn dispatch(context: *Context, input: []const u8) Error![]const u8 {
     var failure: native.DecodeFailure = .overrun;
     const kinds = function.kinds;
     const arguments = abi.decode_arguments(input[4..], kinds, variant_max, &failure) orelse
-        return context.revert_decode(selector, function.parameters, failure);
+        return context.revert_decode(selector, function.parameters, failure, input[4..], kinds);
     switch (function.tag) {
         .create_b20 => {
             const token = try create(context, &arguments);
@@ -170,15 +170,21 @@ fn decode_params(
     const last: abi.Kind = if (variant == .asset) .uint8 else .string;
     const kinds = [_]abi.Kind{ .uint8, .string, .string, .address, last };
     var failure: native.DecodeFailure = .overrun;
-    if (params.len < 32) return context.revert_decode(selector, name, failure);
+    if (params.len < 32) return context.revert_decode(selector, name, failure, params, &kinds);
     const head = params[0..32];
     const offset = for (head[0..24]) |byte| {
-        if (byte != 0) return context.revert_decode(selector, name, .{ .offset = head.* });
+        if (byte != 0) return context.revert_decode(
+            selector,
+            name,
+            .{ .offset = head.* },
+            params,
+            &kinds,
+        );
     } else std.mem.readInt(u64, head[24..32], .big);
-    if (offset > params.len) return context.revert_decode(selector, name, failure);
+    if (offset > params.len) return context.revert_decode(selector, name, failure, params, &kinds);
     const tuple = params[@intCast(offset)..];
     const arguments = abi.decode_arguments(tuple, &kinds, 0, &failure) orelse
-        return context.revert_decode(selector, name, failure);
+        return context.revert_decode(selector, name, failure, tuple, &kinds);
     const is_asset = variant == .asset;
     return .{
         .variant = variant,

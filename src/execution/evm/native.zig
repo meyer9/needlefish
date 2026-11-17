@@ -130,35 +130,51 @@ pub const Context = struct {
         return context.upgrade.at_least(.cobalt);
     }
 
-    /// A known selector with malformed arguments: the bare selector from Cobalt, the
-    /// selector followed by the ABI decoder's message before.
+    /// A known selector with malformed arguments `data` (decoded as `kinds`): the bare
+    /// selector from Cobalt, before it the selector followed by alloy's decoder message
+    /// (base/base `AbiDecodeFailed`); a type check names the tuple's Solidity type and its
+    /// re-encoded data (`Error::type_check_fail_token`).
     pub fn revert_decode(
         context: *Context,
         selector: [4]u8,
         parameters: []const u8,
         failure: DecodeFailure,
+        data: []const u8,
+        kinds: []const native_abi.Kind,
     ) error{Revert} {
         assert(parameters.len <= parameters_length_max);
         if (context.is_cobalt()) return context.revert_selector(selector);
-        var buffer: [4 + 160]u8 = undefined;
-        var writer = std.Io.Writer.fixed(&buffer);
-        writer.writeAll(&selector) catch unreachable; // 4 bytes fit.
-        // Messages are at most 26 + parameters_length_max or 51 + 64 bytes.
-        switch (failure) {
-            .overrun => writer.writeAll(
-                "ABI decoding failed: buffer overrun while deserializing",
-            ) catch unreachable,
-            .type_check => writer.print("type check failed for \"{s}\"", .{
-                parameters,
-            }) catch unreachable,
-            .offset => |word| writer.print(
-                "type check failed for \"offset (usize)\" with data: {x}",
-                .{&word},
-            ) catch unreachable,
-        }
+        var writer = std.Io.Writer.fixed(context.out);
+        // The message only outgrows the 64 MiB return buffer when non-canonical `bytes[]`
+        // offsets repeat a large element; it is then cut off there.
+        write_decode_message(&writer, selector, parameters, failure, data, kinds) catch {};
         context.revert(writer.buffered()) catch {};
         context.revert_custom = false;
         return error.Revert;
+    }
+
+    fn write_decode_message(
+        writer: *std.Io.Writer,
+        selector: [4]u8,
+        parameters: []const u8,
+        failure: DecodeFailure,
+        data: []const u8,
+        kinds: []const native_abi.Kind,
+    ) std.Io.Writer.Error!void {
+        try writer.writeAll(&selector);
+        switch (failure) {
+            .overrun => try writer.writeAll(
+                "ABI decoding failed: buffer overrun while deserializing",
+            ),
+            .type_check => {
+                try writer.print("type check failed for \"{s}\" with data: ", .{parameters});
+                try native_abi.write_tuple_hex(writer, data, kinds);
+            },
+            .offset => |word| try writer.print(
+                "type check failed for \"offset (usize)\" with data: {x}",
+                .{&word},
+            ),
+        }
     }
 
     /// An unknown selector reverts with the bare selector.

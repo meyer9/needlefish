@@ -32,6 +32,10 @@ pub const Kind = enum {
     /// `bytes[]`: element offsets are relative to the word after the length.
     bytes_array,
 
+    fn is_dynamic(kind: Kind) bool {
+        return kind.is_array() or kind == .string or kind == .bytes or kind == .bytes_array;
+    }
+
     fn is_array(kind: Kind) bool {
         return switch (kind) {
             .address_array, .uint64_array, .enumeration_array, .uint256_array => true,
@@ -115,6 +119,19 @@ pub fn decode_arguments(
     enumeration_max: u8,
     failure: *native.DecodeFailure,
 ) ?Arguments {
+    const arguments = decode_tokens(data, kinds, failure) orelse return null;
+    for (kinds, 0..) |kind, index| {
+        const payload = arguments.list(index);
+        if (!valid(kind, arguments.words[index], payload, enumeration_max)) {
+            failure.* = .type_check;
+            return null;
+        }
+    }
+    return arguments;
+}
+
+/// Decode the tokens of `kinds` (alloy's `abi::decode_sequence`) without type checks.
+fn decode_tokens(data: []const u8, kinds: []const Kind, failure: *native.DecodeFailure) ?Arguments {
     assert(kinds.len <= arguments_max);
     var arguments = Arguments{};
     var array_count: u32 = 0;
@@ -140,14 +157,81 @@ pub fn decode_arguments(
         if (array_count == 0) arguments.array = .{ .words = words };
         array_count += 1;
     }
+    return arguments;
+}
+
+/// The hex data of alloy's type-check message for the tuple `kinds` decoded from `data`:
+/// `abi::encode` of the decoded token, so the decoded words (dirty bits kept) re-encoded with
+/// canonical offsets and zero padding, behind a 0x20 offset word when the tuple is dynamic.
+/// `data` must decode as `kinds` (it failed only the type check).
+pub fn write_tuple_hex(
+    writer: *std.Io.Writer,
+    data: []const u8,
+    kinds: []const Kind,
+) std.Io.Writer.Error!void {
+    var failure: native.DecodeFailure = .overrun;
+    const arguments = decode_tokens(data, kinds, &failure).?;
+    var dynamic = false;
+    for (kinds) |kind| dynamic = dynamic or kind.is_dynamic();
+    if (dynamic) try write_int(writer, 32);
+    var tail: u64 = 32 * @as(u64, kinds.len);
     for (kinds, 0..) |kind, index| {
-        const payload = arguments.list(index);
-        if (!valid(kind, arguments.words[index], payload, enumeration_max)) {
-            failure.* = .type_check;
-            return null;
+        if (kind.is_dynamic()) {
+            try write_int(writer, tail);
+            tail += tail_length(kind, &arguments, index);
+        } else {
+            try writer.print("{x}", .{arguments.words[index]});
         }
     }
-    return arguments;
+    for (kinds, 0..) |kind, index| {
+        if (!kind.is_dynamic()) continue;
+        const payload = arguments.dynamic[index];
+        if (kind != .bytes_array) {
+            const count = if (kind.is_array()) payload.len / 32 else payload.len;
+            try write_int(writer, count);
+            try write_padded(writer, payload);
+            continue;
+        }
+        const count = arguments.bytes_count(index);
+        try write_int(writer, count);
+        var offset: u64 = 32 * @as(u64, count);
+        for (0..count) |item| {
+            try write_int(writer, offset);
+            offset += 32 + padded_length(arguments.bytes_item(index, @intCast(item)).len);
+        }
+        for (0..count) |item| {
+            const element = arguments.bytes_item(index, @intCast(item));
+            try write_int(writer, element.len);
+            try write_padded(writer, element);
+        }
+    }
+}
+
+fn tail_length(kind: Kind, arguments: *const Arguments, index: usize) u64 {
+    assert(kind.is_dynamic());
+    if (kind != .bytes_array) return 32 + padded_length(arguments.dynamic[index].len);
+    const count = arguments.bytes_count(index);
+    var length: u64 = 32 + 32 * @as(u64, count);
+    for (0..count) |item| {
+        length += 32 + padded_length(arguments.bytes_item(index, @intCast(item)).len);
+    }
+    return length;
+}
+
+fn padded_length(length: usize) u64 {
+    return std.mem.alignForward(u64, length, 32);
+}
+
+fn write_int(writer: *std.Io.Writer, value: u64) std.Io.Writer.Error!void {
+    var word: [32]u8 = @splat(0);
+    std.mem.writeInt(u64, word[24..32], value, .big);
+    try writer.print("{x}", .{&word});
+}
+
+fn write_padded(writer: *std.Io.Writer, bytes: []const u8) std.Io.Writer.Error!void {
+    try writer.print("{x}", .{bytes});
+    const padding = padded_length(bytes.len) - bytes.len;
+    try writer.splatBytesAll("00", padding);
 }
 
 fn head_word(data: []const u8, index: usize) ?*const [32]u8 {
