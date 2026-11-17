@@ -940,6 +940,31 @@ test "op: B-20 asset metadata, multiplier, allowances, and permit failures" {
     try testing.expectEqual(owner, std.mem.readInt(u256, bad_v.output[36..68], .big));
 }
 
+test "op: B-20 updateExtraMetadata with an empty value deletes a long value before Cobalt" {
+    var h: Harness = undefined;
+    try token_setup(&h);
+    defer h.deinit(testing.allocator);
+    // "k0" holds a 40-byte value: length 40 * 2 + 1 in its slot, two chunks after it.
+    var preimage: [2 + 32]u8 = undefined;
+    preimage[0..2].* = "k0".*;
+    preimage[2..].* = native.u256_word(b20_asset.asset_root + 3);
+    const slot = std.mem.readInt(u256, &keccak_of(&preimage), .big);
+    const data = std.mem.readInt(u256, &keccak_of(&native.u256_word(slot)), .big);
+    try h.database.put_storage(token_address, slot, 81);
+    try h.database.put_storage(token_address, data, 0x61);
+    try h.database.put_storage(token_address, data + 1, 0x62);
+    h.state.reset(h.database.interface());
+    _ = try token_call(&h, .grant_role, &.{ b20.role_metadata, address_int(sender_address) });
+    const k0 = short_string("k0") & ~@as(u256, 0xff);
+    const cleared = try token_call(&h, .update_extra_metadata, &.{ 0x40, 0x80, 2, k0, 0 });
+    try testing.expect(cleared.status == .success);
+    try testing.expectEqual(@as(usize, 1), cleared.logs.len);
+    // base/base deletes the entry: the slot and both chunks are zero.
+    try testing.expectEqual(@as(u256, 0), try h.storage(token_address, slot));
+    try testing.expectEqual(@as(u256, 0), try h.storage(token_address, data));
+    try testing.expectEqual(@as(u256, 0), try h.storage(token_address, data + 1));
+}
+
 fn keccak_of(bytes: []const u8) [32]u8 {
     var digest: [32]u8 = undefined;
     std.crypto.hash.sha3.Keccak256.hash(bytes, &digest, .{});
