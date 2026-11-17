@@ -226,7 +226,7 @@ const Response = struct {
 
 fn answer(adapter: *diff.Adapter, arena: std.mem.Allocator, line: []const u8) !Response {
     var out: std.Io.Writer.Allocating = .init(arena);
-    try diff.handle_line(adapter, arena, line, &out.writer);
+    try diff.handle_line(adapter, arena, line, &out.writer, null);
     return std.json.parseFromSliceLeaky(Response, arena, out.written(), .{
         .ignore_unknown_fields = true,
     });

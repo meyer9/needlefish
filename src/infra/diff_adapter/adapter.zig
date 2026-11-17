@@ -269,9 +269,12 @@ pub const Adapter = struct {
                 }
                 const entry: Rejected = .{ .index = @intCast(index), .reason = @errorName(err) };
                 try rejected.append(arena, entry);
+                evm.coverage.transaction(tx_type_of(raw), entry.reason);
                 continue;
             };
             try included.append(arena, raw);
+            const status = building.receipts[building.count - 1].status;
+            evm.coverage.transaction(tx_type_of(raw), if (status) "ok" else "failed");
         }
         assert(building.count == included.items.len);
         self.missing.phase = .post_block;
@@ -315,6 +318,12 @@ pub const Adapter = struct {
     }
 
     /// The engine and chain checks of the canonical block: the first failure, else null.
+    /// The EIP-2718 type byte (0 for a legacy RLP list, 0xff for empty bytes).
+    fn tx_type_of(raw: []const u8) u8 {
+        if (raw.len == 0) return 0xff;
+        return if (raw[0] < 0x80) raw[0] else 0;
+    }
+
     fn validate(self: *Adapter, case: *const Case, outcome: *const Outcome) ?[]const u8 {
         const spec = self.spec;
         const canonical = &case.header;

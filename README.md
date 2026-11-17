@@ -124,6 +124,45 @@ Replay fetches recent blocks and the state they touch from public RPC, re-execut
 offline, and checks every header field against the chain. It needs no snapshot and no disk
 beyond a small cache. [Learn how replay works](docs/REPLAY.md).
 
+### Differential fuzzing adapter
+
+```sh
+zig build -Doptimize=ReleaseSafe
+zig-out/bin/base diff-adapter < requests.jsonl
+```
+
+`base diff-adapter` runs one block per JSON line on needlefish's block execution path, with
+pre-state from a stateless witness, and answers with every header field, receipt, and state
+change it computes. A differential fuzz harness compares those answers with base/base and
+other clients. The protocol and its code live in `src/infra/diff_adapter`.
+
+For coverage-guided fuzzing, build with `-Ddiff-coverage` and set `BASE_DIFF_COVERAGE=1`:
+
+```sh
+zig build -Doptimize=ReleaseSafe -Ddiff-coverage -p zig-out-coverage
+BASE_DIFF_COVERAGE=1 zig-out-coverage/bin/base diff-adapter < requests.jsonl
+```
+
+Each response then carries `"coverage": {"nf:<feature>": <count>, ...}`, which the harness
+does not compare:
+
+- `nf:op:<opcode>:<fork>:d<depth>`: instructions by EVM fork and call depth bucket.
+- `nf:exit:<opcode>:<outcome>`: the instruction that ended a frame's run, and how.
+- `nf:pre:<address>:l<k>[w]:<result>`: precompile calls by input length (`2^(k-1)` up to
+  `2^k` bytes, `w` for whole words) and result.
+- `nf:native:<contract>:<selector>:<result>[:<revert selector>]`: native precompile calls;
+  B-20 tokens appear by variant.
+- `nf:tx:<type>:<outcome>`: transactions by type: `ok`, `failed`, or the rejection.
+- `nf:edge:<index>`: compiler edge counters (`-ffuzz`, 8-bit, so counts wrap at 256) inside
+  EVM and crypto functions, reset per request. Indices are stable for one binary only.
+
+The flag needs an optimized build (the LLVM backend emits the counters), and it does not
+change results. It instruments the whole `base` module, so the binary runs about 1.7x slower
+with coverage off and 1.9x with it on (ReleaseSafe, synthetic fuzz requests). A request that
+first fills a cache (code analysis, the warm-address set) can show a few more edges than the
+same request later. Without the flag the hooks compile away; the variable then makes the adapter
+exit with an error rather than report nothing.
+
 ### Local devnet
 
 The devnet runs natively, with no Docker and no external L1: needlefish brings its own L1 dev

@@ -12,6 +12,7 @@ const assert = std.debug.assert;
 const usage =
     \\usage: base diff-adapter
     \\  Speaks the differential execution protocol on stdin/stdout (Base mainnet rules).
+    \\  BASE_DIFF_COVERAGE=1 adds per-request coverage (needs a -Ddiff-coverage build).
     \\
 ;
 
@@ -28,6 +29,9 @@ pub fn main(init: std.process.Init, args: []const []const u8) !u8 {
     defer gpa.destroy(adapter);
     try adapter.init(gpa);
     defer adapter.deinit();
+    var coverage = try coverage_from_environment(init);
+    defer if (coverage) |*features| features.deinit(gpa);
+    const features: ?*const diff.Coverage = if (coverage) |*collected| collected else null;
     const read_buffer = try gpa.alloc(u8, read_buffer_bytes);
     defer gpa.free(read_buffer);
     var stdin = Io.File.stdin().reader(init.io, read_buffer);
@@ -49,7 +53,8 @@ pub fn main(init: std.process.Init, args: []const []const u8) !u8 {
         const text = std.mem.trim(u8, line.written(), " \t\r");
         if (text.len > 0) {
             _ = arena_state.reset(.retain_capacity);
-            try diff.handle_line(adapter, arena_state.allocator(), text, &stdout.interface);
+            const arena = arena_state.allocator();
+            try diff.handle_line(adapter, arena, text, &stdout.interface, features);
             try stdout.interface.writeAll("\n");
             try stdout.interface.flush();
             requests += 1;
@@ -58,4 +63,29 @@ pub fn main(init: std.process.Init, args: []const []const u8) !u8 {
     }
     std.log.info("diff-adapter: answered {d} requests", .{requests});
     return 0;
+}
+
+/// Coverage when `BASE_DIFF_COVERAGE` is set and not `0`; a build without
+/// `-Ddiff-coverage` refuses instead of silently reporting nothing.
+fn coverage_from_environment(init: std.process.Init) !?diff.Coverage {
+    const setting = init.environ_map.get("BASE_DIFF_COVERAGE") orelse return null;
+    if (setting.len == 0 or std.mem.eql(u8, setting, "0")) return null;
+    if (!base.execution.evm.coverage.enabled) {
+        std.log.err("BASE_DIFF_COVERAGE needs a binary built with -Ddiff-coverage", .{});
+        return error.CoverageNotBuilt;
+    }
+    // The symbol table maps edge counters to functions; read once at startup.
+    const executable = try Io.Dir.cwd().readFileAlloc(
+        init.io,
+        "/proc/self/exe",
+        init.gpa,
+        .limited(1 << 30),
+    );
+    defer init.gpa.free(executable);
+    const coverage = try diff.Coverage.init(init.gpa, executable);
+    std.log.info("diff-adapter: coverage on, {d} of {d} edges in the EVM and crypto", .{
+        coverage.edges.len,
+        coverage.counters.len,
+    });
+    return coverage;
 }

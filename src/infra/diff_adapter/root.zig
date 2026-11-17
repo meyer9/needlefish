@@ -10,22 +10,29 @@ const assert = std.debug.assert;
 pub const request = @import("request.zig");
 pub const adapter = @import("adapter.zig");
 pub const response = @import("response.zig");
+pub const coverage = @import("coverage.zig");
 pub const Adapter = adapter.Adapter;
+pub const Coverage = coverage.Coverage;
 
 /// Answers one request line into `out` (no newline). Every line gets a response: requests
-/// that cannot be processed get `ok: false`.
+/// that cannot be processed get `ok: false`. With `features`, the response carries the
+/// request's coverage.
 pub fn handle_line(
     self: *Adapter,
     arena: std.mem.Allocator,
     line: []const u8,
     out: *std.Io.Writer,
+    features: ?*const Coverage,
 ) std.Io.Writer.Error!void {
+    if (features) |collected| collected.begin();
     const raw = request.parse(arena, line) catch |err| {
         const id = request.salvage_id(arena, line);
-        return response.write_error(out, id, error_text(arena, "invalid request", err));
+        const text = error_text(arena, "invalid request", err);
+        return response.write_error(out, id, text, features);
     };
     const case = request.decode(arena, &raw) catch |err| {
-        return response.write_error(out, raw.id, error_text(arena, "invalid request", err));
+        const text = error_text(arena, "invalid request", err);
+        return response.write_error(out, raw.id, text, features);
     };
     const outcome = self.run(arena, &case) catch |err| {
         const text = if (err == error.WitnessIncomplete)
@@ -33,9 +40,9 @@ pub fn handle_line(
         else
             error_text(arena, "cannot execute", err);
         std.log.info("diff adapter: {s}: {s}", .{ raw.id orelse "(no id)", text });
-        return response.write_error(out, raw.id, text);
+        return response.write_error(out, raw.id, text, features);
     };
-    return response.write_outcome(out, raw.id, &outcome);
+    return response.write_outcome(out, raw.id, &outcome, features);
 }
 
 /// `WitnessIncomplete: witness lacks trie node 0x.., reading account 0x.., executing
@@ -55,4 +62,5 @@ fn error_text(arena: std.mem.Allocator, what: []const u8, err: anyerror) []const
 test {
     std.testing.refAllDecls(@This());
     _ = @import("adapter_test.zig");
+    _ = @import("coverage.zig");
 }

@@ -18,6 +18,7 @@ const env = @import("env.zig");
 const gas = @import("gas.zig");
 const interpreter = @import("interpreter.zig");
 const precompiles = @import("precompiles.zig");
+const coverage = @import("coverage.zig");
 const crypto = @import("../../common/crypto/root.zig");
 const native = @import("native.zig");
 const Fork = @import("fork.zig").Fork;
@@ -511,6 +512,7 @@ pub const Evm = struct {
             .out = evm.return_buffer,
             .scratch = evm.precompile_scratch,
         });
+        coverage.precompile(&request.target, request.input.len, @tagName(result.status));
         if (result.status != .success) {
             evm.state.revert(checkpoint);
             return failed(0, .precompile_failure);
@@ -551,6 +553,8 @@ pub const Evm = struct {
         };
         const is_direct = request.kind == .call or request.kind == .staticcall;
         const result = try native.run(contract, &context, request.input, is_direct);
+        const status = @tagName(result.status);
+        coverage.native(&request.code_address, request.input, status, result.output);
         assert(result.gas_used <= request.gas_limit);
         if (result.status != .success) evm.state.revert(checkpoint);
         const exit: Exit = switch (result.status) {

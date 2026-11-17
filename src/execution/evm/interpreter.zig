@@ -23,6 +23,7 @@ const memory_module = @import("memory.zig");
 const stack_module = @import("stack.zig");
 const bytecode = @import("bytecode.zig");
 const opcode_profile = @import("opcode_profile.zig");
+const coverage = @import("coverage.zig");
 const state_module = @import("state.zig");
 const evm_module = @import("evm.zig");
 const Fork = @import("fork.zig").Fork;
@@ -75,9 +76,19 @@ pub fn run(comptime fork: Fork, evm: *Evm, frame: *Frame) Exit {
                 defer opcode_profile.record(opcode, start);
                 if (comptime bytecode.fusion(opcode)) |parts| {
                     inline for (parts) |part| {
-                        if (!step(fork, part, r, &analyzed, f, evm, &exit)) break :loop;
+                        coverage.step(fork, part, f.depth);
+                        if (!step(fork, part, r, &analyzed, f, evm, &exit)) {
+                            coverage.halt(part, exit);
+                            break :loop;
+                        }
                     }
-                } else if (!step(fork, opcode, r, &analyzed, f, evm, &exit)) break :loop;
+                } else {
+                    coverage.step(fork, opcode, f.depth);
+                    if (!step(fork, opcode, r, &analyzed, f, evm, &exit)) {
+                        coverage.halt(opcode, exit);
+                        break :loop;
+                    }
+                }
                 continue :dispatch ops[r.pc];
             },
         }

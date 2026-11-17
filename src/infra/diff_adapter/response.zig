@@ -7,17 +7,24 @@ const assert = std.debug.assert;
 const primitives = @import("../../common/primitives/root.zig");
 const consensus = @import("../../common/consensus/root.zig");
 const adapter = @import("adapter.zig");
+const Coverage = @import("coverage.zig").Coverage;
 
 const Writer = std.Io.Writer;
 const Header = consensus.Header;
 const hex = primitives.hex;
 
-/// `{"id":...,"ok":false,"error":...}`
-pub fn write_error(out: *Writer, id: ?[]const u8, message: []const u8) Writer.Error!void {
+/// `{"id":...,"ok":false,"error":...}`, with `coverage` when given.
+pub fn write_error(
+    out: *Writer,
+    id: ?[]const u8,
+    message: []const u8,
+    coverage: ?*const Coverage,
+) Writer.Error!void {
     try out.writeAll("{\"id\":");
     try write_string_or_null(out, id);
     try out.writeAll(",\"ok\":false,\"error\":");
     try std.json.Stringify.encodeJsonString(message, .{}, out);
+    if (coverage) |features| try features.write(out);
     try out.writeAll("}");
 }
 
@@ -25,6 +32,7 @@ pub fn write_outcome(
     out: *Writer,
     id: ?[]const u8,
     outcome: *const adapter.Outcome,
+    coverage: ?*const Coverage,
 ) Writer.Error!void {
     try out.writeAll("{\"id\":");
     try write_string_or_null(out, id);
@@ -51,7 +59,9 @@ pub fn write_outcome(
         if (index > 0) try out.writeAll(",");
         try write_account(out, account);
     }
-    try out.writeAll("}}");
+    try out.writeAll("}");
+    if (coverage) |features| try features.write(out);
+    try out.writeAll("}");
 }
 
 fn write_string_or_null(out: *Writer, text: ?[]const u8) Writer.Error!void {
@@ -167,7 +177,7 @@ const testing = std.testing;
 test "diff response: error and outcome lines" {
     var output: Writer.Allocating = .init(testing.allocator);
     defer output.deinit();
-    try write_error(&output.writer, "a\"b", "witness incomplete");
+    try write_error(&output.writer, "a\"b", "witness incomplete", null);
     try testing.expectEqualStrings(
         \\{"id":"a\"b","ok":false,"error":"witness incomplete"}
     , output.written());
@@ -182,7 +192,7 @@ test "diff response: error and outcome lines" {
         .computed_base_fee = 16,
         .post = &post,
     };
-    try write_outcome(&output.writer, "x", &outcome);
+    try write_outcome(&output.writer, "x", &outcome, null);
     const address_ab = "abababababababababababababababababababab";
     const address_01 = "0101010101010101010101010101010101010101";
     const zero_31 = "00000000000000000000000000000000000000000000000000000000000000";
