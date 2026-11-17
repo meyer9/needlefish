@@ -65,8 +65,12 @@ pub const Array = struct {
     }
 };
 
+/// The head word of an argument a function does not take: reading past a function's
+/// parameters (as `route` code shared between functions may) reads zero, never garbage.
+const zero_word: [32]u8 = @splat(0);
+
 pub const Arguments = struct {
-    words: [arguments_max]*const [32]u8 = undefined,
+    words: [arguments_max]*const [32]u8 = @splat(&zero_word),
     /// The first dynamic array argument.
     array: Array = .{ .words = &.{} },
     /// Dynamic payload per argument: array words or string bytes.

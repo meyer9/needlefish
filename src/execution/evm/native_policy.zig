@@ -278,6 +278,7 @@ fn ensure_activated(context: *Context) Error!void {
 }
 
 fn route(context: *Context, tag: Tag, arguments: *const Arguments) Error![]const u8 {
+    // Zero for the argument-free functions (`Arguments` defaults absent heads to zero).
     const id = arguments.uint64(0);
     const version = version_of(context);
     switch (tag) {

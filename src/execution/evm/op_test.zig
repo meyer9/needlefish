@@ -593,6 +593,22 @@ test "op: B-20 factory calldata below the interface minimum fails the interface 
     try testing.expectEqualSlices(u8, &selector, cobalt.output);
 }
 
+test "op: PolicyRegistry argument-free views answer a bare selector (Denim)" {
+    var h: Harness = undefined;
+    try h.init(testing.allocator);
+    defer h.deinit(testing.allocator);
+    h.evm.block.op = .{ .upgrade = .denim, .activation_admin = sender_address };
+    // A 4-byte call once read the absent policy id through an undefined argument pointer.
+    const minimum = policy_selector(.min_composite_child_policies);
+    const low = try native_call(&h, policy.address, &minimum, 0);
+    try testing.expectEqual(evm_module.Status.success, low.status);
+    try testing.expectEqual(@as(u256, policy.children_min), output_word(low));
+    const maximum = policy_selector(.max_composite_child_policies);
+    const high = try native_call(&h, policy.address, &maximum, 0);
+    try testing.expectEqual(evm_module.Status.success, high.status);
+    try testing.expectEqual(@as(u256, policy.children_max), output_word(high));
+}
+
 fn policy_call(h: *Harness, input: []const u8) !transaction.Executed {
     return native_call_gas(h, policy.address, input, 0, 1_000_000);
 }
