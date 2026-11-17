@@ -129,6 +129,7 @@ fn write_account(out: *Writer, account: *const adapter.PostAccount) Writer.Error
     try out.writeAll(",\"balance\":");
     try quantity(out, info.balance);
     try field_data(out, ",\"codeHash\":", &info.code_hash);
+    if (account.wiped) try out.writeAll(",\"wiped\":true");
     try out.writeAll(",\"storage\":{");
     for (account.storage, 0..) |slot, index| {
         if (index > 0) try out.writeAll(",");
