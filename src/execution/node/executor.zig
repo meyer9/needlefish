@@ -40,8 +40,6 @@ pub const consolidation_request_address: Address =
 pub const system_call_gas: u64 = 30_000_000;
 const gas_per_blob: u64 = 1 << 17;
 
-const access_list_module = @import("access_list.zig");
-
 fn hex20(comptime text: []const u8) Address {
     return comptime primitives.hex.decode_array(20, text) catch unreachable;
 }
@@ -613,8 +611,11 @@ pub const Executor = struct {
         clock: Clock,
         transaction_ns: []u64,
         transaction_gas: []u64,
+        /// Sees the transactions' frames (not the block's system calls).
+        tracer: ?*const evm.evm.Tracer,
     ) Error!Metered {
         assert(executor.known_sender == null);
+        assert(executor.machine.tracer == null);
         if (transactions.len > executor.transactions_max) return error.TooManyTransactions;
         const recovery_start = clock.read();
         try executor.recover_all(transactions);
@@ -633,6 +634,8 @@ pub const Executor = struct {
             }
             try executor.state.set_nonce(account, nonce);
         }
+        executor.machine.tracer = tracer;
+        defer executor.machine.tracer = null;
         try executor.apply_timed(&building, transactions, clock, transaction_ns, transaction_gas);
         return .{
             .signer_recovery_ns = recovery_end -| recovery_start,
@@ -684,8 +687,6 @@ pub const Executor = struct {
         value: u256 = 0,
         data: []const u8 = &.{},
         access_list: []const evm.transaction.AccessListItem = &.{},
-        /// Receives the warm accounts and slots of an executed call (eth_createAccessList).
-        collect: ?*access_list_module.Collector = null,
         /// Sees the state right after the call executes, before it is discarded
         /// (debug_traceCall prestateTracer).
         inspect: ?Inspect = null,
@@ -875,16 +876,6 @@ pub const Executor = struct {
             .invalid => |reason| return .{ .invalid = reason },
             .executed => |executed| executed,
         };
-        if (call.collect) |collector| {
-            const context: access_list_module.Context = .{
-                .spec = executor.spec,
-                .timestamp = block.timestamp,
-                .from = call.from,
-                .to = call.to,
-                .coinbase = block.beneficiary,
-            };
-            collector.collect(executor.state, &context);
-        }
         if (call.inspect) |inspect| inspect.run(inspect.context, executor.state);
         const result_output = try executor.call_output(&executed);
         const output = try executor.alloc(u8, result_output.len);

@@ -2795,3 +2795,108 @@ fn fuzz_sender_nonce(_: void, smith: *testing.Smith) anyerror!void {
 test "eth: fuzz eth_getTransactionBySenderAndNonce nonces" {
     try testing.fuzz({}, fuzz_sender_nonce, .{});
 }
+
+// ---- eth_createAccessList (reth's AccessListInspector) and base_meterBundle opcodeGas ----
+
+inline fn address_hex(comptime byte: []const u8) []const u8 {
+    const zeros: [38]u8 = @splat('0');
+    return "\"0x" ++ zeros ++ byte ++ "\"";
+}
+
+inline fn slot_hex(comptime byte: []const u8) []const u8 {
+    const zeros: [62]u8 = @splat('0');
+    return "\"0x" ++ zeros ++ byte ++ "\"";
+}
+
+/// 0x41 reads its slot 7, the balance of 0x44 and calls 0x42, which reads its slot 1 and
+/// the code size of 0x55 and reverts; 0x41 then stops.
+fn put_access_list_contracts(h: *Harness) !void {
+    const caller = [_]u8{
+        0x60, 0x07, 0x54, 0x50, 0x60, 0x44, 0x31, 0x50, // PUSH1 7 SLOAD POP PUSH1 0x44 BALANCE POP
+        0x5f, 0x5f, 0x5f, 0x5f, 0x5f, 0x60, 0x42, 0x5a, // PUSH0 x5 PUSH1 0x42 GAS
+        0xf1, 0x50, 0x00, // CALL POP STOP
+    };
+    // PUSH1 1 SLOAD POP PUSH1 0x55 EXTCODESIZE POP PUSH0 PUSH0 REVERT.
+    const reverter = [_]u8{ 0x60, 0x01, 0x54, 0x50, 0x60, 0x55, 0x3b, 0x50, 0x5f, 0x5f, 0xfd };
+    var address: [20]u8 = @splat(0);
+    address[19] = 0x41;
+    try h.node.db.put_account(address, 0, 1, &caller);
+    address[19] = 0x42;
+    try h.node.db.put_account(address, 0, 1, &reverter);
+    _ = try h.mine(12);
+}
+
+test "eth: eth_createAccessList follows reth's access list inspector" {
+    const h = try Harness.create();
+    defer h.destroy();
+    try put_access_list_contracts(h);
+    // The request's untouched 0x66 stays; its seeded slot 9 of the excluded `to` goes, the
+    // slot `to` reads stays; the reverted frame's accesses stay.
+    const call = "[{\"to\":" ++ address_hex("41") ++ ",\"accessList\":[{\"address\":" ++
+        address_hex("66") ++ ",\"storageKeys\":[" ++ slot_hex("01") ++ "]},{\"address\":" ++
+        address_hex("41") ++ ",\"storageKeys\":[" ++ slot_hex("09") ++ "]}]}]";
+    // Second run: 21000 + 5 * 2400 + 3 * 1900 intrinsic; 0x41 runs 327 gas with every
+    // access warm, 0x42 214 (PUSH1 3, SLOAD 100, POP 2, PUSH1 3, EXTCODESIZE 100, POP 2,
+    // PUSH0 PUSH0 4): 39241.
+    const expected = "\"result\":{\"accessList\":[{\"address\":" ++ address_hex("41") ++
+        ",\"storageKeys\":[" ++ slot_hex("07") ++ "]},{\"address\":" ++ address_hex("42") ++
+        ",\"storageKeys\":[" ++ slot_hex("01") ++ "]},{\"address\":" ++ address_hex("44") ++
+        ",\"storageKeys\":[]},{\"address\":" ++ address_hex("55") ++
+        ",\"storageKeys\":[]},{\"address\":" ++ address_hex("66") ++ ",\"storageKeys\":[" ++
+        slot_hex("01") ++ "]}],\"gasUsed\":\"0x9949\"}";
+    try testing.expectEqualStrings(expected, try h.request("eth_createAccessList", call));
+}
+
+test "eth: eth_createAccessList returns a failed call's list, gas and error" {
+    const h = try Harness.create();
+    defer h.destroy();
+    try put_access_list_contracts(h);
+    const call = "[{\"to\":" ++ address_hex("42") ++ ",\"accessList\":[{\"address\":" ++
+        address_hex("77") ++ ",\"storageKeys\":[]}]}]";
+    // The first run's gas: 21000 + 2400 intrinsic; PUSH1 3, cold SLOAD 2100, POP 2, PUSH1 3,
+    // cold EXTCODESIZE 2600, POP 2, PUSH0 PUSH0 4: 28114.
+    const expected = "\"result\":{\"accessList\":[{\"address\":" ++ address_hex("42") ++
+        ",\"storageKeys\":[" ++ slot_hex("01") ++ "]},{\"address\":" ++ address_hex("55") ++
+        ",\"storageKeys\":[]},{\"address\":" ++ address_hex("77") ++
+        ",\"storageKeys\":[]}],\"gasUsed\":\"0x6dd2\",\"error\":\"execution reverted\"}";
+    try testing.expectEqualStrings(expected, try h.request("eth_createAccessList", call));
+}
+
+test "eth: base_meterBundle reports precompile opcodeGas" {
+    const h = try Harness.create();
+    defer h.destroy();
+    // BN254_ADD and RIPEMD160 twice without input, then BN254_ADD on (1, 0), not a curve
+    // point, with 0x1000 gas, which it spends.
+    const code = [_]u8{
+        0x5f, 0x5f, 0x5f, 0x5f, 0x5f, 0x60, 0x06, 0x5a, 0xf1, 0x50, // CALL 0x06
+        0x5f, 0x5f, 0x5f, 0x5f, 0x5f, 0x60, 0x03, 0x5a, 0xf1, 0x50, // CALL 0x03
+        0x5f, 0x5f, 0x5f, 0x5f, 0x5f, 0x60, 0x03, 0x5a, 0xf1, 0x50, // CALL 0x03
+        0x60, 0x01, 0x5f, 0x52, // PUSH1 1 PUSH0 MSTORE
+        0x5f, 0x5f, 0x60, 0x40,
+        0x5f, 0x5f, 0x60, 0x06,
+        0x61, 0x10, 0x00, 0xf1,
+        0x50, 0x00,
+    };
+    var contract: [20]u8 = @splat(0);
+    contract[19] = 0x48;
+    try h.node.db.put_account(contract, 0, 1, &code);
+    _ = try h.mine(12);
+    var sha256: [20]u8 = @splat(0);
+    sha256[19] = 0x02;
+    var buffers: [3][256]u8 = undefined;
+    const raws = [_][]const u8{
+        try contract_call_raw(&buffers[0], 0, contract),
+        // The transaction's own call counts: SHA256 of nothing costs 60.
+        try contract_call_raw(&buffers[1], 1, sha256),
+        try transfer_raw(&buffers[2], 2),
+    };
+    const text = try meter_bundle_request(h, &raws);
+    const entry = "{\"contractAddress\":";
+    try expect_contains(text, "\"opcodeGas\":[" ++ entry ++ address_hex("03") ++
+        ",\"opcode\":\"RIPEMD160\",\"count\":2,\"gasUsed\":1200}," ++ entry ++
+        address_hex("06") ++ ",\"opcode\":\"BN254_ADD\",\"count\":2,\"gasUsed\":4246}]}");
+    try expect_contains(text, "\"opcodeGas\":[" ++ entry ++ address_hex("02") ++
+        ",\"opcode\":\"SHA256\",\"count\":1,\"gasUsed\":60}]}");
+    // Nothing metered: no `opcodeGas`.
+    try testing.expectEqual(@as(usize, 2), count_of(text, "opcodeGas"));
+}
