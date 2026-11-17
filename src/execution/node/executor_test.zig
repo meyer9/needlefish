@@ -578,6 +578,20 @@ test "executor: Denim installs the BaseTime implementation once, behind the prox
     try testing.expect(early.db.get_account(base_time.implementation_address) == null);
 }
 
+test "executor: Denim replaces code already at the BaseTime implementation address" {
+    var f: Fixture = undefined;
+    try f.init_with(&everest_spec);
+    defer f.deinit();
+    // Only a synthetic pre-state has code there; base/base overwrites it, keeping the balance.
+    try f.db.put_account(base_time.implementation_address, 7, 3, &.{ 0x60, 0x00 });
+    _ = try f.executor.execute_block(&block_env(1), &.{}, &.{});
+    const implementation = f.db.get_account(base_time.implementation_address).?;
+    const code_hash = base_time.implementation_code_hash;
+    try testing.expectEqualSlices(u8, &code_hash, &implementation.code_hash);
+    try testing.expectEqual(@as(u256, 7), implementation.balance);
+    try testing.expectEqual(@as(u64, 3), implementation.nonce);
+}
+
 test "executor: a Denim block without the BaseTime proxy or its admin is rejected" {
     var bare_spec = everest_spec;
     bare_spec.upgrades[@backingInt(chainspec.Upgrade.denim)] = 1;

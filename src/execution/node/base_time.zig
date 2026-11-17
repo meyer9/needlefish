@@ -111,7 +111,13 @@ pub fn ensure_predeploy(state: *evm.State) TransitionError!void {
     if (admin != address_word(proxy_admin)) return error.BaseTimeUnexpectedProxyAdmin;
     state.begin_transaction();
     const implementation = try state.load(implementation_address);
-    try state.set_code(implementation, &implementation_code);
+    // base/base overwrites whatever code the account holds (only a synthetic pre-state has
+    // any), keeping its balance and nonce.
+    if (implementation.info.has_code()) {
+        try state.replace_code(implementation, &implementation_code);
+    } else {
+        try state.set_code(implementation, &implementation_code);
+    }
     try state.touch(implementation);
     const access = try state.storage_access(proxy, implementation_slot);
     try state.storage_write(proxy, access.slot, address_word(implementation_address));
