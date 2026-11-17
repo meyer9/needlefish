@@ -1044,6 +1044,34 @@ test "eth: feeHistory takes a numeric block count and no percentiles" {
     try expect_contains(try h.request("eth_feeHistory", "[1.5,\"latest\"]"), "-32602");
 }
 
+test "eth: a call request's access list is charged and warms its entries" {
+    const h = try Harness.create();
+    defer h.destroy();
+    const to = "\"to\":\"0x00000000000000000000000000000000000000aa\"";
+    try testing.expectEqualStrings(
+        "\"result\":\"0x5208\"",
+        try h.request("eth_estimateGas", "[{" ++ to ++ "}]"),
+    );
+    // 21000 + 2400 for the address + 1900 for each of two keys = 27200, before or after
+    // `input`; reth's search (optimistic guess, then 1.5%) settles at 27545.
+    const item_address = "\"address\":\"0x1111111111111111111111111111111111111111\"";
+    const key_0 = "\"0x0000000000000000000000000000000000000000000000000000000000000000\"";
+    const key_1 = "\"0x0000000000000000000000000000000000000000000000000000000000000001\"";
+    const listed = "\"accessList\":[{" ++ item_address ++ ",\"storageKeys\":[" ++ key_0 ++
+        "," ++ key_1 ++ "]}]";
+    try testing.expectEqualStrings(
+        "\"result\":\"0x6b99\"",
+        try h.request("eth_estimateGas", "[{" ++ to ++ "," ++ listed ++ ",\"input\":\"0x\"}]"),
+    );
+    try testing.expectEqualStrings(
+        "\"result\":\"0x6b99\"",
+        try h.request("eth_estimateGas", "[{\"input\":\"0x\"," ++ listed ++ "," ++ to ++ "}]"),
+    );
+    // alloy requires both fields of an item.
+    const keyless = "[{\"accessList\":[{" ++ item_address ++ "}]}]";
+    try expect_contains(try h.request("eth_estimateGas", keyless), "-32602");
+}
+
 fn fuzz_body(h: *Harness, body: []const u8) !void {
     var out: std.Io.Writer = .fixed(&h.out);
     const outcome = eth.Router.handle(&h.api, body, &out);

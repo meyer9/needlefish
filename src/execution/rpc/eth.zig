@@ -814,6 +814,7 @@ fn fail_add(code: i32, message: []const u8) AddResult {
 pub fn parse_call(space: []u8, raw: []const u8) HandlerError!node.executor.Executor.Call {
     var result: node.executor.Executor.Call = .{};
     var scanner = json.Scanner.init(raw);
+    var used: usize = 0;
     if ((try scanner_next(&scanner)).tag != .object_begin) return error.InvalidParams;
     while (true) {
         const name = try scanner_next(&scanner);
@@ -822,7 +823,9 @@ pub fn parse_call(space: []u8, raw: []const u8) HandlerError!node.executor.Execu
         const value = try scanner_next(&scanner);
         if (value.tag == .null) continue;
         const text = value.bytes;
-        if (std.mem.eql(u8, name.bytes, "from")) {
+        if (std.mem.eql(u8, name.bytes, "accessList")) {
+            result.access_list = try parse_access_list(&scanner, value, space, &used);
+        } else if (std.mem.eql(u8, name.bytes, "from")) {
             result.from = json.parse_fixed(20, text) catch return error.InvalidParams;
         } else if (std.mem.eql(u8, name.bytes, "to")) {
             result.to = json.parse_fixed(20, text) catch return error.InvalidParams;
@@ -831,12 +834,97 @@ pub fn parse_call(space: []u8, raw: []const u8) HandlerError!node.executor.Execu
         } else if (std.mem.eql(u8, name.bytes, "value")) {
             result.value = json.parse_quantity(u256, text) catch return error.InvalidParams;
         } else if (std.mem.eql(u8, name.bytes, "data") or std.mem.eql(u8, name.bytes, "input")) {
-            result.data = json.parse_data(text, space) catch return error.InvalidParams;
+            const data = json.parse_data(text, space[used..]) catch return error.InvalidParams;
+            result.data = data;
+            used += data.len;
         } else {
             scanner.skip(value) catch return error.InvalidParams;
         }
     }
     return result;
+}
+
+const AccessListItem = evm.transaction.AccessListItem;
+
+/// A request's EIP-2930 access list (alloy's `AccessList`: every item needs `address` and
+/// `storageKeys`), stored in `space` after `used`. Counted on a copy of the scanner first.
+fn parse_access_list(
+    scanner: *json.Scanner,
+    first: json.Token,
+    space: []u8,
+    used: *usize,
+) HandlerError![]const AccessListItem {
+    if (first.tag != .array_begin) return error.InvalidParams;
+    var probe = scanner.*;
+    var items_count: usize = 0;
+    var keys_count: usize = 0;
+    while (try access_list_item(&probe, null, null)) |keys| {
+        items_count += 1;
+        keys_count += keys;
+    }
+    const start = std.mem.alignForward(usize, used.*, @alignOf(AccessListItem));
+    const items_bytes = items_count * @sizeOf(AccessListItem);
+    const keys_bytes = keys_count * @sizeOf([32]u8);
+    if (start + items_bytes + keys_bytes > space.len) return error.InvalidParams;
+    const items: []AccessListItem = @alignCast(std.mem.bytesAsSlice(
+        AccessListItem,
+        space[start..][0..items_bytes],
+    ));
+    const keys: [][32]u8 = @alignCast(std.mem.bytesAsSlice(
+        [32]u8,
+        space[start + items_bytes ..][0..keys_bytes],
+    ));
+    var keys_used: usize = 0;
+    for (items) |*item| {
+        const count = (try access_list_item(scanner, item, keys[keys_used..])).?;
+        keys_used += count;
+    }
+    assert(keys_used == keys_count);
+    if ((try scanner_next(scanner)).tag != .array_end) return error.InvalidParams;
+    used.* = start + items_bytes + keys_bytes;
+    return items;
+}
+
+/// Reads one access list item (null at the list's end) and returns its key count; with
+/// `item`, fills it, its keys in `keys`.
+fn access_list_item(
+    scanner: *json.Scanner,
+    item: ?*AccessListItem,
+    keys: ?[][32]u8,
+) HandlerError!?usize {
+    const open = try scanner_next(scanner);
+    if (open.tag == .array_end) return null;
+    if (open.tag != .object_begin) return error.InvalidParams;
+    var address: ?[20]u8 = null;
+    var count: ?usize = null;
+    while (true) {
+        const name = try scanner_next(scanner);
+        if (name.tag == .object_end) break;
+        if (name.tag != .string) return error.InvalidParams;
+        const value = try scanner_next(scanner);
+        if (std.mem.eql(u8, name.bytes, "address")) {
+            if (value.tag != .string) return error.InvalidParams;
+            address = json.parse_fixed(20, value.bytes) catch return error.InvalidParams;
+        } else if (std.mem.eql(u8, name.bytes, "storageKeys")) {
+            if (value.tag != .array_begin) return error.InvalidParams;
+            var index: usize = 0;
+            while (true) : (index += 1) {
+                const key = try scanner_next(scanner);
+                if (key.tag == .array_end) break;
+                if (key.tag != .string) return error.InvalidParams;
+                const bytes = json.parse_fixed(32, key.bytes) catch return error.InvalidParams;
+                if (keys) |out| out[index] = bytes;
+            }
+            count = index;
+        } else scanner.skip(value) catch return error.InvalidParams;
+    }
+    const keys_count = count orelse return error.InvalidParams;
+    if (item) |out| out.* = .{
+        .address = address orelse return error.InvalidParams,
+        .storage_keys = keys.?[0..keys_count],
+    };
+    if (address == null) return error.InvalidParams;
+    return keys_count;
 }
 
 /// A call request with the state it runs against. The block is resolved before the
@@ -873,8 +961,19 @@ pub fn scratch_used(api: *Api, request: *const CallRequest) usize {
     const base = @intFromPtr(api.scratch.ptr);
     const space = request.override_space;
     if (space.len > 0) return @intFromPtr(space.ptr) - base + space.len;
-    const data = request.message.data;
-    return if (data.len == 0) 0 else @intFromPtr(data.ptr) - base + data.len;
+    // The call data and access list `parse_call` stored, in either order.
+    const message = &request.message;
+    var end: usize = 0;
+    if (message.data.len > 0) end = @intFromPtr(message.data.ptr) + message.data.len;
+    if (message.access_list.len > 0) {
+        const items = std.mem.sliceAsBytes(message.access_list);
+        end = @max(end, @intFromPtr(items.ptr) + items.len);
+    }
+    for (message.access_list) |item| {
+        const keys = std.mem.sliceAsBytes(item.storage_keys);
+        if (keys.len > 0) end = @max(end, @intFromPtr(keys.ptr) + keys.len);
+    }
+    return if (end == 0) 0 else end - base;
 }
 
 /// Attaches state and block overrides (raw JSON, "null" or absent for none).
