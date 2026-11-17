@@ -293,17 +293,18 @@ fn warm_addresses(comptime fork: Fork, evm: *Evm, tx: *const TxEnv) state_module
 pub fn warm_system_addresses(comptime fork: Fork, evm: *Evm) state_module.Error!void {
     evm.state.static_warm = .{};
     if (!fork.at_least(.berlin)) return;
-    if (fork.at_least(.shanghai)) _ = try evm.state.access(evm.block.coinbase);
     const op_upgrade = evm.op_upgrade();
-    if (evm.static_warm_cache) |cache| {
-        if (cache.fork == fork and cache.upgrade == op_upgrade) {
-            evm.state.static_warm = cache.warm;
-            return;
-        }
+    const cached = if (evm.static_warm_cache) |cache|
+        cache.fork == fork and cache.upgrade == op_upgrade
+    else
+        false;
+    if (!cached) {
+        const warm = static_warm_set(fork, op_upgrade);
+        evm.static_warm_cache = .{ .fork = fork, .upgrade = op_upgrade, .warm = warm };
     }
-    const warm = static_warm_set(fork, op_upgrade);
-    evm.static_warm_cache = .{ .fork = fork, .upgrade = op_upgrade, .warm = warm };
-    evm.state.static_warm = warm;
+    evm.state.static_warm = evm.static_warm_cache.?.warm;
+    assert(evm.state.static_warm.coinbase == null);
+    if (fork.at_least(.shanghai)) evm.state.static_warm.coinbase = evm.block.coinbase;
 }
 
 fn static_warm_set(comptime fork: Fork, op_upgrade: ?op.Upgrade) state_module.StaticWarm {

@@ -45,6 +45,9 @@ test "op: deposit mints, skips fees, and refunds normally" {
     const tx = deposit(target, 100_000);
     const executed = (try transaction.transact(&h.evm, .prague, &tx)).executed;
     try testing.expectEqual(evm_module.Status.success, executed.status);
+    // The coinbase is warm but never read (a deposit-only block's witness lacks it).
+    try testing.expect(h.state.accounts.getPtr(coinbase) == null);
+    try testing.expect(h.state.is_warm(coinbase));
     try testing.expectEqual(@as(u64, 21_000 + 22_106), executed.gas_used);
     try testing.expectEqual(@as(u256, 995), try balance(&h, depositor));
     try testing.expectEqual(@as(u256, 5), try balance(&h, target));

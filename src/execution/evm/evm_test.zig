@@ -446,7 +446,9 @@ test "transaction: precompiles are warm by predicate, without loading, for one t
     h.state.begin_transaction();
     try std.testing.expect(!h.state.is_warm(ecrecover));
     try transaction.warm_system_addresses(.osaka, &h.evm);
-    try std.testing.expectEqual(@as(u32, 1), h.state.accounts.count()); // The coinbase only.
+    // Nothing loaded: the coinbase is warm by predicate too (EIP-3651, as in revm).
+    try std.testing.expectEqual(@as(u32, 0), h.state.accounts.count());
+    try std.testing.expect(h.state.is_warm(h.evm.block.coinbase));
     try std.testing.expect(h.state.is_warm(ecrecover));
     try std.testing.expect(h.state.is_warm(point_evaluation));
     try std.testing.expect(!(try h.state.access(ecrecover)).is_cold);

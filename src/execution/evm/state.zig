@@ -301,8 +301,14 @@ pub const StaticWarm = struct {
     precompiles: u32 = 0,
     p256: bool = false,
     natives: []const Address = &.{},
+    /// EIP-3651's warm coinbase, warm without being loaded (as in revm): a block of
+    /// deposits never reads the fee recipient, so a stateless witness need not hold it.
+    coinbase: ?Address = null,
 
     pub fn contains(warm: *const StaticWarm, address: Address) bool {
+        if (warm.coinbase) |coinbase| {
+            if (std.mem.eql(u8, &coinbase, &address)) return true;
+        }
         if (std.mem.allEqual(u8, address[0..18], 0)) {
             const number = std.mem.readInt(u16, address[18..20], .big);
             if (number < 32) return (warm.precompiles >> @intCast(number)) & 1 == 1;
