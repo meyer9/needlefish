@@ -1072,6 +1072,50 @@ test "eth: a call request's access list is charged and warms its entries" {
     try expect_contains(try h.request("eth_estimateGas", keyless), "-32602");
 }
 
+test "eth: a call at a block runs in that block's environment, pending in the next" {
+    const h = try Harness.create();
+    defer h.destroy();
+    _ = try h.mine(2);
+    _ = try h.mine(4);
+    // Code returning TIMESTAMP and NUMBER.
+    const clock = "{\"to\":\"0x00000000000000000000000000000000000c0ffe\"}";
+    const code = "{\"0x00000000000000000000000000000000000c0ffe\":" ++
+        "{\"code\":\"0x426000524360205260406000f3\"}}";
+    // The harness keeps only the head's state, so block 2 is named by number and by tag.
+    const word = "00000000000000000000000000000000000000000000000000000000000000";
+    const head = "\"result\":\"0x" ++ word ++ "04" ++ word ++ "02\"";
+    try testing.expectEqualStrings(
+        head,
+        try h.request("eth_call", "[" ++ clock ++ ",\"0x2\"," ++ code ++ "]"),
+    );
+    try testing.expectEqualStrings(
+        head,
+        try h.request("eth_call", "[" ++ clock ++ ",\"latest\"," ++ code ++ "]"),
+    );
+    // base/base derives "pending" from the head: number + 1, timestamp + 12.
+    try testing.expectEqualStrings(
+        "\"result\":\"0x" ++ word ++ "10" ++ word ++ "03\"",
+        try h.request("eth_call", "[" ++ clock ++ ",\"pending\"," ++ code ++ "]"),
+    );
+}
+
+test "eth: a call request's authorizations are charged as a type-4 transaction" {
+    const h = try Harness.create();
+    defer h.destroy();
+    // An authorization for another chain is skipped but still costs 25000 intrinsic gas.
+    const authorization = "{\"address\":\"0x0000000000000000000000000000000000000004\"," ++
+        "\"chainId\":\"0x2105\",\"nonce\":\"0x5\",\"r\":\"0x1\",\"s\":\"0x1\"," ++
+        "\"yParity\":\"0x1\"}";
+    const to = "\"to\":\"0x2a379f4bf2e4752dd19c04b3d8ac9f1d4ad44b89\"";
+    const listed = try h.request("eth_createAccessList", "[{\"authorizationList\":[" ++
+        authorization ++ "]," ++ to ++ "}]");
+    try expect_contains(listed, "\"gasUsed\":\"0xb3b0\"");
+    // Every field is required.
+    const partial = "[{\"authorizationList\":[{\"address\":" ++
+        "\"0x0000000000000000000000000000000000000004\"}]," ++ to ++ "}]";
+    try expect_contains(try h.request("eth_createAccessList", partial), "-32602");
+}
+
 fn fuzz_body(h: *Harness, body: []const u8) !void {
     var out: std.Io.Writer = .fixed(&h.out);
     const outcome = eth.Router.handle(&h.api, body, &out);

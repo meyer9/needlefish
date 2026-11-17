@@ -523,7 +523,7 @@ fn run_call(
 ) HandlerError!u64 {
     const call = simulation.call;
     const space = simulation.space;
-    var message = try eth.parse_call(space, raw);
+    var message = try eth.parse_call(space, raw, simulation.api.chain.executor.recoverer);
     try set_fees(simulation, &message, raw);
     const remaining = env.gas_limit - gas_used;
     if ((message.gas orelse 0) > remaining) {

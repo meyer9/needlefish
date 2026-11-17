@@ -941,7 +941,7 @@ fn eth_call(api: *Api, call: *Call) HandlerError!void {
     const call_raw = try call.params.raw();
     const raw = try call.params.optional_raw();
     try call.params.finish();
-    var message = try eth.parse_call(api.scratch, call_raw);
+    var message = try eth.parse_call(api.scratch, call_raw, api.node.recoverer);
     // Absent: the executor's default (the block limit, EIP-7825-capped from Osaka on).
     if (message.gas) |gas| message.gas = @min(gas, call_gas_max);
     const view = try view_state(api, call, raw);

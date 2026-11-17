@@ -811,7 +811,11 @@ fn fail_add(code: i32, message: []const u8) AddResult {
 
 // ---- Calls ------------------------------------------------------------------------
 
-pub fn parse_call(space: []u8, raw: []const u8) HandlerError!node.executor.Executor.Call {
+pub fn parse_call(
+    space: []u8,
+    raw: []const u8,
+    recoverer: consensus.Recoverer,
+) HandlerError!node.executor.Executor.Call {
     var result: node.executor.Executor.Call = .{};
     var scanner = json.Scanner.init(raw);
     var used: usize = 0;
@@ -825,6 +829,9 @@ pub fn parse_call(space: []u8, raw: []const u8) HandlerError!node.executor.Execu
         const text = value.bytes;
         if (std.mem.eql(u8, name.bytes, "accessList")) {
             result.access_list = try parse_access_list(&scanner, value, space, &used);
+        } else if (std.mem.eql(u8, name.bytes, "authorizationList")) {
+            const list = try parse_authorizations(&scanner, value, space, &used, recoverer);
+            result.authorization_list = list;
         } else if (std.mem.eql(u8, name.bytes, "from")) {
             result.from = json.parse_fixed(20, text) catch return error.InvalidParams;
         } else if (std.mem.eql(u8, name.bytes, "to")) {
@@ -842,6 +849,76 @@ pub fn parse_call(space: []u8, raw: []const u8) HandlerError!node.executor.Execu
         }
     }
     return result;
+}
+
+const Authorization = evm.transaction.Authorization;
+
+/// A request's EIP-7702 authorizations (alloy's `SignedAuthorization`: `chainId`, `address`,
+/// `nonce`, `yParity` (alias `v`), `r` and `s`, all required), with each authority recovered
+/// as a transaction's are; stored in `space` after `used`.
+fn parse_authorizations(
+    scanner: *json.Scanner,
+    first: json.Token,
+    space: []u8,
+    used: *usize,
+    recoverer: consensus.Recoverer,
+) HandlerError![]const Authorization {
+    if (first.tag != .array_begin) return error.InvalidParams;
+    var probe = scanner.*;
+    var count: usize = 0;
+    while (try signed_authorization(&probe)) |_| count += 1;
+    const start = std.mem.alignForward(usize, used.*, @alignOf(Authorization));
+    const bytes = count * @sizeOf(Authorization);
+    if (start + bytes > space.len) return error.InvalidParams;
+    const list: []Authorization = @alignCast(std.mem.bytesAsSlice(
+        Authorization,
+        space[start..][0..bytes],
+    ));
+    for (list) |*out| {
+        const signed = (try signed_authorization(scanner)).?;
+        const authority = signed.recover_authority(recoverer);
+        out.* = .{
+            .chain_id = signed.chain_id,
+            .address = signed.address.bytes,
+            .nonce = signed.nonce,
+            .authority = if (authority) |a| a.bytes else null,
+        };
+    }
+    if ((try scanner_next(scanner)).tag != .array_end) return error.InvalidParams;
+    used.* = start + bytes;
+    return list;
+}
+
+/// One signed authorization object, or null at the list's end.
+fn signed_authorization(scanner: *json.Scanner) HandlerError!?consensus.tx_fields.Authorization {
+    const open = try scanner_next(scanner);
+    if (open.tag == .array_end) return null;
+    if (open.tag != .object_begin) return error.InvalidParams;
+    var fields: [6]?[]const u8 = @splat(null);
+    const names = [_][]const u8{ "chainId", "address", "nonce", "yParity", "r", "s" };
+    while (true) {
+        const name = try scanner_next(scanner);
+        if (name.tag == .object_end) break;
+        if (name.tag != .string) return error.InvalidParams;
+        const value = try scanner_next(scanner);
+        const key = if (std.mem.eql(u8, name.bytes, "v")) "yParity" else name.bytes;
+        for (names, 0..) |known, index| {
+            if (!std.mem.eql(u8, key, known)) continue;
+            if (value.tag != .string or fields[index] != null) return error.InvalidParams;
+            fields[index] = value.bytes;
+            break;
+        } else scanner.skip(value) catch return error.InvalidParams;
+    }
+    for (fields) |field| if (field == null) return error.InvalidParams;
+    const quantity = json.parse_quantity;
+    return .{
+        .chain_id = quantity(u256, fields[0].?) catch return error.InvalidParams,
+        .address = .{ .bytes = json.parse_fixed(20, fields[1].?) catch return error.InvalidParams },
+        .nonce = quantity(u64, fields[2].?) catch return error.InvalidParams,
+        .y_parity = quantity(u8, fields[3].?) catch return error.InvalidParams,
+        .r = quantity(u256, fields[4].?) catch return error.InvalidParams,
+        .s = quantity(u256, fields[5].?) catch return error.InvalidParams,
+    };
 }
 
 const AccessListItem = evm.transaction.AccessListItem;
@@ -933,6 +1010,8 @@ fn access_list_item(
 pub const CallRequest = struct {
     message: node.executor.Executor.Call,
     view: state_view.View,
+    /// The block tag was "pending": the call runs in a block after the head.
+    pending: bool = false,
     /// The request's fee fields (`call_fees`), applied when the call runs.
     fees: call_fees.Fees = .{},
     /// Raw geth `stateOverrides` / `blockOverrides` objects (see `set_overrides`).
@@ -972,6 +1051,10 @@ pub fn scratch_used(api: *Api, request: *const CallRequest) usize {
     for (message.access_list) |item| {
         const keys = std.mem.sliceAsBytes(item.storage_keys);
         if (keys.len > 0) end = @max(end, @intFromPtr(keys.ptr) + keys.len);
+    }
+    if (message.authorization_list) |list| {
+        const bytes = std.mem.sliceAsBytes(list);
+        if (bytes.len > 0) end = @max(end, @intFromPtr(bytes.ptr) + bytes.len);
     }
     return if (end == 0) 0 else end - base;
 }
@@ -1056,15 +1139,21 @@ pub const Prepared = struct {
 
 pub fn parse_call_request(api: *Api, call: *Call) HandlerError!CallRequest {
     const call_raw = try call.params.raw();
-    const view = try state_view.resolve(api, call, try call.params.optional_raw());
+    const block_raw = try call.params.optional_raw();
+    const view = try state_view.resolve(api, call, block_raw);
     const space = switch (view) {
         .head => api.scratch,
         .historical => api.scratch[0 .. proof_tail_offset(api) orelse {
             return call.fail(rpc.code.internal_error, "proof scratch too small");
         }],
     };
-    const message = try parse_call(space, call_raw);
-    return .{ .message = message, .view = view, .fees = try call_fees.parse(call_raw) };
+    const message = try parse_call(space, call_raw, api.chain.executor.recoverer);
+    return .{
+        .message = message,
+        .view = view,
+        .pending = if (block_raw) |raw| std.mem.eql(u8, raw, "\"pending\"") else false,
+        .fees = try call_fees.parse(call_raw),
+    };
 }
 
 /// Where the proof buffers of a historical call start (aligned, at the scratch tail).
@@ -1085,7 +1174,9 @@ pub fn view_header(api: *Api, view: state_view.View) consensus.Header {
     };
 }
 
-/// The block a call request runs in: the next one after its view, with block overrides.
+/// The block a call request runs in, with block overrides. As reth's `evm_env_at`: a block's
+/// own environment on its post-state, or for "pending" (base/base has no pending block) the
+/// next block derived from the head (`BaseNextBlockEnvAttributes::build_pending_env`).
 pub fn request_env(
     api: *Api,
     call: *Call,
@@ -1093,11 +1184,16 @@ pub fn request_env(
 ) HandlerError!node.executor.BlockEnv {
     const header = view_header(api, request.view);
     var env = node.chain.env_of(&header);
-    env.number += 1;
-    env.timestamp += 1;
-    env.parent_hash = header.hash().bytes;
+    if (request.pending) {
+        assert(request.view == .head);
+        env.number = header.number + 1;
+        env.timestamp = header.timestamp +| 12;
+        env.parent_hash = header.hash().bytes;
+        env.base_fee = next_base_fee_after(api, &header);
+        env.prev_randao = @splat(0); // base/base draws it at random.
+        // The beacon root stays the parent's, as build_pending_env copies it.
+    }
     if (request.block_overrides) |raw| try simulate_module.apply_block_overrides(call, &env, raw);
-    assert(env.number == header.number + 1 or request.block_overrides != null);
     return env;
 }
 

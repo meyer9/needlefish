@@ -687,6 +687,9 @@ pub const Executor = struct {
         value: u256 = 0,
         data: []const u8 = &.{},
         access_list: []const evm.transaction.AccessListItem = &.{},
+        /// The request's EIP-7702 authorizations: present (even empty) makes the call a
+        /// type-4 transaction, as alloy's `TransactionRequest::preferred_type`.
+        authorization_list: ?[]const evm.transaction.Authorization = null,
         /// Sees the state right after the call executes, before it is discarded
         /// (debug_traceCall prestateTracer).
         inspect: ?Inspect = null,
@@ -795,13 +798,18 @@ pub const Executor = struct {
         return result;
     }
 
+    fn call_type(call: *const Call) evm.transaction.TxType {
+        if (call.authorization_list != null) return .eip7702;
+        return if (call.priority_fee == null) .legacy else .eip1559;
+    }
+
     /// Runs `call` in `block` without discarding its changes: fee-free unless `validate`.
     pub fn session_call(executor: *Executor, block: *const BlockEnv, call: Call) Error!SessionCall {
         executor.set_block_env(block);
         const fork = evm_fork(executor.spec.spec_at(block.timestamp));
         const caller = try executor.state.load(call.from);
         const tx: TxEnv = .{
-            .tx_type = if (call.priority_fee == null) .legacy else .eip1559,
+            .tx_type = call_type(&call),
             .caller = call.from,
             .gas_limit = call.gas orelse executor.default_call_gas(block),
             .gas_price = call.gas_price,
@@ -812,6 +820,7 @@ pub const Executor = struct {
             .nonce = if (call.validate) call.nonce orelse caller.info.nonce else caller.info.nonce,
             .chain_id = executor.spec.chain_id,
             .access_list = call.access_list,
+            .authorization_list = call.authorization_list orelse &.{},
             .skip_sender_code_check = true,
             .disable_fee_charge = !call.validate,
             .disable_tx_gas_cap = true,
@@ -855,7 +864,7 @@ pub const Executor = struct {
         const fork = evm_fork(executor.spec.spec_at(block.timestamp));
         const caller = try executor.state.load(call.from);
         const tx: TxEnv = .{
-            .tx_type = if (call.priority_fee == null) .legacy else .eip1559,
+            .tx_type = call_type(&call),
             .caller = call.from,
             .gas_limit = call.gas orelse executor.default_call_gas(block),
             .gas_price = call.gas_price,
@@ -866,6 +875,7 @@ pub const Executor = struct {
             .nonce = caller.info.nonce,
             .chain_id = executor.spec.chain_id,
             .access_list = call.access_list,
+            .authorization_list = call.authorization_list orelse &.{},
             .skip_sender_code_check = true,
             .disable_fee_charge = true,
             .disable_tx_gas_cap = true,

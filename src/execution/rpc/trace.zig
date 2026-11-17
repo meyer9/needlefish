@@ -610,13 +610,11 @@ fn trace_call_frames(
         .executed => |executed| executed,
     };
     if (recorder.full) return call.fail(rpc.code.server_error, "trace exceeds the trace buffers");
-    var header = eth.view_header(api, request.view);
-    var env = node.chain.env_of(&header);
-    env.timestamp += 1; // As `eth.simulate` runs it.
+    const env = try eth.request_env(api, call, &request);
     const limit = request.message.gas orelse executor.default_call_gas(&env);
     const top: TopGas = .{ .limit = limit, .used = executed.gas_used };
-    // A call has no block hash or transaction; it runs in the block after the view's.
-    const locator: flat_call.Locator = .{ .block_number = header.number + 1 };
+    // A call has no block hash or transaction; it runs in the block `eth.simulate` uses.
+    const locator: flat_call.Locator = .{ .block_number = env.number };
     const range: Range = .{ .first = 0, .end = recorder.frame_count };
     try write_frames(call.writer, &recorder, range, top, locator, options);
 }
