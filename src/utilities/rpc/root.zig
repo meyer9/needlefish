@@ -142,7 +142,9 @@ pub const Params = struct {
             _ = try params.next_token();
             return null;
         }
-        return try params.raw();
+        // An explicit null is an absent optional parameter, as serde's `Option` reads it.
+        const text = try params.raw();
+        return if (std.mem.eql(u8, text, "null")) null else text;
     }
 
     fn peek_end(params: *Params) bool {

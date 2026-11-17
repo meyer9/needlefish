@@ -783,7 +783,7 @@ test "eth: eth_config on the dev L1 lists Prague with no next fork" {
     const schedule = "\"blobSchedule\":{\"baseFeeUpdateFraction\":5007716,\"max\":9,\"target\":6}";
     try expect_contains(text, schedule);
     try expect_contains(text, "\"chainId\":\"0x539\"");
-    const pairing = "\"BLS12_PAIRING_CHECK\":\"0x000000000000000000000000000000000000000F\"";
+    const pairing = "\"BLS12_PAIRING_CHECK\":\"0x000000000000000000000000000000000000000f\"";
     try expect_contains(text, pairing);
     try testing.expect(std.mem.indexOf(u8, text, "P256VERIFY") == null);
     try expect_contains(text, "\"WITHDRAWAL_REQUEST_PREDEPLOY_ADDRESS\"");
@@ -854,6 +854,41 @@ fn fuzz_txpool(_: void, smith: *testing.Smith) anyerror!void {
 
 test "eth: txpool listings fuzz" {
     try testing.fuzz({}, fuzz_txpool, .{});
+}
+
+test "eth: fee history closes with the base fee after its newest block, not the head" {
+    const h = try Harness.create_for(&chainspec.ChainSpec.presets.base_devnet);
+    defer h.destroy();
+    const first = try h.mine(2);
+    const second = try h.mine(4);
+    _ = try h.mine(6);
+    const fee_first = h.node.chain.header(first.bytes).?.base_fee_per_gas.?;
+    const fee_second = h.node.chain.header(second.bytes).?.base_fee_per_gas.?;
+    // Empty blocks lower the base fee each block, so the head would imply a third value.
+    try testing.expect(fee_second < fee_first);
+    var expected: [128]u8 = undefined;
+    const fees = try std.fmt.bufPrint(&expected, "\"baseFeePerGas\":[\"0x{x}\",\"0x{x}\"]", .{
+        fee_first,
+        fee_second,
+    });
+    const history = try h.request("eth_feeHistory", "[\"0x1\",\"0x1\",[]]");
+    try expect_contains(history, fees);
+    try expect_contains(history, "\"oldestBlock\":\"0x1\"");
+    try expect_contains(history, "\"reward\":[]");
+    try testing.expectEqualStrings(
+        "\"result\":{\"gasUsedRatio\":[],\"oldestBlock\":\"0x0\"}",
+        try h.request("eth_feeHistory", "[\"0x0\",\"latest\"]"),
+    );
+    // Counts past block 0 or above 1024 truncate, as in reth.
+    const range = try h.request("eth_feeHistory", "[\"0x401\",\"0x1\"]");
+    try expect_contains(range, "\"oldestBlock\":\"0x0\"");
+    // The block size is the length of the block's RLP encoding.
+    const raw = try h.request("debug_getRawBlock", "[\"0x1\"]");
+    const raw_prefix = "\"result\":\"0x";
+    try testing.expect(std.mem.startsWith(u8, raw, raw_prefix));
+    const raw_length = (raw.len - raw_prefix.len - 1) / 2;
+    const size = try std.fmt.bufPrint(&expected, "\"size\":\"0x{x}\"", .{raw_length});
+    try expect_contains(try h.request("eth_getBlockByNumber", "[\"0x1\",false]"), size);
 }
 
 fn fuzz_body(h: *Harness, body: []const u8) !void {

@@ -106,6 +106,8 @@ fn write_in_block(api: *Api, call: *Call, number: u64, sender: Address, nonce: u
             .index = index,
             .base_fee = record.header.base_fee_per_gas,
             .timestamp_ms = format.timestamp_ms(record),
+            .timestamp = record.header.timestamp,
+            .deposit = format.deposit_receipt(record, index),
         }, recoverer);
         return true;
     }

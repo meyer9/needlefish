@@ -9,6 +9,8 @@ const consensus = @import("../../common/consensus/root.zig");
 const json = @import("../../utilities/json/root.zig");
 const rpc = @import("../../utilities/rpc/root.zig");
 const chainspec = @import("../chainspec/root.zig");
+const rlp = @import("../../common/rlp/root.zig");
+const BlobParams = chainspec.BlobParams;
 const txpool = @import("../txpool/root.zig");
 const node = @import("../node/root.zig");
 const format = @import("format.zig");
@@ -21,7 +23,6 @@ const Call = rpc.Call;
 const HandlerError = rpc.HandlerError;
 const Chain = node.Chain;
 
-pub const default_priority_fee: u64 = 1_000_000_000;
 pub const estimate_iterations_max = 64;
 pub const logs_blocks_max = 10_000;
 pub const logs_max = 10_000;
@@ -141,26 +142,84 @@ fn block_number(api: *Api, call: *Call) HandlerError!void {
     try call.writer.quantity(head_header(api).number);
 }
 
-/// Base fee of the next block (assuming it lands one second after the head).
+/// Base fee of the block after the head.
 fn next_base_fee(api: *Api) u64 {
-    const head = head_header(api);
+    return next_base_fee_after(api, &head_header(api));
+}
+
+/// Base fee of a block after `parent`, as base/base derives it (`next_block_base_fee` at the
+/// parent's timestamp; zero when the parent's EIP-1559 extra data does not decode).
+fn next_base_fee_after(api: *Api, parent: *const consensus.Header) u64 {
     return api.spec.next_base_fee(.{
-        .timestamp = head.timestamp,
-        .gas_used = head.gas_used,
-        .gas_limit = head.gas_limit,
-        .base_fee = head.base_fee_per_gas orelse 0,
-        .blob_gas_used = head.blob_gas_used orelse 0,
-        .excess_blob_gas = head.excess_blob_gas orelse 0,
-        .extra_data = head.extra_data,
-    }, head.timestamp + 1) catch head.base_fee_per_gas orelse 0;
+        .timestamp = parent.timestamp,
+        .gas_used = parent.gas_used,
+        .gas_limit = parent.gas_limit,
+        .base_fee = parent.base_fee_per_gas orelse 0,
+        .blob_gas_used = parent.blob_gas_used orelse 0,
+        .excess_blob_gas = parent.excess_blob_gas orelse 0,
+        .extra_data = parent.extra_data,
+    }, parent.timestamp) catch 0;
 }
 
+/// Blob base fee of a block after `parent` (null without a blob schedule or blob fields).
+fn next_blob_fee_after(api: *Api, parent: *const consensus.Header) ?u128 {
+    const params = api.spec.blob_schedule_at(parent.timestamp) orelse return null;
+    const excess = parent.excess_blob_gas orelse return null;
+    const used = parent.blob_gas_used orelse return null;
+    const next = params.next_excess_blob_gas(excess, used, parent.base_fee_per_gas orelse 0);
+    return params.base_fee(next);
+}
+
+/// base/base's minimum suggested priority fee (0.001 gwei).
+pub const min_suggested_priority_fee: u64 = 1_000_000;
+
+/// `eth_gasPrice`: the suggested tip plus the head's base fee (reth `gas_price`).
 fn gas_price(api: *Api, call: *Call) HandlerError!void {
-    try call.writer.quantity(@as(u128, next_base_fee(api)) + default_priority_fee);
+    try call.params.finish();
+    const head = head_header(api);
+    try call.writer.quantity(suggested_tip(api) + (head.base_fee_per_gas orelse 0));
 }
 
-fn max_priority_fee(_: *Api, call: *Call) HandlerError!void {
-    try call.writer.quantity(default_priority_fee);
+fn max_priority_fee(api: *Api, call: *Call) HandlerError!void {
+    try call.params.finish();
+    try call.writer.quantity(suggested_tip(api));
+}
+
+/// reth's `op_suggest_tip_cap`: the minimum suggested priority fee, or 10% above the
+/// head's median effective tip when the head has no room for its largest transaction.
+fn suggested_tip(api: *Api) u128 {
+    var record = api.chain.record(api.chain.head_hash()).?;
+    var receipts = record.receipts;
+    var tx_gas_max: u64 = 0;
+    var previous: u64 = 0;
+    while (!receipts.is_empty()) {
+        const encoded = receipts.bytes() catch unreachable; // Stored by the chain.
+        const receipt = consensus.Receipt.decode(encoded) catch unreachable; // Stored.
+        tx_gas_max = @max(tx_gas_max, receipt.cumulative_gas_used - previous);
+        previous = receipt.cumulative_gas_used;
+    }
+    const header = record.header;
+    if (header.gas_used +| tx_gas_max <= header.gas_limit) return min_suggested_priority_fee;
+    const base_fee = header.base_fee_per_gas orelse 0;
+    const tips_max = api.scratch.len / @sizeOf(u128);
+    const tips: [*]u128 = @ptrCast(@alignCast(api.scratch.ptr));
+    var count: usize = 0;
+    while (!record.transactions.is_empty() and count < tips_max) {
+        const raw = record.transactions.bytes() catch unreachable; // Stored by the chain.
+        const envelope = consensus.Envelope.decode(raw) catch unreachable; // Stored.
+        const price = envelope.effective_gas_price(base_fee) orelse 0;
+        if (price < base_fee) continue; // No effective tip (a deposit, or fee below base).
+        tips[count] = price - base_fee;
+        count += 1;
+    }
+    if (count == 0) return min_suggested_priority_fee;
+    const sorted = tips[0..count];
+    std.mem.sort(u128, sorted, {}, std.sort.asc(u128));
+    const median = if (count % 2 == 1)
+        sorted[count / 2]
+    else
+        (sorted[count / 2 - 1] + sorted[count / 2]) / 2;
+    return @max(min_suggested_priority_fee, median + median / 10);
 }
 
 /// `miner_setMaxDASize(maxTxSize, maxBlockSize)`: the batcher's DA throttle; 0 lifts a
@@ -195,70 +254,197 @@ fn set_gas_limit(api: *Api, call: *Call) HandlerError!void {
 }
 
 fn blob_base_fee(api: *Api, call: *Call) HandlerError!void {
-    const head = head_header(api);
-    const params = api.spec.blob_params_at(head.timestamp + 1) orelse {
-        return call.fail(rpc.code.server_error, "blobs not supported");
-    };
-    const excess = params.next_excess_blob_gas(
-        head.excess_blob_gas orelse 0,
-        head.blob_gas_used orelse 0,
-        head.base_fee_per_gas orelse 0,
-    );
-    try call.writer.quantity(params.base_fee(excess));
+    try call.params.finish();
+    const fee = next_blob_fee_after(api, &head_header(api)) orelse
+        return call.fail(rpc.code.server_error, "excess blob gas not set");
+    try call.writer.quantity(fee);
 }
 
+/// Percentiles `eth_feeHistory` accepts per request (reth's `max_reward_percentile_count`).
+const reward_percentiles_max = 100;
+
+/// `eth_feeHistory(blockCount, newestBlock, rewardPercentiles?)` as base/base (reth) answers:
+/// a count above 1024 is truncated, a range reaching below genesis is an invalid range, the
+/// next block's base and blob fees close the fee lists, and rewards are the effective tips at
+/// each gas-weighted percentile.
 fn fee_history(api: *Api, call: *Call) HandlerError!void {
-    const count = @min(try call.params.quantity(u64), fee_history_blocks_max);
-    const newest = try resolve_number(api, call, try call.params.raw());
-    const percentiles = try call.params.optional_raw();
-    const oldest = @max((newest + 1) -| count, api.chain.genesis_number);
+    var count = @min(try call.params.quantity(u64), fee_history_blocks_max);
+    const newest_raw = try call.params.raw();
+    const percentiles_raw = try call.params.optional_raw();
+    try call.params.finish();
     const w = call.writer;
+    if (count == 0) {
+        try w.begin_object();
+        try w.key("gasUsedRatio");
+        try w.begin_array();
+        try w.end_array();
+        try format.field_quantity(w, "oldestBlock", @as(u64, 0));
+        return w.end_object();
+    }
+    var percentiles_buffer: [reward_percentiles_max]f64 = undefined;
+    const percentiles = try parse_percentiles(call, percentiles_raw, &percentiles_buffer);
+    const newest = try resolve_number(api, call, newest_raw);
+    count = @min(count, newest + 1);
+    const oldest = newest + 1 - count;
+    if (oldest < api.chain.genesis_number) {
+        return call.fail(rpc.code.invalid_params, "invalid block range");
+    }
+    for (oldest..newest + 1) |number| {
+        if (canonical_header(api, number) == null) {
+            return call.fail(rpc.code.invalid_params, "invalid block range");
+        }
+    }
     try w.begin_object();
+    try write_fee_lists(api, w, oldest, newest);
     try format.field_quantity(w, "oldestBlock", oldest);
-    try w.key("baseFeePerGas");
-    try w.begin_array();
-    var number = oldest;
-    while (number <= newest) : (number += 1) {
-        try w.quantity(canonical_header(api, number).?.base_fee_per_gas orelse 0);
-    }
-    try w.quantity(next_base_fee(api));
-    try w.end_array();
-    try w.key("gasUsedRatio");
-    try w.begin_array();
-    number = oldest;
-    while (number <= newest) : (number += 1) {
-        const header = canonical_header(api, number).?;
-        const ratio = @as(f64, @floatFromInt(header.gas_used)) /
-            @as(f64, @floatFromInt(@max(header.gas_limit, 1)));
-        var text: [32]u8 = undefined;
-        try w.raw(std.fmt.bufPrint(&text, "{d}", .{ratio}) catch "0");
-    }
-    try w.end_array();
-    if (percentiles != null) try fee_rewards(api, w, oldest, newest, percentiles.?);
+    if (percentiles) |list| try fee_rewards(api, w, oldest, newest, list);
     try w.end_object();
 }
 
-/// Rewards per block and percentile: the minimum priority fee in each block (a simple,
-/// stable approximation of the percentile reward).
+/// `null` without percentiles; an invalid list is reth's "invalid reward percentiles".
+fn parse_percentiles(
+    call: *Call,
+    raw: ?[]const u8,
+    buffer: *[reward_percentiles_max]f64,
+) HandlerError!?[]const f64 {
+    const text = raw orelse return null;
+    if (std.mem.eql(u8, text, "null")) return null;
+    var scanner = json.Scanner.init(text);
+    if ((try scanner_next(&scanner)).tag != .array_begin) return error.InvalidParams;
+    var count: usize = 0;
+    while (true) {
+        const token = try scanner_next(&scanner);
+        if (token.tag == .array_end) break;
+        if (token.tag != .number) return error.InvalidParams;
+        if (count == buffer.len) {
+            return call.fail(rpc.code.invalid_params, "invalid reward percentiles");
+        }
+        buffer[count] = std.fmt.parseFloat(f64, token.bytes) catch return error.InvalidParams;
+        count += 1;
+    }
+    const list = buffer[0..count];
+    for (list, 0..) |percentile, index| {
+        const descending = index > 0 and list[index - 1] > percentile;
+        if (percentile < 0 or percentile > 100 or descending) {
+            return call.fail(rpc.code.invalid_params, "invalid reward percentiles");
+        }
+    }
+    return list;
+}
+
+/// `baseFeePerGas`, `gasUsedRatio`, `baseFeePerBlobGas` and `blobGasUsedRatio`.
+fn write_fee_lists(api: *Api, w: *json.Writer, oldest: u64, newest: u64) !void {
+    const last = canonical_header(api, newest).?;
+    try w.key("baseFeePerGas");
+    try w.begin_array();
+    for (oldest..newest + 1) |number| {
+        try w.quantity(canonical_header(api, number).?.base_fee_per_gas orelse 0);
+    }
+    try w.quantity(next_base_fee_after(api, &last));
+    try w.end_array();
+    try w.key("gasUsedRatio");
+    try w.begin_array();
+    for (oldest..newest + 1) |number| {
+        const header = canonical_header(api, number).?;
+        try write_ratio(w, header.gas_used, header.gas_limit);
+    }
+    try w.end_array();
+    try w.key("baseFeePerBlobGas");
+    try w.begin_array();
+    for (oldest..newest + 1) |number| {
+        const header = canonical_header(api, number).?;
+        const params = api.spec.blob_schedule_at(header.timestamp) orelse BlobParams.cancun;
+        const fee = if (header.excess_blob_gas) |excess| params.base_fee(excess) else 0;
+        try w.quantity(fee);
+    }
+    try w.quantity(next_blob_fee_after(api, &last) orelse 0);
+    try w.end_array();
+    try w.key("blobGasUsedRatio");
+    try w.begin_array();
+    for (oldest..newest + 1) |number| {
+        const header = canonical_header(api, number).?;
+        const params = api.spec.blob_schedule_at(header.timestamp) orelse BlobParams.cancun;
+        try write_ratio(w, header.blob_gas_used orelse 0, params.max_blob_gas());
+    }
+    try w.end_array();
+}
+
+/// `used / limit` as a JSON number (0 for a zero limit).
+fn write_ratio(w: *json.Writer, used: u64, limit: u64) !void {
+    const ratio = if (limit == 0)
+        0
+    else
+        @as(f64, @floatFromInt(used)) / @as(f64, @floatFromInt(limit));
+    var text: [32]u8 = undefined;
+    try w.raw(std.fmt.bufPrint(&text, "{d}", .{ratio}) catch "0");
+}
+
+const Tip = struct { gas_used: u64, reward: u128 };
+
+fn tip_less(_: void, a: Tip, b: Tip) bool {
+    return a.reward < b.reward;
+}
+
+/// Per block, each percentile's effective tip: transactions sorted by tip, the first whose
+/// cumulative gas reaches the percentile of the block's gas (reth
+/// `calculate_reward_percentiles_for_block`); zeros for an empty block.
 fn fee_rewards(
     api: *Api,
     w: *json.Writer,
     oldest: u64,
     newest: u64,
-    percentiles: []const u8,
+    percentiles: []const f64,
 ) !void {
-    var scanner = json.Scanner.init(percentiles);
-    var count: u32 = 0;
-    if ((try scanner_next(&scanner)).tag != .array_begin) return error.InvalidParams;
-    while ((try scanner_next(&scanner)).tag == .number) count += 1;
-    _ = api;
+    const tips_max = api.scratch.len / @sizeOf(Tip);
+    const tips: [*]Tip = @ptrCast(@alignCast(api.scratch.ptr));
     try w.key("reward");
     try w.begin_array();
-    var number = oldest;
-    while (number <= newest) : (number += 1) {
-        try w.begin_array();
-        for (0..count) |_| try w.quantity(@as(u8, 0));
-        try w.end_array();
+    if (percentiles.len > 0) for (oldest..newest + 1) |number| {
+        const hash = api.chain.store.canonical_hash(number).?;
+        var record = api.chain.record(hash).?;
+        const base_fee = record.header.base_fee_per_gas orelse 0;
+        var count: usize = 0;
+        var previous_gas: u64 = 0;
+        while (!record.transactions.is_empty()) : (count += 1) {
+            const raw = record.transactions.bytes() catch unreachable; // Stored.
+            const encoded = record.receipts.bytes() catch unreachable; // Stored.
+            const receipt = consensus.Receipt.decode(encoded) catch unreachable; // Stored.
+            if (count == tips_max) return error.InvalidParams;
+            const envelope = consensus.Envelope.decode(raw) catch unreachable; // Stored.
+            const price = envelope.effective_gas_price(base_fee) orelse 0;
+            tips[count] = .{
+                .gas_used = receipt.cumulative_gas_used - previous_gas,
+                .reward = price -| base_fee,
+            };
+            previous_gas = receipt.cumulative_gas_used;
+        }
+        try write_block_rewards(w, tips[0..count], previous_gas, percentiles);
+    };
+    try w.end_array();
+}
+
+fn write_block_rewards(
+    w: *json.Writer,
+    tips: []Tip,
+    gas_total: u64,
+    percentiles: []const f64,
+) !void {
+    std.mem.sort(Tip, tips, {}, tip_less);
+    try w.begin_array();
+    var index: usize = 0;
+    var cumulative: u64 = if (tips.len > 0) tips[0].gas_used else 0;
+    for (percentiles) |percentile| {
+        if (tips.len == 0) {
+            try w.quantity(@as(u8, 0));
+            continue;
+        }
+        const gas: f64 = @floatFromInt(gas_total);
+        const threshold: u64 = @intFromFloat(gas * percentile / 100);
+        while (cumulative < threshold and index < tips.len - 1) {
+            index += 1;
+            cumulative += tips[index].gas_used;
+        }
+        try w.quantity(tips[index].reward);
     }
     try w.end_array();
 }
@@ -381,6 +567,15 @@ fn resolve_number(api: *Api, call: *Call, raw: []const u8) HandlerError!u64 {
 
 /// A block tag or hex number, without quotes.
 fn resolve_number_text(api: *Api, call: *Call, text: []const u8) HandlerError!u64 {
+    const number = try number_of_tag(api, text);
+    if (number > head_header(api).number) {
+        return call.fail(rpc.code.server_error, "block not found");
+    }
+    return number;
+}
+
+/// A block tag or hex number, without quotes; a number may lie beyond the head.
+fn number_of_tag(api: *Api, text: []const u8) HandlerError!u64 {
     const head = head_header(api).number;
     if (std.mem.eql(u8, text, "latest") or std.mem.eql(u8, text, "pending")) return head;
     if (std.mem.eql(u8, text, "earliest")) return api.chain.genesis_number;
@@ -391,15 +586,31 @@ fn resolve_number_text(api: *Api, call: *Call, text: []const u8) HandlerError!u6
         const stored = api.chain.store.ref(hash.bytes) orelse return api.chain.genesis_number;
         return stored.number;
     }
-    const number = json.parse_quantity(u64, text) catch return error.InvalidParams;
-    if (number > head) return call.fail(rpc.code.server_error, "block not found");
-    return number;
+    return json.parse_quantity(u64, text) catch return error.InvalidParams;
 }
 
 fn write_block(api: *Api, call: *Call, hash: Hash, full: bool) HandlerError!void {
     const bytes = api.chain.store.record(hash) orelse return call.writer.null_value();
     const record = node.chain.Record.decode(bytes) catch unreachable; // Stored by the chain.
-    try format.block(call.writer, record, hash, bytes.len, full, api.chain.executor.recoverer);
+    const size = block_size(record);
+    try format.block(call.writer, record, hash, size, full, api.chain.executor.recoverer);
+}
+
+/// The block's RLP length, `rlp([header, transactions, ommers, withdrawals?])`, as a block
+/// object's `size` reports it. A legacy transaction is a list in the body; a typed one is a
+/// byte string.
+fn block_size(record: node.chain.Record) usize {
+    var transactions = record.transactions;
+    var transactions_payload: usize = 0;
+    while (!transactions.is_empty()) {
+        const raw = transactions.bytes() catch unreachable; // Stored by the chain.
+        assert(raw.len > 0);
+        transactions_payload += if (raw[0] >= 0xc0) raw.len else rlp.bytes_length(raw);
+    }
+    var payload = rlp.length(record.header) + rlp.list_length(transactions_payload) +
+        rlp.list_length(0);
+    if (record.withdrawals) |withdrawals| payload += withdrawals.rlp_length();
+    return rlp.list_length(payload);
 }
 
 fn get_block_by_number(api: *Api, call: *Call) HandlerError!void {
@@ -802,6 +1013,9 @@ fn estimate_gas(api: *Api, call: *Call) HandlerError!void {
 
 // ---- Logs -------------------------------------------------------------------------
 
+/// reth's `EthRpcErrorCode::PrunedHistory` (EIP-4444).
+const code_pruned_history = 4444;
+
 pub const Filter = struct {
     from: u64,
     to: u64,
@@ -852,7 +1066,7 @@ fn parse_hashes(scanner: *json.Scanner, first: json.Token, out: [][32]u8) Handle
     }
 }
 
-pub fn parse_filter(api: *Api, call: *Call, raw: []const u8) HandlerError!Filter {
+pub fn parse_filter(api: *Api, raw: []const u8) HandlerError!Filter {
     const head = head_header(api).number;
     var filter: Filter = .{ .from = head, .to = head };
     var scanner = json.Scanner.init(raw);
@@ -863,7 +1077,7 @@ pub fn parse_filter(api: *Api, call: *Call, raw: []const u8) HandlerError!Filter
         const value = try scanner_next(&scanner);
         if (std.mem.eql(u8, name.bytes, "fromBlock") or std.mem.eql(u8, name.bytes, "toBlock")) {
             if (value.tag != .string) return error.InvalidParams;
-            const number = try resolve_number_text(api, call, value.bytes);
+            const number = try number_of_tag(api, value.bytes);
             if (name.bytes[0] == 'f') filter.from = number else filter.to = number;
             if (name.bytes[0] == 't') filter.to_given = std.mem.startsWith(u8, value.bytes, "0x");
         } else if (std.mem.eql(u8, name.bytes, "blockHash")) {
@@ -902,11 +1116,26 @@ fn parse_addresses(scanner: *json.Scanner, first: json.Token, out: *[16][20]u8) 
 }
 
 fn get_logs(api: *Api, call: *Call) HandlerError!void {
-    const filter = try parse_filter(api, call, try call.params.raw());
+    const filter = try parse_filter(api, try call.params.raw());
     try call.params.finish();
     if (filter.block_hash == null) {
+        // reth's checks and texts, in its order.
+        const head = head_header(api).number;
+        var text: [128]u8 = undefined;
+        if (filter.to > head) {
+            const message = std.fmt.bufPrint(&text, "block range extends beyond current " ++
+                "head block: requested {d}, head {d}", .{ filter.to, head }) catch unreachable;
+            return call.fail(rpc.code.invalid_params, message);
+        }
         if (filter.to < filter.from) {
-            return call.fail(rpc.code.invalid_params, "invalid block range");
+            return call.fail(rpc.code.invalid_params, "invalid block range params");
+        }
+        const earliest = api.chain.genesis_number;
+        if (filter.from < earliest) {
+            const message = std.fmt.bufPrint(&text, "pruned history unavailable: " ++
+                "requested {d}, earliest available {d}", .{ filter.from, earliest }) catch
+                unreachable;
+            return call.fail(code_pruned_history, message);
         }
         if (filter.to - filter.from >= logs_blocks_max) {
             return call.fail(rpc.code.server_error, "block range too large");

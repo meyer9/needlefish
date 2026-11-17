@@ -116,6 +116,8 @@ fn write_transaction_at(api: *Api, call: *Call, hash: ?Hash, form: Form) Handler
         .index = @intCast(index),
         .base_fee = record.header.base_fee_per_gas,
         .timestamp_ms = format.timestamp_ms(record),
+        .timestamp = record.header.timestamp,
+        .deposit = format.deposit_receipt(record, @intCast(index)),
     }, api.chain.executor.recoverer);
 }
 
