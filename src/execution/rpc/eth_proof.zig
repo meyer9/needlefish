@@ -228,15 +228,13 @@ pub fn parse_keys(raw: []const u8, out: *[storage_keys_max]Hash) HandlerError!u3
     return count;
 }
 
-fn parse_key(text: []const u8) ?Hash {
-    var key: Hash = @splat(0);
-    var buffer: [32]u8 = undefined;
-    if (json.parse_data(text, &buffer)) |bytes| {
-        @memcpy(key[32 - bytes.len ..], bytes);
-        return key;
-    } else |_| {}
-    // Odd-length or minimal hex: read it as a number.
-    const value = json.parse_quantity(u256, text) catch return null;
+/// A storage key as alloy's `JsonStorageKey` reads it: `0x` and 1 to 64 hex digits, leading
+/// zeros allowed, right-aligned in the 32-byte slot.
+pub fn parse_key(text: []const u8) ?Hash {
+    if (text.len < 3 or text.len > 2 + 64 or !std.mem.startsWith(u8, text, "0x")) return null;
+    for (text[2..]) |digit| if (!std.ascii.isHex(digit)) return null;
+    const value = std.fmt.parseInt(u256, text[2..], 16) catch unreachable; // 64 digits fit.
+    var key: Hash = undefined;
     std.mem.writeInt(u256, &key, value, .big);
     return key;
 }

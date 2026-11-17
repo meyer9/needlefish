@@ -510,7 +510,10 @@ fn get_code(api: *Api, call: *Call) HandlerError!void {
 
 fn get_storage_at(api: *Api, call: *Call) HandlerError!void {
     const address = try call.params.fixed(20);
-    const slot = try call.params.quantity(u256);
+    // The slot is a `JsonStorageKey` (full-width hex is common), not a quantity.
+    const slot_key = eth_proof.parse_key(try call.params.string()) orelse
+        return error.InvalidParams;
+    const slot = std.mem.readInt(u256, &slot_key, .big);
     const view = try state_view.resolve(api, call, try call.params.optional_raw());
     var value: [32]u8 = undefined;
     std.mem.writeInt(u256, &value, try state_view.storage(api, call, view, address, slot), .big);

@@ -918,6 +918,25 @@ test "eth: block objects refuse unknown members instead of spinning" {
     try expect_contains(config, "\"result\"");
 }
 
+test "eth: getStorageAt reads a full-width slot key and defaults to latest" {
+    const h = try Harness.create();
+    defer h.destroy();
+    const account = "\"0x4200000000000000000000000000000000000015\"";
+    const wide = "\"0x0000000000000000000000000000000000000000000000000000000000000007\"";
+    const short = try h.request("eth_getStorageAt", "[" ++ account ++ ",\"0x7\",\"latest\"]");
+    try expect_contains(short, "\"result\":\"0x");
+    try testing.expectEqualStrings(short, try h.request("eth_getStorageAt", "[" ++ account ++
+        "," ++ wide ++ "]"));
+    try testing.expectEqualStrings(short, try h.request("eth_getStorageAt", "[" ++ account ++
+        ",\"0x007\"]"));
+    for ([_][]const u8{ "\"0x\"", "\"7\"", "\"0x+7\"", "\"0x1_2\"" }) |slot| {
+        var body: [256]u8 = undefined;
+        const text = try std.fmt.bufPrint(&body, request_prefix_format ++
+            "eth_getStorageAt\",\"params\":[{s},{s}]}}", .{ account, slot });
+        try expect_contains(try h.request_runtime(text), "\"code\":-32602");
+    }
+}
+
 fn fuzz_body(h: *Harness, body: []const u8) !void {
     var out: std.Io.Writer = .fixed(&h.out);
     const outcome = eth.Router.handle(&h.api, body, &out);
