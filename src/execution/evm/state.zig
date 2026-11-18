@@ -348,6 +348,9 @@ pub const State = struct {
     /// EIP-2930 storage keys of the current transaction: warm without being read (as in
     /// revm), so a stateless witness need not hold a listed slot the EVM never reads.
     listed_slots: StorageKeyMap(void) = .empty,
+    /// EIP-2930 addresses of the current transaction: warm without being loaded (as in
+    /// revm), so a stateless witness need not hold a listed account the EVM never reads.
+    listed_accounts: AddressMap(void) = .empty,
     journal: []Entry,
     journal_len: u32 = 0,
     logs: []Log,
@@ -378,6 +381,7 @@ pub const State = struct {
         try state.slots.ensureTotalCapacity(allocator, limits.slots_max);
         try state.transient.ensureTotalCapacity(allocator, limits.transient_slots_max);
         try state.listed_slots.ensureTotalCapacity(allocator, limits.slots_max);
+        try state.listed_accounts.ensureTotalCapacity(allocator, limits.accounts_max);
         return state;
     }
 
@@ -386,6 +390,7 @@ pub const State = struct {
         state.slots.deinit(allocator);
         state.transient.deinit(allocator);
         state.listed_slots.deinit(allocator);
+        state.listed_accounts.deinit(allocator);
         allocator.free(state.journal);
         allocator.free(state.logs);
         allocator.free(state.log_data);
@@ -404,6 +409,7 @@ pub const State = struct {
         // As in `begin_transaction`: an empty map has no tombstones, so skip the memset.
         if (state.transient.count() > 0) state.transient.clearRetainingCapacity();
         if (state.listed_slots.count() > 0) state.listed_slots.clearRetainingCapacity();
+        if (state.listed_accounts.count() > 0) state.listed_accounts.clearRetainingCapacity();
         state.journal_len = 0;
         state.logs_len = 0;
         state.log_data_len = 0;
@@ -429,6 +435,8 @@ pub const State = struct {
         assert(state.transient.count() == 0);
         if (state.listed_slots.count() > 0) state.listed_slots.clearRetainingCapacity();
         assert(state.listed_slots.count() == 0);
+        if (state.listed_accounts.count() > 0) state.listed_accounts.clearRetainingCapacity();
+        assert(state.listed_accounts.count() == 0);
     }
 
     /// Warm an EIP-2930 storage key for the current transaction without reading it.
@@ -577,15 +585,23 @@ pub const State = struct {
         return state.warm(try state.load(address));
     }
 
-    /// Warm an EIP-2930 access list address without loading it for the transaction (revm
-    /// warms listed addresses; only a later use loads them).
+    /// Warm an EIP-2930 access list address without reading it (revm warms listed
+    /// addresses; only a later use loads them).
     pub fn warm_listed_account(state: *State, address: Address) Error!void {
-        _ = try state.warm(try state.load_unseen(address));
+        if (state.listed_accounts.count() >= state.limits.accounts_max) return error.StateFull;
+        state.listed_accounts.putAssumeCapacity(address, {});
+        assert(state.listed_accounts.contains(address));
+    }
+
+    fn is_listed_account(state: *const State, address: Address) bool {
+        if (state.listed_accounts.count() == 0) return false;
+        return state.listed_accounts.contains(address);
     }
 
     fn warm(state: *State, account: *Account) Error!Access {
         const address = account.address;
-        const is_cold = account.warm_tx != state.tx_id and !state.static_warm.contains(address);
+        const is_cold = account.warm_tx != state.tx_id and
+            !state.static_warm.contains(address) and !state.is_listed_account(address);
         if (is_cold) {
             try state.record(.account_warmed, @intFromPtr(account), 0, 0);
             account.warm_tx = state.tx_id;
@@ -595,6 +611,7 @@ pub const State = struct {
 
     pub fn is_warm(state: *State, address: Address) bool {
         if (state.static_warm.contains(address)) return true;
+        if (state.is_listed_account(address)) return true;
         const account = state.accounts.getPtr(address) orelse return false;
         return account.warm_tx == state.tx_id;
     }
