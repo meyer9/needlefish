@@ -17,7 +17,8 @@ const witness_module = @import("witness.zig");
 const StateDb = @import("state_db.zig").StateDb;
 const chain_module = @import("chain.zig");
 const payload = @import("../payload/root.zig");
-const engine_types = @import("../engine/root.zig").types;
+const engine_module = @import("../engine/root.zig");
+const engine_types = engine_module.types;
 
 const Durable = durable_module.Durable(SimStorage);
 const B256 = primitives.B256;
@@ -251,9 +252,19 @@ test "durable: a restart resumes on the forkchoice head, not an unadopted block"
 
 /// Sends block `hash` of `from` to `to` through newPayload.
 fn import(from: *Node, to: *Node, hash: B256) !engine_types.PayloadStatus {
+    return import_payload(from, to, hash, null);
+}
+
+/// `import`, with `state_root` (and the block hash to match) instead of the block's own.
+fn import_payload(
+    from: *Node,
+    to: *Node,
+    hash: B256,
+    state_root: ?[32]u8,
+) !engine_types.PayloadStatus {
     var transactions: [64][]const u8 = undefined;
     var withdrawals: [chain_module.withdrawals_max]payload.Withdrawal = undefined;
-    const p = from.chain.payload_of(hash.bytes, &transactions, &withdrawals).?;
+    var p = from.chain.payload_of(hash.bytes, &transactions, &withdrawals).?;
     const stored = from.chain.record(hash.bytes).?;
     var requests: [2][]const u8 = undefined;
     var requests_decoder = stored.requests;
@@ -266,8 +277,89 @@ fn import(from: *Node, to: *Node, hash: B256) !engine_types.PayloadStatus {
         .parent_beacon_block_root = stored.header.parent_beacon_block_root,
         .execution_requests = requests[0..count],
     };
+    if (state_root) |root| {
+        p.state_root = .{ .bytes = root };
+        p.block_hash = (try engine_module.block.header_of(fixture.spec, &p, &params)).hash();
+    }
     const version = engine_types.new_payload_version(to.spec, p.timestamp);
     return to.engine.new_payload(version, &p, &params);
+}
+
+/// Adds a signed EIP-1559 transaction from sender `from` to the node's pool.
+fn submit_tx(
+    node: *Node,
+    from: u8,
+    nonce: u64,
+    to: consensus.TxKind,
+    input: []const u8,
+    buffer: []u8,
+) !void {
+    const tx: consensus.Eip1559 = .{
+        .chain_id = node.spec.chain_id,
+        .nonce = nonce,
+        .max_priority_fee_per_gas = 2,
+        .max_fee_per_gas = 10_000_000_000,
+        .gas_limit = 200_000,
+        .to = to,
+        .value = 0,
+        .input = input,
+        .access_list = .empty,
+    };
+    const envelope = try consensus.tx.sign(tx, fixture.key(from));
+    const sender = fixture.address_of(from);
+    const account = node.db.get_account(sender.bytes).?;
+    _ = try node.pool.add(.{
+        .hash = envelope.hash(),
+        .sender = sender,
+        .nonce = nonce,
+        .tx_type = 2,
+        .gas_limit = tx.gas_limit,
+        .max_fee_per_gas = tx.max_fee_per_gas,
+        .max_priority_fee_per_gas = tx.max_priority_fee_per_gas,
+        .value = 0,
+        .raw = envelope.encode_to(buffer),
+    }, .{ .nonce = account.nonce, .balance = account.balance });
+}
+
+/// Init code that deploys the one-byte runtime code STOP (0x00).
+const init_code = [_]u8{ 0x60, 0x00, 0x60, 0x00, 0x53, 0x60, 0x01, 0x60, 0x00, 0xf3 };
+
+test "durable: a code a rejected payload left survives a crash in the block reusing it" {
+    const h = try Harness.create(12);
+    defer h.destroy();
+    const other = try Harness.create(13);
+    defer other.destroy();
+    const genesis_hash = h.head();
+    var buffers: [2][512]u8 = undefined;
+    try submit_tx(other.node.?, 1, 0, .create, &init_code, &buffers[0]);
+    const deploy = try other.build_head(genesis_hash, 12, 0xfe);
+    const contract = primitives.create_address(fixture.address_of(1), 0);
+    const code_hash = other.node.?.db.get_account(contract.bytes).?.code_hash;
+    // The deployment with a bad state root executes on the shared state and is rolled
+    // back: its code stays in the state, and no journal entry carries it.
+    const rejected = try import_payload(other.node.?, h.node.?, deploy, @splat(0x11));
+    try testing.expectEqual(engine_types.Status.invalid, rejected.status);
+    try testing.expect(h.node.?.db.code(code_hash) != null);
+    // The valid block deploys the same code, known by then; a crash follows.
+    const status = try import(other.node.?, h.node.?, deploy);
+    try testing.expectEqual(engine_types.Status.valid, status.status);
+    const version = engine_types.forkchoice_version(fixture.spec, 12);
+    const updated = try h.node.?.engine.forkchoice_updated(
+        version,
+        fixture.forkchoice(deploy),
+        null,
+    );
+    try testing.expectEqual(engine_types.Status.valid, updated.payload_status.status);
+    try h.settle();
+    try h.crash_and_reopen();
+    try testing.expectEqualSlices(u8, &deploy.bytes, &h.head().bytes);
+    const code = h.node.?.db.code(code_hash) orelse return error.CodeLost;
+    try testing.expectEqualSlices(u8, &.{0x00}, code);
+    // A block calling the contract executes its code (without it: DatabaseFailure).
+    try submit_tx(h.node.?, 2, 0, .{ .call = contract }, &.{}, &buffers[1]);
+    _ = try h.build_head(deploy, 24, 0xfe);
+    const caller = h.node.?.db.get_account(fixture.address_of(2).bytes).?;
+    try testing.expectEqual(@as(u64, 1), caller.nonce);
 }
 
 test "durable: a side payload executed on an older parent leaves the restart head" {
