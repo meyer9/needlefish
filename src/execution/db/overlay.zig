@@ -191,6 +191,27 @@ pub const Overlay = struct {
             try changeset.add_code(self.base.code_by_hash(hash).?);
         }
         changeset.sort();
+        try self.add_set_codes(changeset);
+    }
+
+    /// Lists the code of every account change that sets one, when the base holds it in its
+    /// arena (not in a table only) and it is not listed yet. A code the base already knows
+    /// is not new, but it may not be durable: a block that executed and was then rolled back
+    /// (a payload with a bad state root) leaves its codes in the arena without any journal
+    /// entry, so a block reusing such a code must carry it, or a restart before the next
+    /// checkpoint loses it.
+    fn add_set_codes(self: *const Overlay, changeset: *Changeset) Error!void {
+        const codes_before = changeset.codes_len;
+        for (changeset.account_changes()) |*change| {
+            const new = change.new orelse continue;
+            if (change.old) |old| {
+                if (std.mem.eql(u8, &old.code_hash, &new.code_hash)) continue;
+            }
+            const code = self.base.code_in_arena(new.code_hash) orelse continue;
+            if (changeset_has_code(changeset, code)) continue;
+            try changeset.add_code(code);
+        }
+        assert(changeset.codes_len >= codes_before);
     }
 
     /// Records every committed slot of a wiped account, with its final overlay value.
@@ -231,6 +252,15 @@ pub const Overlay = struct {
         return self.base.state_root();
     }
 };
+
+/// Whether `changeset` lists `code` (a block lists few codes; most differ in length).
+fn changeset_has_code(changeset: *const Changeset, code: []const u8) bool {
+    assert(code.len > 0);
+    for (0..changeset.codes_len) |index| {
+        if (std.mem.eql(u8, changeset.code(@intCast(index)), code)) return true;
+    }
+    return false;
+}
 
 fn info_equal(a: ?AccountInfo, b: ?AccountInfo) bool {
     if (a == null or b == null) return a == null and b == null;

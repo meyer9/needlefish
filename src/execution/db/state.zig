@@ -424,6 +424,15 @@ pub const State = struct {
         return bytes;
     }
 
+    /// The code with this hash when the arena holds it; null when unknown, empty, or held in
+    /// a table only (durable: the table belongs to a checkpoint).
+    pub fn code_in_arena(self: *const State, hash: Hash) ?[]const u8 {
+        const code = self.code_table.get(hash) orelse return null;
+        if (code.table != 0) return null;
+        assert(code.len > 0);
+        return self.code_arena[code.offset..][0..code.len];
+    }
+
     /// Whether a code with this hash is known (present without reading it).
     pub fn code_known(self: *const State, hash: Hash) bool {
         if (std.mem.eql(u8, &hash, &node.empty_code_hash)) return true;

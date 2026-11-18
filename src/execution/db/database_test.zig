@@ -748,4 +748,36 @@ test "database: commit_applied of a stored side block does not apply its changes
     try testing.expectEqualSlices(u8, &side_root, &db.head_info.state_root);
     try testing.expectEqualSlices(u8, &side_root, &(try db.state.state_root()));
     try testing.expect(db.state.basic(empty) == null);
+    // A's code came back from its first entry: the head entry carries no code.
+    const deployed = db.state.basic(address_of(21)) orelse return error.AccountLost;
+    const code = db.state.code_by_hash(deployed.code_hash) orelse return error.CodeLost;
+    try testing.expectEqualSlices(u8, codes[2], code);
+}
+
+test "database: a block reusing a code a rolled-back block left journals that code" {
+    var prng = Prng.init(23);
+    var sim = try sim_create(23, &prng);
+    defer sim.deinit(testing.allocator);
+    const harness = try Harness.create(&sim, 23);
+    defer harness.destroy();
+    try harness.format(23);
+    const db = &harness.db;
+    const code = codes[3];
+    // A payload with a bad state root executes on the state and is rolled back: its code
+    // stays in the state's arena, and no journal entry carries it.
+    const code_hash = try harness.overlay.insert_code(code);
+    try harness.overlay.set_account(address_of(22), .{ .nonce = 1, .code_hash = code_hash });
+    _ = try harness.overlay.commit(&db.changeset_built);
+    try db.state.unwind(&db.changeset_built);
+    try testing.expect(db.state.code_known(code_hash));
+    // The next block sets the same code, known now (the evm inserts only unknown codes).
+    try harness.overlay.set_account(address_of(23), .{ .nonce = 1, .code_hash = code_hash });
+    var input = harness.block_input(db.head_info.hash, db.head_info.number + 1);
+    _ = try db.execute_and_commit(&harness.overlay, &input);
+    try harness.tick_until(Harness.idle);
+    // A restart before any checkpoint replays that block's entry.
+    try harness.reopen();
+    try testing.expectEqualSlices(u8, &input.hash, &db.head_info.hash);
+    const recovered = db.state.code_by_hash(code_hash) orelse return error.CodeLost;
+    try testing.expectEqualSlices(u8, code, recovered);
 }
