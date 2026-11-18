@@ -63,7 +63,10 @@ pub fn parse_request(scanner: *json.Scanner) RequestError!Request {
         if (std.mem.eql(u8, key.bytes, "jsonrpc")) {
             version_ok = value.tag == .string and std.mem.eql(u8, value.bytes, "2.0");
         } else if (std.mem.eql(u8, key.bytes, "method")) {
-            if (value.tag != .string or value.escaped) return error.InvalidRequest;
+            if (value.tag != .string) return error.InvalidRequest;
+            // An escaped name keeps its backslashes, which no method name has: jsonrpsee
+            // answers a valid request for an unknown method. (An escape spelling a known
+            // name is the one case this does not decode.)
             request.method = value.bytes;
             method_seen = true;
         } else if (std.mem.eql(u8, key.bytes, "params")) {
@@ -185,6 +188,17 @@ pub const Params = struct {
 
     pub fn boolean(params: *Params) ParamsError!bool {
         return try params.optional_boolean() orelse error.InvalidParams;
+    }
+
+    /// A boolean that may be left out (null when absent) but not given as null, as serde
+    /// reads a trailing `bool` argument.
+    pub fn absent_or_boolean(params: *Params) ParamsError!?bool {
+        const token = try params.next_token() orelse return null;
+        return switch (token.tag) {
+            .true => true,
+            .false => false,
+            else => error.InvalidParams,
+        };
     }
 
     pub fn optional_boolean(params: *Params) ParamsError!?bool {

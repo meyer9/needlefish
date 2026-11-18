@@ -1136,14 +1136,14 @@ fn write_block(api: *Api, call: *Call, tag: Tag, full: bool) HandlerError!void {
 fn get_block_by_number(api: *Api, call: *Call) HandlerError!void {
     const tag = try parse_tag(try call.params.raw());
     if (tag == .hash) return error.InvalidParams;
-    const full = try call.params.optional_boolean() orelse false;
+    const full = try call.params.absent_or_boolean() orelse false;
     try call.params.finish();
     try write_block(api, call, tag, full);
 }
 
 fn get_block_by_hash(api: *Api, call: *Call) HandlerError!void {
     const hash = try call.params.fixed(32);
-    const full = try call.params.optional_boolean() orelse false;
+    const full = try call.params.absent_or_boolean() orelse false;
     try call.params.finish();
     try write_block(api, call, .{ .hash = hash }, full);
 }

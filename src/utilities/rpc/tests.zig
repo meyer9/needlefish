@@ -139,6 +139,12 @@ test "rpc: protocol errors" {
             ,
             \\{"jsonrpc":"2.0","id":1,"result":"0x2105"}
         },
+        // A control character makes a valid but unknown method name.
+        .{
+            \\{"jsonrpc":"2.0","id":1,"method":"eth_chain\rId","params":[]}
+            ,
+            \\{"jsonrpc":"2.0","id":1,"error":{"code":-32601,"message":"method not found"}}
+        },
         .{ "[]", invalid_request },
         .{ "7", invalid_request },
     };

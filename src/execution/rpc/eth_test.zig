@@ -1599,6 +1599,14 @@ test "eth: base_meterBundle meters a bundle ahead of the sender's nonce" {
     try expect_contains(try h.request("base_meterBundle", "[{}]"), "-32602");
     try expect_contains(try h.request("base_meterBundle", "[{\"txs\":[\"0x7e\"]}]"), "-32602");
     try expect_contains(try h.request("base_meterBundle", "[{\"txs\":1}]"), "-32602");
+    // base/base decodes every transaction before metering (`ParsedBundle::try_from`).
+    const undecodable = try h.request("base_meterBundle", "[{\"txs\":[\"0xc20180\"]}]");
+    try expect_contains(undecodable, "-32602");
+    try expect_contains(undecodable, "Failed to decode transaction");
+    // serde refuses null for the `full` flag; leaving it out reads as false.
+    const null_full = try h.request("eth_getBlockByNumber", "[\"latest\",null]");
+    try expect_contains(null_full, "-32602");
+    try expect_contains(try h.request("eth_getBlockByNumber", "[\"latest\"]"), "\"result\":{");
 }
 
 test "eth: seeded fuzz of base_meterBundle nonces" {

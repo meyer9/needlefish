@@ -376,6 +376,7 @@ fn meter_bundle(api: *Api, call: *Call) HandlerError!void {
     const half = api.scratch.len / 2;
     try parse_bundle(raw, api.scratch[0..half], &bundle);
     const transactions = bundle.transactions[0..bundle.count];
+    try check_bundle(api, call, transactions);
     var ns: [bundle_transactions_max]u64 = undefined;
     var gas: [bundle_transactions_max]u64 = undefined;
     const chain = api.chain;
@@ -406,6 +407,28 @@ fn meter_bundle(api: *Api, call: *Call) HandlerError!void {
     const senders = executor.senders[0..transactions.len];
     const metered: Metered = .{ .ns = &ns, .gas = &gas, .precompiles = precompile_meter.sorted() };
     try write_bundle(call.writer, header.number, transactions, senders, metered);
+}
+
+/// base/base `ParsedBundle::try_from`: every transaction decodes exactly as a Base
+/// envelope (no blob transactions) and recovers its signer, or the bundle is invalid params.
+fn check_bundle(api: *Api, call: *Call, transactions: []const []const u8) HandlerError!void {
+    assert(transactions.len <= bundle_transactions_max);
+    const recoverer = api.chain.executor.recoverer;
+    for (transactions) |raw| {
+        const envelope = consensus.Envelope.decode(raw) catch null;
+        if (envelope == null or envelope.? == .eip4844) {
+            const message = "Failed to parse bundle: Failed to decode transaction";
+            return call.fail(rpc.code.invalid_params, message);
+        }
+        switch (envelope.?) {
+            .deposit, .eip8130 => {},
+            else => if (envelope.?.recover_sender(recoverer) == null) {
+                const message = "Failed to parse bundle: " ++
+                    "Failed to convert transaction to recovered";
+                return call.fail(rpc.code.invalid_params, message);
+            },
+        }
+    }
 }
 
 /// What `base_meterBundle` measured of each transaction.

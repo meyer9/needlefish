@@ -662,7 +662,7 @@ fn block_size(record: node.chain.Record) usize {
 
 fn get_block_by_number(api: *Api, call: *Call) HandlerError!void {
     const raw = try call.params.raw();
-    const full = try call.params.optional_boolean() orelse false;
+    const full = try call.params.absent_or_boolean() orelse false;
     const hash = resolve_block(api, call, raw) catch |err| switch (err) {
         error.Failed => return call.writer.null_value(),
         else => return err,
@@ -672,7 +672,7 @@ fn get_block_by_number(api: *Api, call: *Call) HandlerError!void {
 
 fn get_block_by_hash(api: *Api, call: *Call) HandlerError!void {
     const hash = try call.params.fixed(32);
-    const full = try call.params.optional_boolean() orelse false;
+    const full = try call.params.absent_or_boolean() orelse false;
     try write_block(api, call, hash, full);
 }
 
