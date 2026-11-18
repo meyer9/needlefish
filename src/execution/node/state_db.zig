@@ -213,6 +213,44 @@ pub const StateDb = struct {
         evm_state.code_store_len = 0;
     }
 
+    /// `commit` for a block given as writes in hashed key space (no preimages), on a
+    /// disk-mode state: the writes become a hashed changeset (old values read by trie key,
+    /// `overlay.build_hashed_changeset`), which is applied (`State.apply`) and saved for
+    /// `rollback` and the journal (`last_changeset`), as `commit` does with an evm block.
+    pub fn commit_hashed(db: *StateDb, writes: db_module.overlay.HashedWrites) Error!void {
+        assert(db.overlay.base == db.state);
+        assert(db.overlay.accounts.count() == 0);
+        if (db.state.disk == null) return error.Unsupported;
+        const reader: HashedReader = .{ .state = db.state };
+        try db_module.overlay.build_hashed_changeset(reader, writes, &db.changeset);
+        try db.state.apply(&db.changeset);
+        db.undo_push();
+        assert(db.changeset.hashed);
+    }
+
+    /// Disk-mode reads by trie key, for `build_hashed_changeset`.
+    const HashedReader = struct {
+        state: *const State,
+
+        pub const Error = error{};
+
+        pub fn account(
+            reader: HashedReader,
+            key: *const Hash,
+        ) HashedReader.Error!?db_module.AccountInfo {
+            const record = reader.state.account_hashed(key) orelse return null;
+            return record.info;
+        }
+
+        pub fn storage(
+            reader: HashedReader,
+            key: *const Hash,
+            slot: *const Hash,
+        ) HashedReader.Error!u256 {
+            return reader.state.storage_hashed(key, slot);
+        }
+    };
+
     /// Saves the encoded changeset just applied; evicts the oldest records for room. A
     /// changeset larger than the ring drops all undo history.
     fn undo_push(db: *StateDb) void {

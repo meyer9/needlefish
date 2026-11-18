@@ -253,6 +253,81 @@ pub const Overlay = struct {
     }
 };
 
+/// One account of a hashed write batch: its account trie key, and its info after the block
+/// (null: absent).
+pub const HashedAccountWrite = struct { key: Hash, info: ?AccountInfo };
+
+/// One slot of a hashed write batch: the account's and the slot's trie keys, and the word
+/// after the block (zero: absent).
+pub const HashedSlotWrite = struct { key: Hash, slot: Hash, value: u256 };
+
+/// A block's writes in hashed key space, as post-block values: `accounts` ascending by key,
+/// `slots` by key then slot, no key (or key and slot) twice.
+pub const HashedWrites = struct {
+    accounts: []const HashedAccountWrite,
+    slots: []const HashedSlotWrite,
+};
+
+/// The hashed-key counterpart of `Overlay.build_changeset`: fills `changeset` (a hashed
+/// changeset, `Changeset.hashed`) with the effect of `writes` on the state `reader` reads,
+/// old values from it, writes that change nothing dropped. `reader` has `Error`,
+/// `account(key) Error!?AccountInfo` and `storage(key, slot) Error!u256`. As in every
+/// changeset, the committed slots of a destroyed or wiped account must be written (to zero)
+/// one by one: disk mode cannot list them.
+pub fn build_hashed_changeset(
+    reader: anytype,
+    writes: HashedWrites,
+    changeset: *Changeset,
+) (@TypeOf(reader).Error || changeset_module.Error)!void {
+    changeset.clear_hashed();
+    var account_index: usize = 0;
+    var slot_index: usize = 0;
+    while (account_index < writes.accounts.len or slot_index < writes.slots.len) {
+        const key = next_hashed_owner(writes, account_index, slot_index);
+        if (account_index < writes.accounts.len and
+            std.mem.eql(u8, &writes.accounts[account_index].key, &key))
+        {
+            const write = &writes.accounts[account_index];
+            account_index += 1;
+            const old = try reader.account(&key);
+            if (!info_equal(old, write.info)) {
+                const address = try changeset.hashed_owner(&key);
+                try changeset.add_account(.{ .address = address, .old = old, .new = write.info });
+            }
+        }
+        while (slot_index < writes.slots.len and
+            std.mem.eql(u8, &writes.slots[slot_index].key, &key))
+        {
+            const write = &writes.slots[slot_index];
+            slot_index += 1;
+            const old = try reader.storage(&key, &write.slot);
+            if (old == write.value) continue;
+            const address = try changeset.hashed_owner(&key);
+            const slot = std.mem.readInt(u256, &write.slot, .big);
+            try changeset.add_storage(.{
+                .address = address,
+                .slot = slot,
+                .old = old,
+                .new = write.value,
+            });
+        }
+    }
+    // Owners were named in ascending key order, slots within an owner too: sorted already.
+    changeset.sort();
+    assert(changeset.hashed);
+    assert(changeset.keys_len <= writes.accounts.len + writes.slots.len);
+}
+
+/// The smallest key not yet merged of either list.
+fn next_hashed_owner(writes: HashedWrites, account_index: usize, slot_index: usize) Hash {
+    assert(account_index < writes.accounts.len or slot_index < writes.slots.len);
+    if (account_index == writes.accounts.len) return writes.slots[slot_index].key;
+    if (slot_index == writes.slots.len) return writes.accounts[account_index].key;
+    const a = &writes.accounts[account_index].key;
+    const b = &writes.slots[slot_index].key;
+    return if (std.mem.order(u8, a, b) == .gt) b.* else a.*;
+}
+
 /// Whether `changeset` lists `code` (a block lists few codes; most differ in length).
 fn changeset_has_code(changeset: *const Changeset, code: []const u8) bool {
     assert(code.len > 0);

@@ -2195,6 +2195,30 @@ pub fn DatabaseType(comptime Storage: type) type {
             return leaf.account;
         }
 
+        /// `proof_at` by trie keys, for a caller without preimages: the account proof of
+        /// `address_hash`, and one storage proof and value per slot hash. Disk mode, at the
+        /// head (or inside a history view, as `proof_at`): `proof_disk`'s walks, unhashed.
+        pub fn proof_hashed(
+            self: *Self,
+            address_hash: *const Hash,
+            slot_hashes: []const Hash,
+            account_proof: *StateTrie.AccountProof,
+            storage_proofs: []StateTrie.StorageProof,
+            values: []u256,
+        ) ProofError!?history_module.AccountState {
+            assert(slot_hashes.len == storage_proofs.len and slot_hashes.len == values.len);
+            if (self.phase != .ready or !self.head_info.present) return error.NotReady;
+            const disk = if (self.disk) |*disk| disk else return error.HistoryUnavailable;
+            assert(!self.checkpoints_held);
+            const leaf = disk.prove(address_hash, null, account_proof, account_proof) catch |err|
+                return disk_proof_error(err);
+            for (slot_hashes, storage_proofs, values) |*slot_hash, *proof, *value| {
+                const found = disk.prove(address_hash, slot_hash, account_proof, proof);
+                value.* = (found catch |err| return disk_proof_error(err)).word;
+            }
+            return leaf.account;
+        }
+
         fn disk_proof_error(err: disk_state_module.Error) ProofError {
             return switch (err) {
                 error.Full, error.Busy => error.HistoryFull,
