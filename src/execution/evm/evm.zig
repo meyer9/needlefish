@@ -427,7 +427,7 @@ pub const Evm = struct {
     }
 
     /// EIP-7702: a top-level call to a delegated EOA runs the delegate's code.
-    fn resolve_code_address(evm: *Evm, comptime fork: Fork, target: Address) Error!Address {
+    pub fn resolve_code_address(evm: *Evm, comptime fork: Fork, target: Address) Error!Address {
         if (!fork.at_least(.prague)) return target;
         const account = try evm.state.load(target);
         const code = try evm.state.code(account);

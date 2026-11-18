@@ -472,6 +472,9 @@ fn transact_deposit(comptime fork: Fork, evm: *Evm, tx: *const TxEnv) evm_module
     // reports as a halt, so the deposit fails and consumes its whole gas limit (base/base
     // `catch_error`). A nested call's failed transfer only fails that frame.
     if (sender.info.balance < tx.value) {
+        // revm loads the callee (and its EIP-7702 delegate) before the transfer fails, and
+        // the failed deposit keeps them loaded: prestateTracer lists them.
+        if (tx.to) |to| _ = try evm.resolve_code_address(fork, to);
         return .{ .executed = try fail_deposit(fork, evm, tx, .revert) };
     }
     if (tx.to != null) try evm.state.set_nonce(sender, sender.info.nonce +| 1);

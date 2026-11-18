@@ -95,6 +95,8 @@ test "op: deposit whose value exceeds balance plus mint fails with its whole gas
     const executed = (try transaction.transact(&h.evm, .prague, &tx)).executed;
     try testing.expectEqual(evm_module.Status.halt, executed.status);
     try testing.expectEqual(@as(u64, 100_000), executed.gas_used);
+    // The callee was loaded before the transfer failed (revm's frame), as a trace lists it.
+    try testing.expectEqual(h.state.tx_id, h.state.accounts.getPtr(target).?.seen_tx);
     try testing.expectEqual(@as(u256, 4), try balance(&h, depositor));
     try testing.expectEqual(@as(u64, 8), (try h.state.load(depositor)).info.nonce);
     try testing.expectEqual(@as(u256, 0), try balance(&h, target));
@@ -1411,4 +1413,23 @@ test "op: B-20 V3 rejects crediting the token and always checks the executor pol
     try testing.expect(minted.status == .revert);
     const sent = try token_call(&h, .transfer, &.{ address_int(holder), 1 });
     try testing.expect(sent.status == .success);
+}
+
+test "op: a deposit failing its transfer loads the callee's EIP-7702 delegate" {
+    var h: Harness = undefined;
+    try h.init(testing.allocator);
+    defer h.deinit(testing.allocator);
+    h.evm.block.op = .{ .upgrade = .jovian };
+    const delegate = primitives.address_from_int(0xd1ff0000);
+    const designator = [_]u8{ 0xef, 0x01, 0x00 } ++ delegate;
+    try h.database.put_account(target, 0, 55, &designator);
+    try h.database.put_account(delegate, 0, 1, &store_code);
+    var tx = deposit(target, 100_000);
+    tx.mint = 1;
+    const executed = (try transaction.transact(&h.evm, .prague, &tx)).executed;
+    try testing.expectEqual(evm_module.Status.halt, executed.status);
+    const tx_id = h.state.tx_id;
+    try testing.expectEqual(tx_id, h.state.accounts.getPtr(target).?.seen_tx);
+    try testing.expectEqual(tx_id, h.state.accounts.getPtr(delegate).?.seen_tx);
+    try testing.expectEqual(@as(u256, 0), try h.storage(delegate, 0));
 }
