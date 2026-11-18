@@ -115,7 +115,7 @@ pub const Node = struct {
         const allocator = testing.allocator;
         node.chain = try Chain.init(allocator, chain_spec, &node.db, &node.executor, &genesis, .{
             .restoring = if (shared) |s| s.restoring else false,
-            .store = .{ .blocks_max = 256, .bytes_max = 1 << 20 },
+            .store = .{ .blocks_max = 512, .bytes_max = 1 << 20 },
             .staging_bytes = 1 << 18,
             .select_max = 64,
             .build_bytes = 1 << 16,

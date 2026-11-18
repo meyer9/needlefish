@@ -1788,6 +1788,45 @@ test "eth: debug_trace callTracer reports nested calls, logs and reverts" {
     try expect_contains(flat_text, "\"transactionPosition\":1,\"type\":\"call\"}]");
 }
 
+test "eth: debug_trace replays BLOCKHASH of a block the head's ring has dropped" {
+    const h = try Harness.create();
+    defer h.destroy();
+    var store = try meter_history();
+    defer store.deinit(testing.allocator);
+    try h.node.db.trie().track_changes(testing.allocator);
+    try h.node.chain.attach_history(&store);
+    // SSTORE(0, BLOCKHASH(NUMBER - 255)); STOP.
+    const target: [20]u8 = @splat(0x5b);
+    try h.node.db.put_account(target, 0, 0, &.{ 0x60, 0xff, 0x43, 0x03, 0x40, 0x5f, 0x55, 0x00 });
+    var timestamp: u64 = 0;
+    for (0..256) |_| {
+        timestamp += 12;
+        _ = try h.mine(timestamp);
+    }
+    var buffer: [256]u8 = undefined;
+    const raw = try contract_call_raw(&buffer, 0, target);
+    try expect_contains(try send_raw(h, raw), "\"result\":\"0x");
+    timestamp += 12;
+    _ = try h.mine(timestamp);
+    // The next block takes the ring slot of BLOCKHASH(2): only the replay reads it there.
+    timestamp += 12;
+    _ = try h.mine(timestamp);
+    const tx_hash = primitives.keccak256(raw).bytes;
+    // 21000 + 30 for the opcodes + 22100 for a cold SSTORE of a non-zero hash.
+    const gas_used = "\"gasUsed\":\"0xa87a\"";
+    var body: [200]u8 = undefined;
+    const receipt_format = request_prefix_format ++
+        "eth_getTransactionReceipt\",\"params\":[\"0x{x}\"]}}";
+    const receipt = try std.fmt.bufPrint(&body, receipt_format, .{&tx_hash});
+    try expect_contains(try h.request_runtime(receipt), gas_used);
+    const call_tracer = "{\"tracer\":\"callTracer\"}";
+    try expect_contains(
+        try trace_request(h, "debug_traceTransaction", &tx_hash, call_tracer),
+        gas_used,
+    );
+    try expect_contains(try trace_request(h, "debug_traceTransaction", &tx_hash, "{}"), "43130");
+}
+
 test "eth: debug_traceCall traces a call against the head state" {
     const h = try Harness.create();
     defer h.destroy();
