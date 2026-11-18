@@ -174,6 +174,30 @@ pub fn transaction(
 ) WriteError!void {
     const envelope = Envelope.decode(raw) catch return w.null_value();
     const sender = envelope.recover_sender(recoverer) orelse primitives.Address.zero;
+    try transaction_object(w, envelope, raw, sender, inclusion);
+}
+
+/// An eth_simulateV1 transaction object: its signature is zero, so the request's `from` is
+/// its sender (reth `Recovered::new_unchecked`).
+pub fn simulated_transaction(
+    w: *Writer,
+    raw: []const u8,
+    sender: primitives.Address,
+    inclusion: Inclusion,
+) WriteError!void {
+    // Proof: the simulation encoded `raw` from a transaction it built.
+    const envelope = Envelope.decode(raw) catch unreachable;
+    assert(envelope != .deposit);
+    try transaction_object(w, envelope, raw, sender, inclusion);
+}
+
+fn transaction_object(
+    w: *Writer,
+    envelope: Envelope,
+    raw: []const u8,
+    sender: primitives.Address,
+    inclusion: ?Inclusion,
+) WriteError!void {
     try w.begin_object();
     try field_data(w, "hash", &primitives.keccak256(raw).bytes);
     try field_quantity(w, "type", @as(u8, @backingInt(envelope.tx_type())));
@@ -225,8 +249,10 @@ fn fee_fields(w: *Writer, envelope: Envelope, inclusion: ?Inclusion) WriteError!
         .legacy, .eip2930 => try field_quantity(w, "gasPrice", envelope.max_fee_per_gas()),
         .deposit => try field_quantity(w, "gasPrice", @as(u8, 0)),
         else => {
+            // alloy: the effective tip (zero when the fee cap is below the base fee, as
+            // only a simulated block allows) plus the base fee.
             const price = if (base_fee) |fee|
-                envelope.effective_gas_price(fee) orelse envelope.max_fee_per_gas()
+                envelope.effective_gas_price(fee) orelse fee
             else
                 envelope.max_fee_per_gas();
             try field_quantity(w, "gasPrice", price);

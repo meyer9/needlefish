@@ -7,12 +7,12 @@
 //! saturating; the base fee is zero unless overridden);
 //! state overrides `balance`, `nonce`, `code`, `state` (replaces all storage) and
 //! `stateDiff`. Calls run fee-free (gas price and base fee zero, as without
-//! `validation`), with the block's remaining gas by default. Each block reports
-//! `number`, `timestamp`, `gasLimit`, `gasUsed`, `baseFeePerGas`, `miner` and `calls`
-//! (`returnData`, `logs`, `gasUsed`, `status`, `error` for a revert (code 3, reth's
-//! "execution reverted: <reason>", with data) or a halt (-32015, reth's halt text)). Not
-//! supported: `validation: true`, `traceTransfers`, `movePrecompileToAddress`; no block
-//! hashes or roots.
+//! `validation`), with the block's remaining gas by default. Each block is the full block
+//! base/base assembles (`simulate_block.zig`: header, hash, transactions, withdrawals) plus
+//! `calls` (`returnData`, `logs`, `gasUsed`, `maxUsedGas`, `status`, `error` for a revert
+//! (code 3, reth's "execution reverted: <reason>", with data) or a halt (-32015, reth's halt
+//! text)); `returnFullTransactions` writes transaction objects. Not supported:
+//! `traceTransfers`, `movePrecompileToAddress`.
 
 const std = @import("std");
 const assert = std.debug.assert;
@@ -27,6 +27,8 @@ const call_error = @import("call_error.zig");
 const call_fees = @import("call_fees.zig");
 const chainspec = @import("../chainspec/root.zig");
 const schedule_module = @import("simulate_schedule.zig");
+const assembly = @import("simulate_block.zig");
+const primitives = @import("../../common/primitives/root.zig");
 
 const Api = eth.Api;
 const Call = rpc.Call;
@@ -39,7 +41,7 @@ pub const methods = [_]rpc.Method(*Api){
 };
 
 pub const blocks_max = schedule_module.blocks_max;
-pub const calls_max = 256;
+pub const calls_max = assembly.calls_max;
 pub const overrides_max = 64;
 pub const slots_max = 256;
 /// execution-apis error codes (reth `EthSimulateError::error_code`, `SIMULATE_*_CODE`).
@@ -118,6 +120,13 @@ const Simulation = struct {
     call: *Call,
     /// Call data and override code of the call running; error texts once it ran.
     space: []u8,
+    /// The encoded transactions and receipts of the block running.
+    block_space: []u8,
+    /// `returnFullTransactions`: blocks list transaction objects, not hashes.
+    full_transactions: bool,
+    /// The base block's beacon root, which every simulated block repeats (base/base
+    /// `BaseNextBlockEnvAttributes::build_pending_env` copies the parent's).
+    parent_beacon_block_root: ?primitives.B256,
     /// `validation: true`: fees, balances and nonces are checked and fees charged.
     validation: bool,
     /// The base block's extra data (its EIP-1559 parameters, for validated base fees).
@@ -135,6 +144,7 @@ const gas_limit_reached = "Client adjustable limit reached";
 /// The simulated block a block builds on.
 const Parent = struct {
     env: BlockEnv,
+    hash: primitives.B256,
     gas_used: u64,
     blob_gas_used: u64,
 };
@@ -150,12 +160,9 @@ fn simulate_v1(api: *Api, call: *Call) HandlerError!void {
         return call.fail(schedule_module.code_too_many_blocks, "too many blocks");
     }
     if (count == 0) return call.fail(rpc.code.invalid_params, "calls are empty.");
-    const space = switch (view) {
-        .head => api.scratch,
-        .historical => api.scratch[0 .. eth.proof_tail_offset(api) orelse {
-            return call.fail(rpc.code.internal_error, "proof scratch too small");
-        }],
-    };
+    const scratch = try scratch_of(api, call, view);
+    // Calls take the first half of the scratch, the block being assembled the second.
+    const space = scratch[0 .. scratch.len / 2];
     const header = eth.view_header(api, view);
     const denim = api.spec.upgrades[@backingInt(chainspec.Upgrade.denim)];
     const chain = api.chain;
@@ -173,6 +180,9 @@ fn simulate_v1(api: *Api, call: *Call) HandlerError!void {
         .api = api,
         .call = call,
         .space = space,
+        .block_space = scratch[space.len..],
+        .full_transactions = try json_true(options, "returnFullTransactions"),
+        .parent_beacon_block_root = header.parent_beacon_block_root,
         .validation = try json_true(options, "validation"),
         .extra_data = header.extra_data,
         .history = null,
@@ -202,11 +212,24 @@ fn simulate_v1(api: *Api, call: *Call) HandlerError!void {
     defer chain.executor.session_end(session);
     var parent: Parent = .{
         .env = node.chain.env_of(&header),
+        .hash = header.hash(),
         .gas_used = header.gas_used,
         .blob_gas_used = header.blob_gas_used orelse 0,
     };
     parent.env.parent_beacon_block_root = parent.env.parent_beacon_block_root orelse @splat(0);
     try run_blocks(&simulation, &schedule, &parent, blocks);
+}
+
+/// The scratch a simulation may use: all of it at the head, else what the proofs leave.
+fn scratch_of(api: *Api, call: *Call, view: state_view.View) HandlerError![]u8 {
+    const scratch = switch (view) {
+        .head => api.scratch,
+        .historical => api.scratch[0 .. eth.proof_tail_offset(api) orelse {
+            return call.fail(rpc.code.internal_error, "proof scratch too small");
+        }],
+    };
+    assert(scratch.len <= api.scratch.len);
+    return scratch;
 }
 
 fn count_blocks(blocks: []const u8) HandlerError!u64 {
@@ -329,56 +352,79 @@ fn block_env(
     return env;
 }
 
-/// Runs one simulated block on top of `parent` and writes it.
+/// Runs one simulated block on top of `parent` and writes it. The calls are written as
+/// they run, so their logs' `blockHash` is filled in once the block is sealed.
 fn simulate_block(
     simulation: *Simulation,
     parent: *const Parent,
     raw: []const u8,
     planned: schedule_module.Schedule.Planned,
 ) HandlerError!Parent {
-    const call = simulation.call;
-    const space = simulation.space;
-    const env = try block_env(simulation, parent, try block_overrides(raw), planned);
-    const executor = simulation.api.chain.executor;
-    if (json.find_path(raw, &.{"stateOverrides"}) catch return error.InvalidParams) |o| {
-        if (try both_state_and_diff(o)) |address| {
-            return call.fail(rpc.code.invalid_params, both_state_message(space, address));
-        }
-        apply_state_overrides(executor.state, space, o) catch |err| switch (err) {
-            error.InvalidParams => return error.InvalidParams,
-            else => return call.fail(rpc.code.internal_error, @errorName(err)),
-        };
-    }
-    const w = call.writer;
+    const overrides = try block_overrides(raw);
+    const env = try block_env(simulation, parent, overrides, planned);
+    // alloy-evm `apply_block_overrides` sets the block's difficulty (only the header shows
+    // it: post-merge DIFFICULTY reads prevRandao).
+    const difficulty = try difficulty_of(overrides);
+    try apply_block_state_overrides(simulation, raw);
+    var block = assembly.Block.init(simulation.block_space);
+    const w = simulation.call.writer;
     try w.begin_object();
-    try w.key("number");
-    try w.quantity(env.number);
-    try w.key("timestamp");
-    try w.quantity(env.timestamp);
-    try w.key("gasLimit");
-    try w.quantity(env.gas_limit);
-    try w.key("baseFeePerGas");
-    try w.quantity(env.base_fee);
-    try w.key("miner");
-    try w.data(&env.beneficiary);
     try w.key("calls");
     try w.begin_array();
-    var gas_used: u64 = 0;
-    var log_index: u64 = 0;
+    const calls_start = w.out.end;
     if (json.find_path(raw, &.{"calls"}) catch return error.InvalidParams) |calls| {
         var list = try Elements.init(calls);
+        var log_index: u64 = 0;
         var index: u64 = 0;
         while (try list.next(calls_max)) |call_raw| : (index += 1) {
-            const position: Position = .{ .block = env.number, .index = index };
-            gas_used += try run_call(simulation, &env, gas_used, call_raw, position, &log_index);
-            assert(gas_used <= env.gas_limit);
+            try run_call(simulation, &env, &block, call_raw, &log_index);
+            assert(block.gas_used <= env.gas_limit);
         }
+        assert(index == block.count);
     }
     try w.end_array();
-    try w.key("gasUsed");
-    try w.quantity(gas_used);
+    const calls_end = w.out.end;
+    const sealed = block.header(.{
+        .spec = simulation.api.spec,
+        .parent_hash = parent.hash,
+        .env = &env,
+        .difficulty = difficulty,
+        .extra_data = simulation.extra_data,
+        .parent_beacon_block_root = simulation.parent_beacon_block_root,
+    });
+    const hash = sealed.hash();
+    _ = assembly.patch_block_hashes(w.out.buffer[calls_start..calls_end], hash);
+    try block.write(w, &sealed, hash, simulation.full_transactions);
     try w.end_object();
-    return .{ .env = env, .gas_used = gas_used, .blob_gas_used = 0 };
+    return .{
+        .env = env,
+        .hash = hash,
+        .gas_used = block.gas_used,
+        .blob_gas_used = block.da_footprint,
+    };
+}
+
+fn difficulty_of(overrides: ?[]const u8) HandlerError!u256 {
+    const raw = overrides orelse return 0;
+    const value = json.find_path(raw, &.{"difficulty"}) catch return error.InvalidParams;
+    const text = value orelse return 0;
+    if (std.mem.eql(u8, text, "null")) return 0;
+    return quantity_of(u256, text);
+}
+
+fn apply_block_state_overrides(simulation: *Simulation, raw: []const u8) HandlerError!void {
+    const call = simulation.call;
+    const space = simulation.space;
+    const executor = simulation.api.chain.executor;
+    const overrides = (json.find_path(raw, &.{"stateOverrides"}) catch
+        return error.InvalidParams) orelse return;
+    if (try both_state_and_diff(overrides)) |address| {
+        return call.fail(rpc.code.invalid_params, both_state_message(space, address));
+    }
+    apply_state_overrides(executor.state, space, overrides) catch |err| switch (err) {
+        error.InvalidParams => return error.InvalidParams,
+        else => return call.fail(rpc.code.internal_error, @errorName(err)),
+    };
 }
 
 /// Whether the block overrides `raw` set the field `names` (a name and its aliases; a null
@@ -391,12 +437,11 @@ fn overridden(raw: []const u8, names: []const []const u8) HandlerError!bool {
     return false;
 }
 
-const Position = struct { block: u64, index: u64 };
-
 /// alloy-evm 0.39 `apply_block_overrides` over alloy's `BlockOverrides` fields and serde
-/// aliases. Unknown members are ignored, as serde ignores them. `difficulty` is read and
-/// dropped (post-merge DIFFICULTY reads prevRandao); `beaconRoot` reaches only a simulated
-/// block's system call; `blockHash` is not supported.
+/// aliases. Unknown members are ignored, as serde ignores them. `difficulty` is read here
+/// and reaches only a simulated block's header (`difficulty_of`; post-merge DIFFICULTY
+/// reads prevRandao); `beaconRoot` never reaches a simulated header (base/base repeats the
+/// parent's); `blockHash` is not supported.
 pub fn apply_block_overrides(call: *Call, env: *BlockEnv, raw: []const u8) HandlerError!void {
     var members = try Members.init(raw);
     while (try members.next(32)) |member| {
@@ -515,32 +560,41 @@ fn write_slots(state: *evm.State, account: *evm.state.Account, raw: []const u8) 
     }
 }
 
-/// Runs and writes one call; returns its gas used. A call the EVM rejects fails the whole
-/// request (reth's `execute_transactions`); a revert or halt is the call's `error`.
+/// Where a call's logs sit; their block hash is patched in once the block is sealed.
+const Position = struct { block: u64, timestamp: u64, index: u64, tx_hash: primitives.B256 };
+
+/// Runs and writes one call, adding its transaction and receipt to `block`. A call the EVM
+/// rejects fails the whole request (reth's `execute_transactions`); a revert or halt is the
+/// call's `error`.
 fn run_call(
     simulation: *Simulation,
     env: *const BlockEnv,
-    gas_used: u64,
+    block: *assembly.Block,
     raw: []const u8,
-    position: Position,
     log_index: *u64,
-) HandlerError!u64 {
+) HandlerError!void {
     const call = simulation.call;
-    const space = simulation.space;
-    var message = try eth.parse_call(space, raw, simulation.api.chain.executor.recoverer);
+    const executor = simulation.api.chain.executor;
+    var message = try eth.parse_call(simulation.space, raw, executor.recoverer);
     try set_fees(simulation, &message, raw);
-    const remaining = env.gas_limit - gas_used;
+    const remaining = env.gas_limit - block.gas_used;
     if ((message.gas orelse 0) > remaining) {
         return call.fail(code_block_gas, "Block gas limit exceeded by the block's transactions");
     }
     // The RPC gas cap bounds a given gas silently and the default.
     const cap = simulation.gas_cap_remaining;
     message.gas = if (message.gas) |gas| @min(gas, cap) else @min(remaining, cap);
-    const executor = simulation.api.chain.executor;
     const caller = executor.state.load(message.from) catch |err| {
         return call.fail(rpc.code.internal_error, @errorName(err));
     };
     const sender: Sender = .{ .nonce = caller.info.nonce, .balance = caller.info.balance };
+    const position: Position = .{
+        .block = env.number,
+        .timestamp = env.timestamp,
+        .index = block.count,
+        .tx_hash = try add_transaction(simulation, block, &message, raw, sender.nonce),
+    };
+    try add_da_footprint(simulation, env, block);
     const result = executor.session_call(env, message) catch |err| {
         return call.fail(rpc.code.internal_error, @errorName(err));
     };
@@ -552,20 +606,39 @@ fn run_call(
         return call.fail(code_gas_limit_reached, gas_limit_reached);
     }
     simulation.gas_cap_remaining = cap - executed.gas_used;
-    const w = call.writer;
+    const success = executed.status == .success;
+    const logs = if (success) executed.logs else &.{};
+    block.add_receipt(success, executed.gas_used, logs) catch return scratch_full(call);
+    try write_call(simulation, &message, &executed, position, log_index);
+}
+
+const Executed = @FieldType(Executor.SessionCall, "executed");
+
+fn write_call(
+    simulation: *Simulation,
+    message: *const Executor.Call,
+    executed: *const Executed,
+    position: Position,
+    log_index: *u64,
+) HandlerError!void {
+    const w = simulation.call.writer;
+    const space = simulation.space;
+    assert(executed.gas_max_used >= executed.gas_used);
     try w.begin_object();
     try w.key("returnData");
     // base/base reports no return data for a failed call (the revert output is `data`).
     try w.data(if (executed.status == .success) executed.output else &.{});
     try w.key("logs");
     try w.begin_array();
-    for (executed.logs) |item| {
+    if (executed.status == .success) for (executed.logs) |item| {
         try write_log(w, item, position, log_index.*);
         log_index.* += 1;
-    }
+    };
     try w.end_array();
     try w.key("gasUsed");
     try w.quantity(executed.gas_used);
+    try w.key("maxUsedGas");
+    try w.quantity(executed.gas_max_used);
     try w.key("status");
     try w.quantity(@as(u64, @intFromBool(executed.status == .success)));
     // The call data in `space` is done with: the error text goes there.
@@ -581,7 +654,83 @@ fn run_call(
         },
     }
     try w.end_object();
-    return executed.gas_used;
+}
+
+fn scratch_full(call: *Call) HandlerError {
+    return call.fail(rpc.code.internal_error, "simulation scratch full");
+}
+
+/// The call as the transaction base/base builds for it (reth `resolve_transaction`): the
+/// state nonce unless given (a given 2^64 - 1 is zero without validation), the call's gas,
+/// the chain id unless given, missing prices zero; added to `block`, returning its hash.
+fn add_transaction(
+    simulation: *const Simulation,
+    block: *assembly.Block,
+    message: *const Executor.Call,
+    raw: []const u8,
+    state_nonce: u64,
+) HandlerError!primitives.B256 {
+    const fees = try call_fees.parse(raw);
+    const tx_type = assembly.tx_type_of(
+        message.authorization_list != null,
+        fees.blob_hashes != null,
+        try member_of(raw, "accessList") != null,
+        fees.gas_price != null,
+    );
+    var nonce = state_nonce;
+    if (try member_of(raw, "nonce")) |text| nonce = try quantity_of(u64, text);
+    if (!simulation.validation and nonce == std.math.maxInt(u64)) nonce = 0;
+    var request: assembly.TxRequest = .{
+        .tx_type = tx_type,
+        .chain_id = message.chain_id orelse simulation.api.spec.chain_id,
+        .nonce = nonce,
+        .gas_limit = message.gas.?,
+        .to = if (message.to) |to| .{ .bytes = to } else null,
+        .value = message.value,
+        .input = message.data,
+        .access_list = message.access_list,
+    };
+    const price_max = std.math.maxInt(u128);
+    switch (tx_type) {
+        .legacy, .eip2930 => request.gas_price = @intCast(@min(fees.gas_price orelse 0, price_max)),
+        else => {
+            request.max_fee_per_gas = @intCast(@min(fees.max_fee orelse 0, price_max));
+            const priority = fees.max_priority_fee orelse 0;
+            request.max_priority_fee_per_gas = @intCast(@min(priority, price_max));
+        },
+    }
+    if (tx_type == .eip7702) {
+        const list = (try member_of(raw, "authorizationList")).?; // Parsed by `parse_call`.
+        request.authorizations = assembly.encode_authorizations(block, list) catch |err|
+            return switch (err) {
+                error.ScratchFull => scratch_full(simulation.call),
+                else => |other| other,
+            };
+    }
+    const sender: primitives.Address = .{ .bytes = message.from };
+    return block.add_transaction(&request, sender) catch scratch_full(simulation.call);
+}
+
+/// Jovian: base/base's block executor counts every transaction's DA footprint, of its empty
+/// envelope (`WithEncoded::new(Default::default(), tx)`) at the L1Block's current scalar.
+fn add_da_footprint(
+    simulation: *const Simulation,
+    env: *const BlockEnv,
+    block: *assembly.Block,
+) HandlerError!void {
+    if (!simulation.api.spec.is_upgrade_active(.jovian, env.timestamp)) return;
+    const state = simulation.api.chain.executor.state;
+    const params = evm.op.load_params(state, .jovian) catch |err| {
+        return simulation.call.fail(rpc.code.internal_error, @errorName(err));
+    };
+    block.da_footprint +|= params.jovian_da_footprint(&.{});
+}
+
+/// The raw value of member `name` of the object `raw`; null when absent or null.
+fn member_of(raw: []const u8, name: []const u8) HandlerError!?[]const u8 {
+    const value = (json.find_path(raw, &.{name}) catch return error.InvalidParams) orelse
+        return null;
+    return if (std.mem.eql(u8, value, "null")) null else value;
 }
 
 const Sender = struct { nonce: u64, balance: u256 };
@@ -682,8 +831,15 @@ fn write_log(
     try w.end_array();
     try w.key("data");
     try w.data(item.data);
+    // A placeholder until the block is sealed (`patch_block_hashes`).
+    try w.key("blockHash");
+    try w.data(&primitives.B256.zero.bytes);
     try w.key("blockNumber");
     try w.quantity(position.block);
+    try w.key("blockTimestamp");
+    try w.quantity(position.timestamp);
+    try w.key("transactionHash");
+    try w.data(&position.tx_hash.bytes);
     try w.key("transactionIndex");
     try w.quantity(position.index);
     try w.key("logIndex");

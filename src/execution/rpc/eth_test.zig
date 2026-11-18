@@ -593,9 +593,11 @@ test "eth: eth_simulateV1 carries state across calls and blocks with overrides" 
     try testing.expectEqual(@as(usize, 2), count_of(text, "\"returnData\":\"" ++ word ++ "1\""));
     try expect_contains(text, "\"logIndex\":\"0x1\"");
     try expect_contains(text, "\"error\":{\"code\":3,\"message\":\"execution reverted\"}");
-    try expect_contains(text, "\"number\":\"0x2\",\"timestamp\":\"0x1000\"");
+    try expect_contains(text, "\"number\":\"0x2\"");
+    try expect_contains(text, "\"timestamp\":\"0x1000\"");
     // base/base's default: the chain's schedule, here two seconds after the override.
-    try expect_contains(text, "\"number\":\"0x3\",\"timestamp\":\"0x1002\"");
+    try expect_contains(text, "\"number\":\"0x3\"");
+    try expect_contains(text, "\"timestamp\":\"0x1002\"");
     // Nothing was committed.
     try testing.expectEqual(head_root, try h.node.db.root());
     try testing.expectEqualStrings("\"result\":\"0x\"", try h.request("eth_getCode", "[" ++
@@ -686,7 +688,8 @@ test "eth: eth_simulateV1 call errors and validation" {
     const poor = "[{\"blockStateCalls\":[{\"calls\":[{\"from\":" ++ poor_sender ++
         ",\"to\":" ++ address_target ++ ",\"value\":\"0x1\"}]}]}]";
     try expect_contains(try h.request("eth_simulateV1", poor), "\"gasUsed\":\"0x5208\"," ++
-        "\"status\":\"0x0\",\"error\":{\"code\":-32015,\"message\":\"EVM error: OutOfFunds\"}");
+        "\"maxUsedGas\":\"0x5208\",\"status\":\"0x0\",\"error\":{\"code\":-32015," ++
+        "\"message\":\"EVM error: OutOfFunds\"}");
     // With validation the fee, nonce and balance checks apply.
     const validated = "[{\"validation\":true,\"blockStateCalls\":[{\"calls\":[{\"from\":" ++
         poor_sender ++ ",\"to\":" ++ address_target;
@@ -749,6 +752,132 @@ fn fuzz_simulate(_: void, smith: *testing.Smith) anyerror!void {
 
 test "eth: fuzz eth_simulateV1" {
     try testing.fuzz({}, fuzz_simulate, .{});
+}
+
+test "eth: eth_simulateV1 blocks are base/base's sealed blocks" {
+    const h = try Harness.create_for(&denim_rpc_spec);
+    defer h.destroy();
+    var head: [66]u8 = undefined;
+    const latest = try h.request("eth_getBlockByNumber", "[\"latest\",false]");
+    @memcpy(&head, value_after(latest, "hash", 0).?);
+    // A counter call (one log), then slot 0 cleared from 1 (a refund), then an empty block.
+    const clearer_at = "\"0x0000000000000000000000000000000000000057\"";
+    const params = "[{\"returnFullTransactions\":true,\"blockStateCalls\":[" ++
+        "{\"blockOverrides\":{\"difficulty\":\"0x7\"},\"stateOverrides\":{" ++ counter_at ++
+        ":{\"code\":\"" ++ counter_hex ++ "\"}},\"calls\":[{\"from\":" ++ address_one ++
+        ",\"to\":" ++ counter_at ++ ",\"gasPrice\":\"0x0\"}]}," ++
+        "{\"stateOverrides\":{" ++ clearer_at ++ ":{\"code\":\"0x5f5f5500\",\"state\":{\"0x" ++
+        zeros_62 ++ "00\":\"0x" ++ zeros_62 ++ "01\"}}},\"calls\":[{\"to\":" ++ clearer_at ++
+        "}]},{}]},\"latest\"]";
+    const text = try h.request("eth_simulateV1", params);
+    const result = text["\"result\":".len..];
+    // Block hashes chain from the base block; the first block's log points at its block and
+    // transaction. With full transactions, block and transaction hashes alternate.
+    const first_hash = value_after(text, "hash", 0).?;
+    const second_hash = value_after(text, "hash", 2).?;
+    const tx_hash = value_after(text, "hash", 1).?;
+    try testing.expectEqualStrings(&head, value_after(text, "parentHash", 0).?);
+    try testing.expectEqualStrings(first_hash, value_after(text, "parentHash", 1).?);
+    try testing.expectEqualStrings(second_hash, value_after(text, "parentHash", 2).?);
+    try testing.expectEqualStrings(first_hash, value_after(text, "blockHash", 0).?);
+    try testing.expectEqualStrings(tx_hash, value_after(text, "transactionHash", 0).?);
+    try testing.expectEqualStrings(first_hash, value_after(text, "blockHash", 1).?);
+    // Each `hash` is the hash of the header the block object shows.
+    for (0..3) |index| {
+        const object = element_of(result, index).?;
+        const shown = try json.parse_fixed(32, value_after(object, "hash", 0).?);
+        try testing.expectEqualSlices(u8, &shown, &(try header_of_block(object)).hash().bytes);
+    }
+    // A zero state and withdrawals root (no state provider), the transaction with its
+    // `from` and a zero signature (an EIP-155 legacy one: gasPrice was given).
+    const zero_hash = "\"0x" ++ zeros_62 ++ "00\"";
+    try testing.expectEqual(@as(usize, 3), count_of(text, "\"stateRoot\":" ++ zero_hash));
+    try testing.expectEqual(@as(usize, 3), count_of(text, "\"withdrawalsRoot\":" ++ zero_hash));
+    try testing.expectEqual(@as(usize, 3), count_of(text, "\"withdrawals\":[]"));
+    try expect_contains(text, "\"type\":\"0x0\",\"from\":" ++ address_one);
+    try expect_contains(text, "\"type\":\"0x2\",\"from\":\"0x" ++ zeros_62[0..40] ++ "\"");
+    try expect_contains(text, "\"r\":\"0x0\",\"s\":\"0x0\"");
+    try expect_contains(text, "\"difficulty\":\"0x7\"");
+    // The empty block has the empty transactions and receipts roots.
+    const empty = "\"0x56e81f171bcc55a6ff8345e692c0f86e5b48e01b996cadc001622fb5e363b421\"";
+    try expect_contains(text, "\"transactionsRoot\":" ++ empty ++ ",\"receiptsRoot\":" ++ empty);
+    // maxUsedGas is the gas before the refund: 21000 + 2 * 2 + 5000 = 26004, refunded 4800.
+    try expect_contains(text, "\"gasUsed\":\"0x52d4\",\"maxUsedGas\":\"0x6594\"");
+}
+
+/// The value of the `nth` (from 0) string member `key` in `text`, without its quotes.
+fn value_after(text: []const u8, key: []const u8, nth: usize) ?[]const u8 {
+    var buffer: [64]u8 = undefined;
+    const needle = std.fmt.bufPrint(&buffer, "\"{s}\":\"", .{key}) catch unreachable;
+    var position: usize = 0;
+    var found: usize = 0;
+    while (std.mem.indexOfPos(u8, text, position, needle)) |at| : (found += 1) {
+        const start = at + needle.len;
+        const end = std.mem.indexOfScalarPos(u8, text, start, '"') orelse return null;
+        if (found == nth) return text[start..end];
+        position = end;
+    }
+    return null;
+}
+
+/// The raw text of element `index` of the JSON array `array`.
+fn element_of(array: []const u8, index: usize) ?[]const u8 {
+    var scanner = json.Scanner.init(array);
+    const open = scanner.next() catch return null;
+    if (open.tag != .array_begin) return null;
+    var position: usize = 0;
+    while (position <= index) : (position += 1) {
+        const before = scanner.offset();
+        const token = scanner.next() catch return null;
+        if (token.tag == .array_end) return null;
+        scanner.skip(token) catch return null;
+        if (position == index) {
+            const raw = scanner.input[before..scanner.offset()];
+            return std.mem.trimStart(u8, raw, " \t\r\n,");
+        }
+    }
+    return null;
+}
+
+/// Rebuilds the consensus header of an RPC block object from its fields.
+fn header_of_block(object: []const u8) !consensus.Header {
+    var header: consensus.Header = .{};
+    header.parent_hash.bytes = try fixed_field(32, object, "parentHash");
+    header.ommers_hash.bytes = try fixed_field(32, object, "sha3Uncles");
+    header.beneficiary.bytes = try fixed_field(20, object, "miner");
+    header.state_root.bytes = try fixed_field(32, object, "stateRoot");
+    header.transactions_root.bytes = try fixed_field(32, object, "transactionsRoot");
+    header.receipts_root.bytes = try fixed_field(32, object, "receiptsRoot");
+    header.logs_bloom.bytes = try fixed_field(256, object, "logsBloom");
+    header.difficulty = try quantity_field(u256, object, "difficulty");
+    header.number = try quantity_field(u64, object, "number");
+    header.gas_limit = try quantity_field(u64, object, "gasLimit");
+    header.gas_used = try quantity_field(u64, object, "gasUsed");
+    header.timestamp = try quantity_field(u64, object, "timestamp");
+    header.mix_hash.bytes = try fixed_field(32, object, "mixHash");
+    header.nonce.bytes = try fixed_field(8, object, "nonce");
+    header.base_fee_per_gas = try quantity_field(u64, object, "baseFeePerGas");
+    header.withdrawals_root = .{ .bytes = try fixed_field(32, object, "withdrawalsRoot") };
+    header.blob_gas_used = try quantity_field(u64, object, "blobGasUsed");
+    header.excess_blob_gas = try quantity_field(u64, object, "excessBlobGas");
+    header.parent_beacon_block_root = .{
+        .bytes = try fixed_field(32, object, "parentBeaconBlockRoot"),
+    };
+    header.requests_hash = .{ .bytes = try fixed_field(32, object, "requestsHash") };
+    const extra = value_after(object, "extraData", 0) orelse return error.MissingField;
+    try testing.expect(extra.len <= 2 + 2 * 32);
+    header.extra_data = try json.parse_data(extra, &extra_data_buffer);
+    return header;
+}
+
+var extra_data_buffer: [32]u8 = undefined;
+
+fn fixed_field(comptime size: usize, object: []const u8, key: []const u8) ![size]u8 {
+    return json.parse_fixed(size, value_after(object, key, 0) orelse return error.MissingField);
+}
+
+fn quantity_field(comptime T: type, object: []const u8, key: []const u8) !T {
+    return json.parse_quantity(T, value_after(object, key, 0) orelse return error.MissingField);
 }
 
 test "eth: call and estimate gas" {

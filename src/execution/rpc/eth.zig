@@ -944,7 +944,9 @@ fn parse_authorizations(
 }
 
 /// One signed authorization object, or null at the list's end.
-fn signed_authorization(scanner: *json.Scanner) HandlerError!?consensus.tx_fields.Authorization {
+pub fn signed_authorization(
+    scanner: *json.Scanner,
+) HandlerError!?consensus.tx_fields.Authorization {
     const open = try scanner_next(scanner);
     if (open.tag == .array_end) return null;
     if (open.tag != .object_begin) return error.InvalidParams;
@@ -1656,6 +1658,7 @@ test {
     _ = @import("eth_config.zig");
     _ = @import("access_list.zig");
     _ = @import("simulate.zig");
+    _ = @import("simulate_block.zig");
     _ = @import("eth_test.zig");
     _ = @import("send_sync.zig");
     _ = @import("debug_test.zig");
