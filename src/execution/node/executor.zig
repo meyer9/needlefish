@@ -774,6 +774,8 @@ pub const Executor = struct {
             /// Why the call stopped (the halt reason of a failed, non-reverted call).
             exit: evm.evm.Exit,
             gas_used: u64,
+            /// Gas spent before the refund, at least the calldata floor (`maxUsedGas`).
+            gas_max_used: u64,
             /// Valid until the next session call.
             output: []const u8,
             logs: []const evm.state.Log,
@@ -845,6 +847,7 @@ pub const Executor = struct {
                 .status = executed.status,
                 .exit = executed.exit,
                 .gas_used = executed.gas_used,
+                .gas_max_used = executed.gas_max_used,
                 .output = try executor.call_output(&executed),
                 .logs = executed.logs,
             } },

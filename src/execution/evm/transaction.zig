@@ -119,6 +119,9 @@ pub const Executed = struct {
     gas_used: u64,
     /// Refund applied (after the cap).
     gas_refunded: u64,
+    /// Gas spent before the refund, at least the EIP-7623 floor (revm
+    /// `max(total_gas_spent, floor_gas)`, eth_simulateV1's `maxUsedGas`).
+    gas_max_used: u64,
     output: []const u8,
     created: ?Address,
     logs: []const state_module.Log,
@@ -502,13 +505,14 @@ fn fail_deposit(
         .exit = exit,
         .gas_used = tx.gas_limit,
         .gas_refunded = 0,
+        .gas_max_used = tx.gas_limit,
         .output = &.{},
         .created = null,
         .logs = &.{},
     };
 }
 
-const Accounted = struct { gas_used: u64, refund: u64 };
+const Accounted = struct { gas_used: u64, refund: u64, max_used: u64 };
 
 /// Apply the refund cap and the calldata floor.
 fn account_gas(
@@ -524,9 +528,13 @@ fn account_gas(
     const refund_requested: u64 = if (refund_counter > 0) @intCast(refund_counter) else 0;
     const refund = @min(refund_requested, gas_spent / gas.max_refund_quotient(fork));
     var gas_used = gas_spent - refund;
-    if (fork.at_least(.prague)) gas_used = @max(gas_used, intrinsic.floor);
+    // revm's floor gas is zero before Prague.
+    const floor: u64 = if (fork.at_least(.prague)) intrinsic.floor else 0;
+    gas_used = @max(gas_used, floor);
     assert(gas_used <= tx.gas_limit);
-    return .{ .gas_used = gas_used, .refund = refund };
+    const max_used = @max(gas_spent, floor);
+    assert(max_used >= gas_used and max_used <= tx.gas_limit);
+    return .{ .gas_used = gas_used, .refund = refund, .max_used = max_used };
 }
 
 /// Reimburse unused gas and pay the tip (unless fee charge is disabled); on the OP Stack
@@ -577,6 +585,7 @@ fn finish(
         .exit = outcome.exit,
         .gas_used = accounted.gas_used,
         .gas_refunded = accounted.refund,
+        .gas_max_used = accounted.max_used,
         .output = outcome.output,
         .created = outcome.created,
         .logs = logs,
