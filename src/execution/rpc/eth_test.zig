@@ -2074,9 +2074,121 @@ test "eth: debug_trace struct logs stream past the scratch into the response" {
     try testing.expectEqual(@as(usize, 21546), count_of(text, "\"pc\":"));
     try expect_contains(text, "{\"pc\":2,\"op\":\"JUMP\",\"gas\":6,\"gasCost\":6,\"depth\":1," ++
         "\"error\":\"Some(OutOfGas)\",\"stack\":[\"0x0\"],\"refund\":0}]}}");
-    // A response that cannot grow past its buffer fails cleanly.
+    // A response that cannot grow past its buffer fails cleanly, as jsonrpsee's.
     const too_large = try h.request_runtime(body);
-    try expect_contains(too_large, "{\"code\":-32603,\"message\":\"response too large\"}");
+    try expect_contains(too_large, oversized);
+    try testing.expect(h.node.chain.executor.machine.tracer == null);
+}
+
+/// jsonrpsee's error for a response past reth's 160 MiB bound.
+const oversized = "\"error\":{\"code\":-32008,\"message\":\"Response is too big\"," ++
+    "\"data\":\"Exceeded max limit of 167772160\"}}";
+
+const http = @import("../../utilities/http/root.zig");
+
+/// A response as the node's HTTP server builds it: a 64 KiB send buffer whose body moves
+/// into `large` once a write needs more room (`http.ResponseBuilder`).
+const HttpResponse = struct {
+    small: [1 << 16]u8 = undefined,
+    large: []u8,
+    builder: http.ResponseBuilder = undefined,
+
+    fn acquire(context: *anyopaque, size_bytes: usize) ?[]u8 {
+        const response: *HttpResponse = @ptrCast(@alignCast(context));
+        return if (size_bytes <= response.large.len) response.large else null;
+    }
+
+    fn request(response: *HttpResponse, h: *Harness, body: []const u8) ![]const u8 {
+        response.builder = .init(&response.small);
+        response.builder.grow = .{ .context = response, .acquire = acquire };
+        _ = eth.Router.handle(&h.api, body, response.builder.writer());
+        const text = response.builder.writer().buffered();
+        try json.validate(text);
+        return text;
+    }
+};
+
+/// Reads `fan_out_count` storage slots (counter down to 1) and makes as many CALLs to 128
+/// fresh accounts (0x10000 + counter % 128): a transaction whose call tree and prestate
+/// run past a 64 KiB send buffer, within the fixture executor's state bounds.
+const fan_out_count = 900;
+const fan_out_code = [_]u8{
+    0x61, fan_out_count >> 8, fan_out_count & 0xff, // PUSH2 count
+    0x5b, 0x80, 0x15, 0x60, 0x24, 0x57, // loop (3): JUMPDEST DUP1 ISZERO PUSH1 end JUMPI
+    0x80, 0x54, 0x50, // SLOAD(counter) POP
+    0x5f, 0x5f, 0x5f, 0x5f, 0x5f, 0x85, 0x60, 0x7f, 0x16, // the CALL's zeros, counter % 128
+    0x62, 0x01, 0x00, 0x00, 0x01, 0x5a, 0xf1, 0x50, // + 0x10000; GAS CALL POP
+    0x60, 0x01, 0x90, 0x03, 0x60, 0x03, 0x56, // counter - 1; PUSH1 loop JUMP
+    0x5b, 0x00, // end (0x24): JUMPDEST STOP
+};
+comptime {
+    std.debug.assert(fan_out_code[0x24] == 0x5b and fan_out_code[3] == 0x5b);
+}
+const fan_out_at = "\"0x5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b\"";
+
+fn fan_out_raw(buffer: []u8) ![]const u8 {
+    const tx: consensus.Eip1559 = .{
+        .chain_id = fixture.spec.chain_id,
+        .nonce = 0,
+        .max_priority_fee_per_gas = 2,
+        .max_fee_per_gas = 10_000_000_000,
+        .gas_limit = 3_000_000,
+        .to = .{ .call = .{ .bytes = @splat(0x5b) } },
+        .value = 0,
+        .input = &.{},
+        .access_list = .empty,
+    };
+    const envelope = try consensus.tx.sign(tx, fixture.key(1));
+    return envelope.encode_to(buffer);
+}
+
+test "eth: debug_trace tracers stream a heavy transaction into a growing response" {
+    const h = try Harness.create();
+    defer h.destroy();
+    const scratch = try testing.allocator.alloc(u8, 16 << 20);
+    defer testing.allocator.free(scratch);
+    h.api.scratch = scratch;
+    var store = try meter_history();
+    defer store.deinit(testing.allocator);
+    try h.node.db.trie().track_changes(testing.allocator);
+    try h.node.chain.attach_history(&store);
+    try h.node.db.put_account(@splat(0x5b), 0, 0, &fan_out_code);
+    _ = try h.mine(12);
+    var buffer: [256]u8 = undefined;
+    const raw = try fan_out_raw(&buffer);
+    try expect_contains(try send_raw(h, raw), "\"result\":\"0x");
+    _ = try h.mine(24);
+    const large = try testing.allocator.alloc(u8, 4 << 20);
+    defer testing.allocator.free(large);
+    const response = try testing.allocator.create(HttpResponse);
+    defer testing.allocator.destroy(response);
+    response.* = .{ .large = large };
+    const block = request_prefix ++ "debug_traceBlockByNumber\",\"params\":[\"latest\",";
+    // Each slot read reports its zero value.
+    const zero_slot = "\":\"0x" ++ zeros_62 ++ "00\"";
+    const pre = try response.request(h, block ++ "{\"tracer\":\"prestateTracer\"}]}");
+    try testing.expect(pre.len > response.small.len);
+    try testing.expect(count_of(pre, zero_slot) >= fan_out_count);
+    const diff = try response.request(h, block ++ "{\"tracer\":\"prestateTracer\"," ++
+        "\"tracerConfig\":{\"diffMode\":true}}]}");
+    try expect_contains(diff, "\"post\":{");
+    const calls = try response.request(h, block ++ "{\"tracer\":\"callTracer\"}]}");
+    try testing.expectEqual(@as(usize, fan_out_count + 1), count_of(calls, "\"type\":\"CALL\""));
+    const flat = try response.request(h, block ++ "{\"tracer\":\"flatCallTracer\"}]}");
+    try testing.expectEqual(@as(usize, fan_out_count + 1), count_of(flat, "\"callType\""));
+    const four = try response.request(h, block ++ "{\"tracer\":\"4byteTracer\"}]}");
+    try expect_contains(four, "\"result\":{}");
+    // debug_traceCall's prestate and call paths hold the same call.
+    const call = request_prefix ++ "debug_traceCall\",\"params\":[{\"to\":" ++ fan_out_at ++
+        "},\"latest\",";
+    const call_pre = try response.request(h, call ++ "{\"tracer\":\"prestateTracer\"}]}");
+    try testing.expect(count_of(call_pre, zero_slot) >= fan_out_count);
+    const call_tree = try response.request(h, call ++ "{\"tracer\":\"callTracer\"}]}");
+    try testing.expectEqual(@as(usize, fan_out_count + 1), count_of(call_tree, "\"to\""));
+    // Past the large buffer: jsonrpsee's oversized response, not a torn result.
+    response.large = large[0 .. 64 << 10];
+    const call_tracer = "{\"tracer\":\"callTracer\"}]}";
+    try expect_contains(try response.request(h, block ++ call_tracer), oversized);
     try testing.expect(h.node.chain.executor.machine.tracer == null);
 }
 

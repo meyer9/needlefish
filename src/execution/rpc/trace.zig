@@ -5,7 +5,10 @@
 //! The block is re-executed on its parent's state (`HistoryDatabase`, so the history window
 //! bounds what can be traced) in an executor session that commits nothing; the evm's
 //! call-frame hook (`evm.Tracer`) feeds a `Recorder` that keeps frames flat, in call order
-//! with their depth, copying inputs, outputs and logs into a bounded arena. The nested JSON
+//! with their depth, copying inputs, outputs and logs into a bounded arena carved from the
+//! API scratch. It holds one transaction: each traced transaction's result is written into
+//! the response as soon as it has run, and the response grows as far as the router lets it
+//! (`rpc.response_bytes_max`, then jsonrpsee's oversized-response error). The nested JSON
 //! is written from that list with an explicit stack (no recursion). As geth: the top frame
 //! reports the transaction's gas limit and gas used, logs of failed frames (and their
 //! descendants) are dropped, and `revertReason` decodes `Error(string)`. An EIP-8130
@@ -100,8 +103,13 @@ pub const Recorder = struct {
     with_logs: bool = false,
     full: bool = false,
 
+    /// Forgets the previous transaction's frames, logs and bytes (they are written).
     pub fn begin_transaction(recorder: *Recorder, index: u32) void {
         assert(recorder.open_count == 0);
+        assert(!recorder.full);
+        recorder.frame_count = 0;
+        recorder.log_count = 0;
+        recorder.bytes_used = 0;
         recorder.transaction = index;
         recorder.root = null;
         recorder.shift = 0;
@@ -197,17 +205,29 @@ pub const Recorder = struct {
 };
 
 /// Carves a recorder's frames, logs and bytes out of `space`; null when it is too small.
+/// A quarter goes to frames, an eighth to logs, the rest to the frames' and logs' bytes.
 pub fn recorder_in(space: []u8) ?Recorder {
-    const frame_bytes = space.len / 4;
-    const log_bytes = space.len / 8;
-    var fixed: std.heap.FixedBufferAllocator = .init(space);
-    const allocator = fixed.allocator();
-    const frames = allocator.alloc(Frame, frame_bytes / @sizeOf(Frame)) catch return null;
-    const logs = allocator.alloc(Log, log_bytes / @sizeOf(Log)) catch return null;
-    const rest = space.len - fixed.end_index;
-    const bytes = allocator.alloc(u8, rest) catch return null;
-    if (frames.len == 0) return null;
+    var used: usize = 0;
+    const frames = carve(Frame, space, &used, space.len / 4 / @sizeOf(Frame)) orelse return null;
+    const logs = carve(Log, space, &used, space.len / 8 / @sizeOf(Log)) orelse return null;
+    const bytes = space[used..];
+    if (frames.len == 0 or logs.len == 0) return null;
+    assert(@intFromPtr(bytes.ptr) + bytes.len == @intFromPtr(space.ptr) + space.len);
     return .{ .frames = frames, .logs = logs, .bytes = bytes };
+}
+
+/// `count` items of `T` from `space` at `used.*` (aligned), advancing `used`; null when they
+/// do not fit. Unlike an allocator it leaves the bytes untouched, so carving a large lazily
+/// committed scratch does not make it resident (safe builds fill allocations).
+pub fn carve(comptime T: type, space: []u8, used: *usize, count: usize) ?[]T {
+    assert(used.* <= space.len);
+    const base = @intFromPtr(space.ptr);
+    const start = std.mem.alignForward(usize, base + used.*, @alignOf(T)) - base;
+    const size = std.math.mul(usize, count, @sizeOf(T)) catch return null;
+    if (start > space.len or space.len - start < size) return null;
+    used.* = start + size;
+    const items: [*]T = @ptrCast(@alignCast(space[start..].ptr));
+    return items[0..count];
 }
 
 // ---- Output -----------------------------------------------------------------------
@@ -799,12 +819,6 @@ fn trace_raw_block(api: *Api, call: *Call) HandlerError!void {
     try trace_block(api, call, &block.header, transactions, null, options, reserved);
 }
 
-/// Per-transaction results of a re-execution: frame ranges and gas.
-const Ranges = struct {
-    first: [*]u32,
-    gas: [*]u64,
-};
-
 /// Re-executes block `hash` up to transaction `only` (or all of it), tracing `only` (or
 /// every transaction), and writes the result.
 fn trace(api: *Api, call: *Call, hash: Hash, only: ?u32, options: Options) HandlerError!void {
@@ -867,111 +881,85 @@ fn trace_block(
         const run = if (options.tracer == .prestate) &trace_prestate else &trace_struct;
         return run(api, call, &env, transactions, only, options, &history, space);
     }
-    const per_transaction = run_count * (@sizeOf(u32) + @sizeOf(u64)) + 16;
-    if (per_transaction >= space.len) {
-        return call.fail(rpc.code.internal_error, "scratch too small");
-    }
-    const ranges = carve_ranges(space[0..per_transaction], run_count + 1);
-    var recorder = recorder_in(space[per_transaction..]) orelse
+    var recorder = recorder_in(space) orelse
         return call.fail(rpc.code.internal_error, "scratch too small");
     recorder.with_logs = options.with_logs;
-    execute(chain.executor, &env, transactions, only, &recorder, ranges, database) catch |err| {
-        if (history.failure) |failure| return eth_proof.fail_history(call, failure);
-        return call.fail(rpc.code.server_error, @errorName(err));
-    };
-    if (recorder.full) return call.fail(rpc.code.server_error, "trace exceeds the trace buffers");
-    try write_result(call.writer, &recorder, transactions, only, ranges, header, options);
-}
-
-fn carve_ranges(space: []u8, count: usize) Ranges {
-    var fixed: std.heap.FixedBufferAllocator = .init(space);
-    const allocator = fixed.allocator();
-    const gas = allocator.alloc(u64, count) catch unreachable; // Sized by the caller.
-    const first = allocator.alloc(u32, count) catch unreachable;
-    return .{ .first = first.ptr, .gas = gas.ptr };
-}
-
-fn execute(
-    executor: *node.executor.Executor,
-    env: *const node.executor.BlockEnv,
-    transactions: []const []const u8,
-    only: ?u32,
-    recorder: *Recorder,
-    ranges: Ranges,
-    database: evm.state.Database,
-) node.executor.Error!void {
-    const session = executor.session_begin(database);
-    defer executor.session_end(session);
-    try executor.recover_all(transactions);
-    var building = try executor.begin_block(env);
-    const tracer = recorder.tracer();
-    defer executor.machine.tracer = null;
-    defer executor.known_sender = null;
-    for (transactions, 0..) |raw, index| {
-        const traced = only == null or only.? == index;
-        recorder.begin_transaction(@intCast(index));
-        ranges.first[index] = recorder.frame_count;
-        executor.machine.tracer = if (traced) &tracer else null;
-        executor.known_sender = executor.senders[index];
-        const before = building.gas_used;
-        try executor.apply(&building, raw);
-        ranges.gas[index] = building.gas_used - before;
-    }
-    ranges.first[transactions.len] = recorder.frame_count;
-}
-
-/// The traced block's hash (computed for flatCallTracer only) and number.
-const Block = struct { hash: Hash, number: u64 };
-
-fn write_result(
-    w: *json.Writer,
-    recorder: *const Recorder,
-    transactions: []const []const u8,
-    only: ?u32,
-    ranges: Ranges,
-    header: *const consensus.Header,
-    options: Options,
-) json.Writer.WriteError!void {
     // flatCallTracer locates each trace in its block.
     const block: Block = .{
         .hash = if (options.tracer == .flat_call) header.hash().bytes else @splat(0),
         .number = header.number,
     };
-    if (only) |index| {
-        return write_one(w, recorder, transactions[index], index, ranges, block, options);
-    }
-    try w.begin_array();
-    for (transactions, 0..) |raw, index| {
-        try w.begin_object();
-        try w.key("txHash");
-        try w.data(&primitives.keccak256(raw).bytes);
-        try w.key("result");
-        try write_one(w, recorder, raw, @intCast(index), ranges, block, options);
-        try w.end_object();
-    }
-    try w.end_array();
+    const run: Run = .{ .env = &env, .transactions = transactions, .only = only };
+    execute(chain.executor, run, &recorder, database, call.writer, block, options) catch |err| {
+        if (history.failure) |failure| return eth_proof.fail_history(call, failure);
+        return switch (err) {
+            error.WriteFailed => error.WriteFailed,
+            error.TraceFull => call.fail(rpc.code.server_error, "trace exceeds the trace buffers"),
+            else => call.fail(rpc.code.server_error, @errorName(err)),
+        };
+    };
 }
 
-fn write_one(
+/// A block re-execution: transactions up to `only` (or all of them), tracing `only` (or
+/// every one).
+const Run = struct {
+    env: *const node.executor.BlockEnv,
+    transactions: []const []const u8,
+    only: ?u32,
+};
+
+/// Re-executes the block, writing each traced transaction's result as soon as it has run
+/// (the recorder holds one transaction's frames at a time).
+fn execute(
+    executor: *node.executor.Executor,
+    run: Run,
+    recorder: *Recorder,
+    database: evm.state.Database,
     w: *json.Writer,
-    recorder: *const Recorder,
-    raw: []const u8,
-    index: u32,
-    ranges: Ranges,
     block: Block,
     options: Options,
-) json.Writer.WriteError!void {
-    const range: Range = .{ .first = ranges.first[index], .end = ranges.first[index + 1] };
-    const envelope = consensus.Envelope.decode(raw) catch unreachable; // Executed.
-    const top: TopGas = .{ .limit = envelope.gas_limit(), .used = ranges.gas[index] };
-    const locator: flat_call.Locator = .{
-        .block_hash = block.hash,
-        .block_number = block.number,
-        .transaction_hash = primitives.keccak256(raw).bytes,
-        .transaction_position = index,
-    };
-    try write_frames(w, recorder, range, top, locator, options);
+) !void {
+    const session = executor.session_begin(database);
+    defer executor.session_end(session);
+    try executor.recover_all(run.transactions);
+    var building = try executor.begin_block(run.env);
+    const tracer = recorder.tracer();
+    defer executor.machine.tracer = null;
+    defer executor.known_sender = null;
+    if (run.only == null) try w.begin_array();
+    for (run.transactions, 0..) |raw, index| {
+        const traced = run.only == null or run.only.? == index;
+        recorder.begin_transaction(@intCast(index));
+        executor.machine.tracer = if (traced) &tracer else null;
+        executor.known_sender = executor.senders[index];
+        const before = building.gas_used;
+        try executor.apply(&building, raw);
+        if (!traced) continue;
+        if (recorder.full) return error.TraceFull;
+        const envelope = consensus.Envelope.decode(raw) catch unreachable; // Applied.
+        const top: TopGas = .{ .limit = envelope.gas_limit(), .used = building.gas_used - before };
+        const hash = primitives.keccak256(raw).bytes;
+        const locator: flat_call.Locator = .{
+            .block_hash = block.hash,
+            .block_number = block.number,
+            .transaction_hash = hash,
+            .transaction_position = @intCast(index),
+        };
+        if (run.only == null) {
+            try w.begin_object();
+            try w.key("txHash");
+            try w.data(&hash);
+            try w.key("result");
+        }
+        const range: Range = .{ .first = 0, .end = recorder.frame_count };
+        try write_frames(w, recorder, range, top, locator, options);
+        if (run.only == null) try w.end_object();
+    }
+    if (run.only == null) try w.end_array();
 }
+
+/// The traced block's hash (computed for flatCallTracer only) and number.
+const Block = struct { hash: Hash, number: u64 };
 
 /// A transaction's frames in the recorder: `first..end`.
 pub const Range = struct { first: u32, end: u32 };
@@ -1207,8 +1195,9 @@ fn trace_call_prestate(
     try prestate.write(call.writer, &collected, options.diff_mode);
 }
 
-/// prestateTracer over a stored block: each traced transaction's result is staged in
-/// scratch as it executes (the state moves on), then written in one piece.
+/// prestateTracer over a stored block: each traced transaction's result is written into
+/// the response as soon as it has run (the state moves on); a failure later rewinds the
+/// whole response.
 fn trace_prestate(
     api: *Api,
     call: *Call,
@@ -1219,11 +1208,8 @@ fn trace_prestate(
     history: *node.HistoryDatabase,
     space: []u8,
 ) HandlerError!void {
-    const half = space.len / 2;
-    var collected = prestate.Collected.init(space[0..half]) orelse
+    var collected = prestate.Collected.init(space) orelse
         return call.fail(rpc.code.internal_error, "scratch too small");
-    var staging: std.Io.Writer = .fixed(space[half..]);
-    var staged: json.Writer = .init(&staging);
     const executor = api.chain.executor;
     run_prestate(
         executor,
@@ -1232,19 +1218,17 @@ fn trace_prestate(
         only,
         options,
         &collected,
-        &staged,
+        call.writer,
         history.database(),
     ) catch |err| {
         if (history.failure) |failure| return eth_proof.fail_history(call, failure);
-        const too_large = "trace exceeds the trace buffers";
         return switch (err) {
-            error.WriteFailed => call.fail(rpc.code.server_error, too_large),
-            error.TraceFull => call.fail(rpc.code.server_error, too_large),
+            error.WriteFailed => error.WriteFailed,
+            error.TraceFull => call.fail(rpc.code.server_error, "trace exceeds the trace buffers"),
             error.StateReadFailed => call.fail(rpc.code.internal_error, "state read failed"),
             else => call.fail(rpc.code.server_error, @errorName(err)),
         };
     };
-    try call.writer.raw(staging.buffered());
 }
 
 fn run_prestate(

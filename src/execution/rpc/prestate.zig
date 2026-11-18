@@ -56,9 +56,7 @@ pub const SlotEntry = struct {
 };
 
 const Snapshot = std.AutoHashMapUnmanaged(Address, evm.state.AccountInfo);
-
-/// Distinct frame addresses remembered per transaction; more mark the result `full`.
-pub const frames_max = 512;
+const FrameSet = std.AutoHashMapUnmanaged(Address, void);
 
 pub const Collected = struct {
     accounts: []AccountEntry,
@@ -73,26 +71,36 @@ pub const Collected = struct {
     full: bool = false,
     /// The database failed while reading a pre-state.
     failed: bool = false,
-    /// Addresses that ran as call frames (from and to) in the traced transaction.
-    frames: [frames_max]Address = undefined,
-    frame_count: u32 = 0,
+    /// Addresses that ran as call frames (from and to) in the traced transaction, at most
+    /// `frames_max` (as many as account entries).
+    frames: FrameSet = .empty,
+    frames_max: u32 = 0,
 
-    /// Carves the collector out of `space`; null when it is too small.
+    /// Carves the collector out of `space` (left untouched until used); null when it is too
+    /// small. An eighth each goes to accounts and slots, a quarter to the snapshot of the
+    /// cached accounts, the frame set takes what its accounts' worth of entries need, and
+    /// the rest holds the accounts' code.
     pub fn init(space: []u8) ?Collected {
-        var fixed: std.heap.FixedBufferAllocator = .init(space);
-        const allocator = fixed.allocator();
-        const accounts = allocator.alloc(AccountEntry, space.len / 8 / @sizeOf(AccountEntry)) catch
-            return null;
-        const slots = allocator.alloc(SlotEntry, space.len / 8 / @sizeOf(SlotEntry)) catch
-            return null;
-        const snapshot_space = allocator.alloc(u8, space.len / 2) catch return null;
-        const bytes = allocator.alloc(u8, space.len - fixed.end_index) catch return null;
+        const carve = @import("trace.zig").carve;
+        var used: usize = 0;
+        const account_count = space.len / 8 / @sizeOf(AccountEntry);
+        const accounts = carve(AccountEntry, space, &used, account_count) orelse return null;
+        const slot_count = space.len / 8 / @sizeOf(SlotEntry);
+        const slots = carve(SlotEntry, space, &used, slot_count) orelse return null;
+        const snapshot_space = carve(u8, space, &used, space.len / 4) orelse return null;
         if (accounts.len == 0 or slots.len == 0) return null;
+        // A hash map entry is its key and a metadata byte, at most 80% full.
+        const frames_space = carve(u8, space, &used, accounts.len * 2 * 32) orelse return null;
+        var fixed: std.heap.FixedBufferAllocator = .init(frames_space);
+        var frames: FrameSet = .empty;
+        frames.ensureTotalCapacity(fixed.allocator(), @intCast(accounts.len)) catch return null;
         return .{
             .accounts = accounts,
             .slots = slots,
-            .bytes = bytes,
+            .bytes = space[used..],
             .snapshot_space = snapshot_space,
+            .frames = frames,
+            .frames_max = @intCast(accounts.len),
         };
     }
 
@@ -100,7 +108,7 @@ pub const Collected = struct {
     pub fn take_snapshot(collected: *Collected, state: *const evm.State) void {
         var fixed: std.heap.FixedBufferAllocator = .init(collected.snapshot_space);
         collected.snapshot = .empty;
-        collected.frame_count = 0;
+        collected.frames.clearRetainingCapacity();
         const count = state.accounts.count();
         collected.snapshot.ensureTotalCapacity(fixed.allocator(), count) catch {
             collected.full = true;
@@ -124,12 +132,21 @@ pub const Collected = struct {
         return out;
     }
 
+    /// The account's fields with its code copied, unless `same` already holds that code.
     fn info_of(
         collected: *Collected,
         state: *State,
         info: evm.state.AccountInfo,
         exists: bool,
+        same: ?*const Info,
     ) Info {
+        if (same) |other| if (std.mem.eql(u8, &other.code_hash, &info.code_hash)) return .{
+            .balance = info.balance,
+            .nonce = info.nonce,
+            .code_hash = info.code_hash,
+            .code = other.code,
+            .exists = exists and !info.is_empty(),
+        };
         const code: []const u8 = if (info.code) |code| code else if (info.has_code())
             state.database.code_by_hash(info.code_hash) catch blk: {
                 collected.failed = true;
@@ -157,7 +174,7 @@ pub const Collected = struct {
             const account = item.value_ptr;
             const pre = collected.pre_of(state, account.address);
             const post_exists = !account.self_destructed;
-            const post = collected.info_of(state, account.info, post_exists);
+            const post = collected.info_of(state, account.info, post_exists, &pre);
             const framed = collected.is_frame(&account.address);
             if (account.warm_tx != tx_id and !framed and !info_changed(&pre, &post)) continue;
             if (collected.account_count == collected.accounts.len) {
@@ -176,12 +193,14 @@ pub const Collected = struct {
     }
 
     fn pre_of(collected: *Collected, state: *State, address: Address) Info {
-        if (collected.snapshot.get(address)) |info| return collected.info_of(state, info, true);
+        if (collected.snapshot.get(address)) |info| {
+            return collected.info_of(state, info, true, null);
+        }
         const found = state.database.basic(address) catch {
             collected.failed = true;
             return .{};
         };
-        return collected.info_of(state, found orelse .{}, found != null);
+        return collected.info_of(state, found orelse .{}, found != null, null);
     }
 
     fn collect_slots(collected: *Collected, state: *State) void {
@@ -207,20 +226,16 @@ pub const Collected = struct {
     }
 
     fn is_frame(collected: *const Collected, address: *const Address) bool {
-        for (collected.frames[0..collected.frame_count]) |*frame| {
-            if (std.mem.eql(u8, frame, address)) return true;
-        }
-        return false;
+        return collected.frames.contains(address.*);
     }
 
     fn note_frame(collected: *Collected, address: Address) void {
         if (collected.is_frame(&address)) return;
-        if (collected.frame_count == frames_max) {
+        if (collected.frames.count() == collected.frames_max) {
             collected.full = true;
             return;
         }
-        collected.frames[collected.frame_count] = address;
-        collected.frame_count += 1;
+        collected.frames.putAssumeCapacity(address, {});
     }
 
     /// The evm hook recording frame addresses; attach it for the traced transaction.

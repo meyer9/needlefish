@@ -31,9 +31,18 @@ pub const code = struct {
     pub const invalid_payload_attributes: i32 = -38003;
     pub const too_large_request: i32 = -38004;
     pub const unsupported_fork: i32 = -38005;
+    /// jsonrpsee: a response past the server's size bound ("Response is too big").
+    pub const oversized_response: i32 = -32008;
+    /// jsonrpsee: a batch response past the bound ("The batch response was too large").
+    pub const oversized_batch_response: i32 = -32011;
 };
 
 pub const batch_size_max = 100;
+
+/// The largest response, as reth's default `--rpc.max-response-size` (160 MiB): a server
+/// sizes its output to it, and a response that does not fit fails as jsonrpsee's oversized
+/// response, whose data names this bound.
+pub const response_bytes_max: u32 = 160 << 20;
 
 /// The fields of one request object. Slices point into the request body.
 pub const Request = struct {
@@ -292,7 +301,7 @@ pub fn Router(comptime Context: type, comptime methods: []const Method(Context))
 
         fn handle_batch(context: Context, scanner: *json.Scanner, out: *std.Io.Writer) Outcome {
             const start = out.end;
-            out.writeByte('[') catch return overflow(out, start);
+            out.writeByte('[') catch return oversized_batch(out, start);
             var count: u32 = 0;
             var responses: u32 = 0;
             while (count <= batch_size_max) : (count += 1) {
@@ -303,7 +312,7 @@ pub fn Router(comptime Context: type, comptime methods: []const Method(Context))
                     return write_bare_error(out, code.too_large_request);
                 }
                 const mark = out.end;
-                if (responses > 0) out.writeByte(',') catch return overflow(out, start);
+                if (responses > 0) out.writeByte(',') catch return oversized_batch(out, start);
                 const outcome = if (element.tag == .object_begin)
                     handle_single(context, scanner, out)
                 else blk: {
@@ -320,7 +329,7 @@ pub fn Router(comptime Context: type, comptime methods: []const Method(Context))
                 out.end = start;
                 return .empty;
             }
-            out.writeByte(']') catch return overflow(out, start);
+            out.writeByte(']') catch return oversized_batch(out, start);
             return .response;
         }
 
@@ -372,13 +381,16 @@ pub fn Router(comptime Context: type, comptime methods: []const Method(Context))
         ) DispatchError!void {
             inline for (methods) |method| {
                 if (std.mem.eql(u8, request.method, method.name)) {
-                    var writer = json.Writer.init(out);
+                    var growing: Growing = .init(out);
+                    var writer = json.Writer.init(&growing.writer);
                     var call: Call = .{
                         .method = request.method,
                         .params = Params.init(request.params) catch return error.InvalidParams,
                         .writer = &writer,
                     };
-                    method.handler(context, &call) catch |err| {
+                    const result = method.handler(context, &call);
+                    growing.finish();
+                    result catch |err| {
                         failure.error_code = call.error_code;
                         failure.message = call.error_message;
                         failure.data = call.error_data;
@@ -401,10 +413,14 @@ pub fn Router(comptime Context: type, comptime methods: []const Method(Context))
             const error_code: i32, const message: []const u8 = switch (err) {
                 error.MethodNotFound => .{ code.method_not_found, "method not found" },
                 error.InvalidParams => .{ code.invalid_params, "invalid params" },
-                error.WriteFailed => .{ code.internal_error, "response too large" },
+                error.WriteFailed => .{ code.oversized_response, "Response is too big" },
                 error.Failed => .{ failure.error_code, failure.message },
             };
             if (id.len == 0) return .empty; // Notifications get no reply, even on error.
+            if (err == error.WriteFailed) {
+                write_oversized(out, id, error_code, message) catch return overflow(out, out.end);
+                return .response;
+            }
             const data = if (err == error.Failed) failure.data else &.{};
             const start = out.end;
             write_error_data(out, id, error_code, message, data) catch {
@@ -509,6 +525,89 @@ pub const Outcome = enum {
     response,
     /// Only notifications (or nothing fit): send no body (HTTP 204, no WebSocket frame).
     empty,
+};
+
+/// jsonrpsee's oversized response error: its data names the bound as a string.
+fn write_oversized(
+    out: *std.Io.Writer,
+    id: []const u8,
+    error_code: i32,
+    message: []const u8,
+) std.Io.Writer.Error!void {
+    assert(error_code == code.oversized_response or error_code == code.oversized_batch_response);
+    try out.writeAll("{\"jsonrpc\":\"2.0\",\"id\":");
+    try out.writeAll(if (id.len == 0) "null" else id);
+    try out.print(",\"error\":{{\"code\":{d},\"message\":\"{s}\",", .{ error_code, message });
+    try out.print("\"data\":\"Exceeded max limit of {d}\"}}}}", .{response_bytes_max});
+}
+
+/// jsonrpsee `reject_too_big_batch_response`: the whole batch is answered by one error.
+fn oversized_batch(out: *std.Io.Writer, start: usize) Outcome {
+    out.end = start;
+    const message = "The batch response was too large";
+    const error_code = code.oversized_batch_response;
+    write_oversized(out, "", error_code, message) catch return overflow(out, start);
+    return .response;
+}
+
+/// A writer over `inner`'s own buffer that asks `inner` for room (`rebase`, as
+/// `ensureUnusedCapacity` does) when a write does not fit, so a handler's plain writes grow
+/// a response as far as `inner` allows: an HTTP response moves into a large send buffer
+/// once (`http.ResponseBuilder`), a fixed writer fails as before. The two share the bytes
+/// and their offsets; `finish` hands the end back to `inner`.
+const Growing = struct {
+    inner: *std.Io.Writer,
+    writer: std.Io.Writer,
+
+    const vtable: std.Io.Writer.VTable = .{
+        .drain = drain,
+        .flush = std.Io.Writer.noopFlush,
+        .rebase = rebase,
+    };
+
+    fn init(inner: *std.Io.Writer) Growing {
+        return .{
+            .inner = inner,
+            .writer = .{ .vtable = &vtable, .buffer = inner.buffer, .end = inner.end },
+        };
+    }
+
+    fn finish(growing: *Growing) void {
+        assert(growing.writer.buffer.ptr == growing.inner.buffer.ptr);
+        assert(growing.writer.end <= growing.inner.buffer.len);
+        growing.inner.end = growing.writer.end;
+    }
+
+    fn rebase(writer: *std.Io.Writer, preserve: usize, capacity: usize) std.Io.Writer.Error!void {
+        const growing: *Growing = @alignCast(@fieldParentPtr("writer", writer));
+        growing.inner.end = writer.end;
+        try growing.inner.rebase(preserve, capacity);
+        writer.buffer = growing.inner.buffer;
+        writer.end = growing.inner.end;
+        assert(writer.buffer.len - writer.end >= capacity);
+    }
+
+    /// Makes room for all of `data` (the last slice `splat` times), then copies it.
+    fn drain(
+        writer: *std.Io.Writer,
+        data: []const []const u8,
+        splat: usize,
+    ) std.Io.Writer.Error!usize {
+        if (data.len == 0) return 0;
+        const pattern = data[data.len - 1];
+        var total = std.math.mul(usize, pattern.len, splat) catch return error.WriteFailed;
+        for (data[0 .. data.len - 1]) |bytes| total +|= bytes.len;
+        try rebase(writer, writer.end, total);
+        for (data[0 .. data.len - 1]) |bytes| {
+            @memcpy(writer.buffer[writer.end..][0..bytes.len], bytes);
+            writer.end += bytes.len;
+        }
+        for (0..splat) |_| {
+            @memcpy(writer.buffer[writer.end..][0..pattern.len], pattern);
+            writer.end += pattern.len;
+        }
+        return total;
+    }
 };
 
 fn overflow(out: *std.Io.Writer, start: usize) Outcome {

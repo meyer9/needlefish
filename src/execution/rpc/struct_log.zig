@@ -10,10 +10,9 @@
 //! `returnValue`) comes from its top frame's outcome once it ends, so its head is built in
 //! the fragment and slid in front of the logs. The fragment, slots and output are carved
 //! from scratch at the start; a full one marks the logger `full` and the request fails.
-//! The response bounds the logs: the first entry that does not fit asks the writer for
-//! room (`ensureUnusedCapacity`), which moves an HTTP response into a large send buffer
-//! once (`http.ResponseBuilder`); an entry past that marks the logger `overflow`, and the
-//! request fails as a response too large.
+//! The response bounds the logs: the RPC router's writer grows it (an HTTP response moves
+//! into a large send buffer once, `rpc.response_bytes_max`); an entry past that marks the
+//! logger `overflow`, and the request fails as an oversized response.
 //!
 //! revm-inspectors semantics kept here:
 //!   - `gas` is the frame's gas before the instruction, `gasCost` what it left the frame
@@ -63,11 +62,6 @@ const Pending = struct {
 /// Frames open at once: the call depth bound and the SELFDESTRUCT pseudo-frame.
 const open_max = 1026;
 
-/// A struct log entry's bytes beyond its fragment and storage: `pc`, `op`, `gas`,
-/// `gasCost`, `depth`, `error`, `refund` and the punctuation.
-const entry_fields_max = 512;
-/// One `storage` member: two quoted 32-byte hex words, a colon and a comma.
-const slot_entry_max = 2 * (2 + 2 + 64) + 2;
 /// The result head's bytes beyond its hex output.
 const head_fields_max = 128;
 
@@ -105,13 +99,12 @@ pub const Logger = struct {
     /// Carves the logger's buffers out of `space`, writing to `out`; null when `space` is
     /// too small. The fragment takes most: a step's memory is its largest part.
     pub fn init(space: []u8, config: Config, out: *std.Io.Writer) ?Logger {
-        var fixed: std.heap.FixedBufferAllocator = .init(space);
-        const allocator = fixed.allocator();
-        const slots = allocator.alloc(Slot, space.len / 16 / @sizeOf(Slot)) catch return null;
-        const output = allocator.alloc(u8, space.len / 8) catch return null;
-        const fragment = allocator.alloc(u8, space.len - fixed.end_index) catch return null;
+        const carve = @import("trace.zig").carve;
+        var used: usize = 0;
+        const slots = carve(Slot, space, &used, space.len / 16 / @sizeOf(Slot)) orelse return null;
+        const output = carve(u8, space, &used, space.len / 8) orelse return null;
+        const fragment = space[used..];
         if (slots.len == 0 or fragment.len < 1024) return null;
-        assert(fixed.end_index == space.len);
         // The result head (hex output and a few fields) is built in the fragment.
         assert(fragment.len >= 2 * output.len + head_fields_max);
         return .{
@@ -313,24 +306,13 @@ pub const Logger = struct {
         assert(logger.slot_count <= logger.slots.len);
     }
 
-    /// Appends the instruction's entry to the response, asking it for room once when the
-    /// entry does not fit; marks the logger `overflow` when it still does not.
+    /// Appends the instruction's entry to the response; marks the logger `overflow` when
+    /// the response has no room left (it grows on its own as far as it can).
     fn write_log(logger: *Logger, frame: *const evm.evm.Frame, result: StepResult) void {
-        const out = logger.out;
-        const start = out.end;
+        const start = logger.out.end;
         logger.write_entry(frame, result) catch {
-            out.end = start;
-            // Entries are bounded by their fixed fields, the fragment and the slots.
-            const slot_bytes = @as(usize, logger.slot_count) * slot_entry_max;
-            const bound = entry_fields_max + logger.fragment.end + slot_bytes;
-            out.ensureUnusedCapacity(bound) catch {
-                logger.overflow = true;
-                return;
-            };
-            logger.write_entry(frame, result) catch {
-                out.end = start;
-                logger.overflow = true;
-            };
+            logger.out.end = start;
+            logger.overflow = true;
         };
     }
 
