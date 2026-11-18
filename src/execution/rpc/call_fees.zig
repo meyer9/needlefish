@@ -79,7 +79,7 @@ fn count_blob_hashes(scanner: *json.Scanner, first: json.Token) HandlerError!u32
         const token = scanner.next() catch return error.InvalidParams;
         if (token.tag == .array_end) return count;
         if (token.tag != .string) return error.InvalidParams;
-        _ = json.parse_fixed(32, token.bytes) catch return error.InvalidParams;
+        _ = json.parse_hash(token.bytes) catch return error.InvalidParams;
     }
     return error.InvalidParams;
 }

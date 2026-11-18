@@ -550,12 +550,11 @@ fn canonical_header(api: *Api, number: u64) ?consensus.Header {
 }
 
 /// Resolves a block parameter (tag, number, bare hash, or `{"blockHash": ...}`) to a
-/// hash.
+/// hash. Nethermind's `BlockParameterConverter` reads every block parameter this way, the
+/// block-number ones included.
 pub fn resolve_block(api: *Api, call: *Call, raw: []const u8) HandlerError!Hash {
     if (raw.len == 2 + 2 + 64 and raw[0] == '"') {
-        const hash = json.parse_fixed(32, raw[1 .. raw.len - 1]) catch {
-            return error.InvalidParams;
-        };
+        const hash = json.parse_hash(raw[1 .. raw.len - 1]) catch return error.InvalidParams;
         if (api.chain.store.ref(hash) == null) {
             return call.fail(rpc.code.server_error, "block not found");
         }
@@ -564,16 +563,6 @@ pub fn resolve_block(api: *Api, call: *Call, raw: []const u8) HandlerError!Hash 
     if (raw.len > 0 and raw[0] == '{') {
         return resolve_block_object(api, call, raw);
     }
-    const number = try resolve_number(api, call, raw);
-    return api.chain.store.canonical_hash(number) orelse {
-        return call.fail(rpc.code.server_error, "block not found");
-    };
-}
-
-/// Resolves a `BlockNumberOrTag` parameter (tag or number; a hash or block object is
-/// invalid params, as alloy deserializes it) to a canonical hash.
-pub fn resolve_numbered(api: *Api, call: *Call, raw: []const u8) HandlerError!Hash {
-    if (raw.len > 0 and raw[0] == '{') return error.InvalidParams;
     const number = try resolve_number(api, call, raw);
     return api.chain.store.canonical_hash(number) orelse {
         return call.fail(rpc.code.server_error, "block not found");
@@ -599,7 +588,7 @@ fn resolve_block_object(api: *Api, call: *Call, raw: []const u8) HandlerError!Ha
         if (value.tag != .string) return error.InvalidParams;
         if (hash != null or number != null) return error.InvalidParams;
         if (std.mem.eql(u8, name.bytes, "blockHash")) {
-            hash = json.parse_fixed(32, value.bytes) catch return error.InvalidParams;
+            hash = json.parse_hash(value.bytes) catch return error.InvalidParams;
         } else if (std.mem.eql(u8, name.bytes, "blockNumber")) {
             number = value.bytes;
         } else return error.InvalidParams;
@@ -618,6 +607,8 @@ fn resolve_block_object(api: *Api, call: *Call, raw: []const u8) HandlerError!Ha
 }
 
 fn resolve_number(api: *Api, call: *Call, raw: []const u8) HandlerError!u64 {
+    // Nethermind reads a null block parameter as latest.
+    if (std.mem.eql(u8, raw, "null")) return head_header(api).number;
     if (raw.len < 2 or raw[0] != '"' or raw[raw.len - 1] != '"') return error.InvalidParams;
     return resolve_number_text(api, call, raw[1 .. raw.len - 1]);
 }
@@ -631,9 +622,11 @@ fn resolve_number_text(api: *Api, call: *Call, text: []const u8) HandlerError!u6
     return number;
 }
 
-/// A block tag or hex number, without quotes; a number may lie beyond the head.
+/// A block tag or hex number, without quotes; a number may lie beyond the head. The empty
+/// string is latest, as Nethermind reads it.
 fn number_of_tag(api: *Api, text: []const u8) HandlerError!u64 {
     const head = head_header(api).number;
+    if (text.len == 0) return head;
     if (std.mem.eql(u8, text, "latest") or std.mem.eql(u8, text, "pending")) return head;
     if (std.mem.eql(u8, text, "earliest")) return api.chain.genesis_number;
     if (std.mem.eql(u8, text, "safe") or std.mem.eql(u8, text, "finalized")) {
@@ -673,7 +666,7 @@ fn block_size(record: node.chain.Record) usize {
 fn get_block_by_number(api: *Api, call: *Call) HandlerError!void {
     const raw = try call.params.raw();
     const full = try call.params.absent_or_boolean() orelse false;
-    const hash = resolve_numbered(api, call, raw) catch |err| switch (err) {
+    const hash = resolve_block(api, call, raw) catch |err| switch (err) {
         error.Failed => return call.writer.null_value(),
         else => return err,
     };
@@ -681,7 +674,7 @@ fn get_block_by_number(api: *Api, call: *Call) HandlerError!void {
 }
 
 fn get_block_by_hash(api: *Api, call: *Call) HandlerError!void {
-    const hash = try call.params.fixed(32);
+    const hash = try call.params.hash();
     const full = try call.params.absent_or_boolean() orelse false;
     try write_block(api, call, hash, full);
 }
@@ -689,7 +682,7 @@ fn get_block_by_hash(api: *Api, call: *Call) HandlerError!void {
 // ---- Transactions and receipts ----------------------------------------------------
 
 fn get_transaction_by_hash(api: *Api, call: *Call) HandlerError!void {
-    const tx_hash = try call.params.fixed(32);
+    const tx_hash = try call.params.hash();
     try call.params.finish();
     const recoverer = api.chain.executor.recoverer;
     if (api.chain.find_transaction(tx_hash)) |location| {
@@ -719,7 +712,7 @@ fn nth_transaction(record: node.chain.Record, index: u32) []const u8 {
 }
 
 fn get_transaction_receipt(api: *Api, call: *Call) HandlerError!void {
-    const tx_hash = try call.params.fixed(32);
+    const tx_hash = try call.params.hash();
     try call.params.finish();
     if (!try write_receipt(api, call.writer, tx_hash)) try call.writer.null_value();
 }
@@ -897,7 +890,7 @@ fn parse_blob_hashes(
         if (token.tag == .array_end) break;
         if (token.tag != .string) return error.InvalidParams;
         if (start + (count + 1) * 32 > space.len) return error.InvalidParams;
-        space[start + count * 32 ..][0..32].* = json.parse_fixed(32, token.bytes) catch
+        space[start + count * 32 ..][0..32].* = json.parse_hash(token.bytes) catch
             return error.InvalidParams;
     }
     used.* = start + count * 32;
@@ -907,9 +900,10 @@ fn parse_blob_hashes(
 
 const Authorization = evm.transaction.Authorization;
 
-/// A request's EIP-7702 authorizations (alloy's `SignedAuthorization`: `chainId`, `address`,
-/// `nonce`, `yParity` (alias `v`), `r` and `s`, all required), with each authority recovered
-/// as a transaction's are; stored in `space` after `used`.
+/// A request's EIP-7702 authorizations (`chainId`, `address`, `nonce` and `yParity` (alias
+/// `v`) required; `r` and `s` zero when absent, as Nethermind's `RpcAuthTuple` defaults
+/// them), with each authority recovered as a transaction's are (none for a zero
+/// signature); stored in `space` after `used`.
 fn parse_authorizations(
     scanner: *json.Scanner,
     first: json.Token,
@@ -965,22 +959,26 @@ pub fn signed_authorization(
             break;
         } else scanner.skip(value) catch return error.InvalidParams;
     }
-    for (fields) |field| if (field == null) return error.InvalidParams;
+    for (fields[0..4]) |field| if (field == null) return error.InvalidParams;
     const quantity = json.parse_quantity;
+    const r = if (fields[4]) |text| quantity(u256, text) catch return error.InvalidParams else 0;
+    const s = if (fields[5]) |text| quantity(u256, text) catch return error.InvalidParams else 0;
+    assert(fields[4] != null or r == 0);
     return .{
         .chain_id = quantity(u256, fields[0].?) catch return error.InvalidParams,
         .address = .{ .bytes = json.parse_fixed(20, fields[1].?) catch return error.InvalidParams },
         .nonce = quantity(u64, fields[2].?) catch return error.InvalidParams,
         .y_parity = quantity(u8, fields[3].?) catch return error.InvalidParams,
-        .r = quantity(u256, fields[4].?) catch return error.InvalidParams,
-        .s = quantity(u256, fields[5].?) catch return error.InvalidParams,
+        .r = r,
+        .s = s,
     };
 }
 
 const AccessListItem = evm.transaction.AccessListItem;
 
-/// A request's EIP-2930 access list (alloy's `AccessList`: every item needs `address` and
-/// `storageKeys`), stored in `space` after `used`. Counted on a copy of the scanner first.
+/// A request's EIP-2930 access list (Nethermind's `AccessListForRpc`: every item needs
+/// `address`; `storageKeys` may be absent or null, and each key is `0x` and 1 to 64 hex
+/// digits), stored in `space` after `used`. Counted on a copy of the scanner first.
 fn parse_access_list(
     scanner: *json.Scanner,
     first: json.Token,
@@ -1029,7 +1027,7 @@ fn access_list_item(
     if (open.tag == .array_end) return null;
     if (open.tag != .object_begin) return error.InvalidParams;
     var address: ?[20]u8 = null;
-    var count: ?usize = null;
+    var count: usize = 0;
     while (true) {
         const name = try scanner_next(scanner);
         if (name.tag == .object_end) break;
@@ -1039,19 +1037,21 @@ fn access_list_item(
             if (value.tag != .string) return error.InvalidParams;
             address = json.parse_fixed(20, value.bytes) catch return error.InvalidParams;
         } else if (std.mem.eql(u8, name.bytes, "storageKeys")) {
+            if (value.tag == .null) continue;
             if (value.tag != .array_begin) return error.InvalidParams;
             var index: usize = 0;
             while (true) : (index += 1) {
                 const key = try scanner_next(scanner);
                 if (key.tag == .array_end) break;
                 if (key.tag != .string) return error.InvalidParams;
-                const bytes = json.parse_fixed(32, key.bytes) catch return error.InvalidParams;
+                const bytes = eth_proof.parse_slot_key(key.bytes) orelse
+                    return error.InvalidParams;
                 if (keys) |out| out[index] = bytes;
             }
             count = index;
         } else scanner.skip(value) catch return error.InvalidParams;
     }
-    const keys_count = count orelse return error.InvalidParams;
+    const keys_count = count;
     if (item) |out| out.* = .{
         .address = address orelse return error.InvalidParams,
         .storage_keys = keys.?[0..keys_count],
@@ -1427,6 +1427,7 @@ fn simulate_in(
 }
 
 fn eth_call(api: *Api, call: *Call) HandlerError!void {
+    try refuse_deposit(call);
     if (try eip8130_request(api, call, .call)) return;
     var request = try parse_call_request(api, call);
     request.forecast = true;
@@ -1445,6 +1446,23 @@ fn eth_call(api: *Api, call: *Call) HandlerError!void {
     }
 }
 
+/// Nethermind binds the request of eth_call, eth_estimateGas and eth_createAccessList as a
+/// `SignableTransactionForRpc`, which refuses a deposit (`type` 0x7e) before the call runs
+/// (-32602 "invalid argument 0"). Params are left untouched.
+pub fn refuse_deposit(call: *Call) HandlerError!void {
+    var peek = call.params;
+    const call_raw = try peek.raw();
+    const value = (json.find_path(call_raw, &.{"type"}) catch return error.InvalidParams) orelse
+        return;
+    // Any other malformed `type` is refused by `parse_call`.
+    if (value.len < 2 or value[0] != '"' or value[value.len - 1] != '"') return;
+    const tx_type = json.parse_quantity(u8, value[1 .. value.len - 1]) catch return;
+    if (tx_type == deposit_tx_type) return call.fail(rpc.code.invalid_params, "invalid argument 0");
+    assert(tx_type != deposit_tx_type);
+}
+
+const deposit_tx_type: u8 = 0x7e;
+
 /// Serves an EIP-8130 request (`eip8130_call`); false (params untouched) for a plain one.
 fn eip8130_request(
     api: *Api,
@@ -1461,6 +1479,7 @@ fn eip8130_request(
 
 /// reth's estimate (`estimate.zig`).
 fn estimate_gas(api: *Api, call: *Call) HandlerError!void {
+    try refuse_deposit(call);
     if (try eip8130_request(api, call, .estimate)) return;
     var request = try parse_call_request(api, call);
     request.forecast = true;
@@ -1509,7 +1528,7 @@ pub const Filter = struct {
 fn parse_hashes(scanner: *json.Scanner, first: json.Token, out: [][32]u8) HandlerError!u32 {
     if (first.tag == .null) return 0;
     if (first.tag == .string) {
-        out[0] = json.parse_fixed(32, first.bytes) catch return error.InvalidParams;
+        out[0] = json.parse_hash(first.bytes) catch return error.InvalidParams;
         return 1;
     }
     if (first.tag != .array_begin) return error.InvalidParams;
@@ -1518,7 +1537,7 @@ fn parse_hashes(scanner: *json.Scanner, first: json.Token, out: [][32]u8) Handle
         const token = try scanner_next(scanner);
         if (token.tag == .array_end) return count;
         if (count == out.len or token.tag != .string) return error.InvalidParams;
-        out[count] = json.parse_fixed(32, token.bytes) catch return error.InvalidParams;
+        out[count] = json.parse_hash(token.bytes) catch return error.InvalidParams;
         count += 1;
     }
 }
@@ -1545,7 +1564,7 @@ pub fn parse_filter(api: *Api, raw: []const u8) HandlerError!Filter {
             if (name.bytes[0] == 'f') filter.from = number else filter.to = number;
             if (name.bytes[0] == 't') filter.to_given = std.mem.startsWith(u8, value.bytes, "0x");
         } else if (std.mem.eql(u8, name.bytes, "blockHash")) {
-            filter.block_hash = json.parse_fixed(32, value.bytes) catch return error.InvalidParams;
+            filter.block_hash = json.parse_hash(value.bytes) catch return error.InvalidParams;
         } else if (std.mem.eql(u8, name.bytes, "address")) {
             filter.address_count = try parse_addresses(&scanner, value, &filter.addresses);
         } else if (std.mem.eql(u8, name.bytes, "topics")) {

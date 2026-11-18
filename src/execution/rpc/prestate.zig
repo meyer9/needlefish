@@ -15,6 +15,8 @@
 //! not empty before the transaction, with every slot read; diff mode follows
 //! `geth_prestate_diff_traces`: only changed accounts and changed non-zero slots, `pre`
 //! without created accounts, `post` without destroyed ones and with only changed fields.
+//! As Nethermind's tracer, an account also gets its `codeHash`, and every EIP-7702 authority
+//! with a valid signature is looked up, its authorization valid or not.
 
 const std = @import("std");
 const assert = std.debug.assert;
@@ -85,6 +87,9 @@ pub const Collected = struct {
     full: bool = false,
     /// The database failed while reading a pre-state.
     failed: bool = false,
+    /// The traced call's EIP-7702 authorizations (debug_traceCall), whose recoverable
+    /// authorities are listed even when the authorization is invalid.
+    authorities: []const evm.transaction.Authorization = &.{},
 
     /// Carves the collector out of `space` (left untouched until used); null when it is too
     /// small. An eighth each goes to accounts and slots, a quarter to the snapshot of the
@@ -190,6 +195,39 @@ pub const Collected = struct {
         sort(collected);
     }
 
+    /// Lists an EIP-7702 authority the transaction did not load (its authorization was
+    /// invalid: another chain id, a nonce of 2^64 - 1), as Nethermind's tracer lists every
+    /// authority with a valid signature. Call after `collect`; keeps the address order.
+    pub fn add_authority(collected: *Collected, state: *State, address: Address) void {
+        const accounts = collected.accounts[0..collected.account_count];
+        var position: usize = 0;
+        while (position < accounts.len) : (position += 1) {
+            switch (std.mem.order(u8, &accounts[position].address, &address)) {
+                .lt => continue,
+                .eq => return,
+                .gt => break,
+            }
+        }
+        if (collected.account_count == collected.accounts.len) {
+            collected.full = true;
+            return;
+        }
+        const pre = collected.pre_of(state, address);
+        const post = if (state.accounts.get(address)) |account|
+            collected.info_of(state, account.info, &pre)
+        else
+            pre;
+        const count = collected.account_count;
+        std.mem.copyBackwards(
+            AccountEntry,
+            collected.accounts[position + 1 .. count + 1],
+            collected.accounts[position..count],
+        );
+        collected.accounts[position] = .{ .address = address, .pre = pre, .post = post };
+        collected.account_count += 1;
+        assert(collected.account_count <= collected.accounts.len);
+    }
+
     fn pre_of(collected: *Collected, state: *State, address: Address) Info {
         if (collected.snapshot.get(address)) |info| {
             return collected.info_of(state, info, null);
@@ -236,6 +274,10 @@ pub const Collected = struct {
     fn run_inspect(context: *anyopaque, state: *State) void {
         const collected: *Collected = @ptrCast(@alignCast(context));
         collected.collect(state);
+        for (collected.authorities) |authorization| {
+            const authority = authorization.authority orelse continue;
+            collected.add_authority(state, authority);
+        }
     }
 };
 
@@ -295,7 +337,8 @@ fn write_slots(
 }
 
 /// Writes one account. A diff's `post` keeps only the fields that differ from `pre`
-/// (alloy `remove_matching_account_info`); a zero nonce and empty code are never written.
+/// (alloy `remove_matching_account_info`); a zero nonce and empty code are never written,
+/// and `codeHash` follows the code as Nethermind writes it.
 fn write_account(
     w: *json.Writer,
     entry: *const AccountEntry,
@@ -320,8 +363,21 @@ fn write_account(
         try w.key("code");
         try w.data(info.code);
     }
+    if (code_hash_listed(entry, side, config)) {
+        try w.key("codeHash");
+        try w.data(&info.code_hash);
+    }
     if (config.storage) try write_slots(w, slots, side, config.diff);
     try w.end_object();
+}
+
+/// Nethermind's `codeHash` (`disableCode` or not): an account with code lists its hash, and
+/// a diff's `post` lists the hash whenever it changed (the empty-code hash included).
+fn code_hash_listed(entry: *const AccountEntry, side: Side, config: Config) bool {
+    if (config.diff and side == .post) return !same_code(entry);
+    const info = if (side == .pre) &entry.pre else &entry.post;
+    return !std.mem.eql(u8, &info.code_hash, &evm.primitives.keccak_empty) and
+        !std.mem.eql(u8, &info.code_hash, &@as(Hash, @splat(0)));
 }
 
 fn same_code(entry: *const AccountEntry) bool {
@@ -335,7 +391,8 @@ fn diff_keeps(entry: *const AccountEntry, slots: []const SlotEntry, config: Conf
     if (config.storage) {
         for (slots) |slot| if (slot.pre != slot.post) return true;
     }
-    if (config.code and !same_code(entry)) return true;
+    // A changed code hash is a change even under `disableCode` (Nethermind's `codeHash`).
+    if (!same_code(entry)) return true;
     return entry.pre.balance != entry.post.balance or entry.pre.nonce != entry.post.nonce;
 }
 
@@ -544,4 +601,40 @@ test "prestate: modes follow revm-inspectors' geth_prestate_traces" {
     const bare_diff = try write_text(&collected, .{ .diff = true, .storage = false }, &out);
     try testing.expect(std.mem.indexOf(u8, bare_diff, "storage") == null);
     try testing.expect(std.mem.indexOf(u8, bare_diff, "\"nonce\":2") != null);
+}
+
+test "prestate: codeHash follows Nethermind's tracer" {
+    const code = [_]u8{0x00};
+    const code_hash: Hash = @splat(0xbc);
+    var accounts = [_]AccountEntry{
+        // Code kept: its hash is listed in the default mode and a diff's pre, never in post.
+        .{
+            .address = @splat(5),
+            .pre = .{ .balance = 1, .code_hash = code_hash, .code = &code },
+            .post = .{ .balance = 2, .code_hash = code_hash, .code = &code },
+        },
+        // Code installed: a diff's post lists the new hash, even under `disableCode`.
+        .{
+            .address = @splat(6),
+            .pre = .{ .balance = 3 },
+            .post = .{ .balance = 3, .code_hash = code_hash, .code = &code },
+        },
+    };
+    const collected: Collected = .{
+        .accounts = &accounts,
+        .account_count = accounts.len,
+        .slots = &.{},
+        .bytes = &.{},
+        .snapshot_space = &.{},
+    };
+    const hash_text = "\"codeHash\":\"0x" ++ "bcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbc" ++
+        "bcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbc\"";
+    var out: [2048]u8 = undefined;
+    const plain = try write_text(&collected, .{}, &out);
+    try testing.expectEqualStrings("{" ++ address_5 ++ ":{\"balance\":\"0x1\",\"code\":\"0x00\"," ++
+        hash_text ++ "}," ++ address_6 ++ ":{\"balance\":\"0x3\"}}", plain);
+    const diff = try write_text(&collected, .{ .diff = true, .code = false }, &out);
+    try testing.expectEqualStrings("{\"pre\":{" ++ address_5 ++ ":{\"balance\":\"0x1\"," ++
+        hash_text ++ "}," ++ address_6 ++ ":{\"balance\":\"0x3\"}},\"post\":{" ++ address_5 ++
+        ":{\"balance\":\"0x2\"}," ++ address_6 ++ ":{" ++ hash_text ++ "}}}", diff);
 }

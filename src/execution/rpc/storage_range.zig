@@ -81,7 +81,7 @@ pub fn start_key(bytes: []const u8) ?[32]u8 {
 }
 
 fn storage_range_at(api: *Api, call: *Call) HandlerError!void {
-    const block_hash = try call.params.fixed(32);
+    const block_hash = try call.params.hash();
     const transaction_index = try call.params.quantity(u64);
     const address = try call.params.fixed(20);
     var start_bytes: [64]u8 = undefined;

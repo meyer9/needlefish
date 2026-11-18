@@ -679,7 +679,7 @@ fn options_or_refuse(call: *Call, deferred: Deferred) HandlerError!Options {
 }
 
 fn trace_transaction(api: *Api, call: *Call) HandlerError!void {
-    const tx_hash = try call.params.fixed(32);
+    const tx_hash = try call.params.hash();
     const deferred = try options_deferred(try call.params.optional_raw());
     try call.params.finish();
     const location = api.chain.find_transaction(tx_hash) orelse {
@@ -693,15 +693,20 @@ fn trace_block_by_number(api: *Api, call: *Call) HandlerError!void {
     const raw = try call.params.raw();
     const deferred = try options_deferred(try call.params.optional_raw());
     try call.params.finish();
-    const hash = eth.resolve_numbered(api, call, raw) catch |err| switch (err) {
+    // Nethermind: the pending block is the head's alias, not a next-block candidate.
+    if (std.mem.eql(u8, raw, "\"pending\"")) {
+        return call.fail(rpc.code.server_error, "pending block is not available");
+    }
+    const hash = eth.resolve_block(api, call, raw) catch |err| switch (err) {
         error.Failed => return call.fail(rpc.code.server_error, "block not found"),
         else => return err,
     };
+    assert(api.chain.store.ref(hash) != null);
     try trace(api, call, hash, null, try options_or_refuse(call, deferred));
 }
 
 fn trace_block_by_hash(api: *Api, call: *Call) HandlerError!void {
-    const hash = try call.params.fixed(32);
+    const hash = try call.params.hash();
     const deferred = try options_deferred(try call.params.optional_raw());
     try call.params.finish();
     if (api.chain.record(hash) == null) return call.fail(rpc.code.server_error, "block not found");
@@ -1181,6 +1186,7 @@ fn trace_call_prestate(
     var collected = prestate.Collected.init(space) orelse
         return call.fail(rpc.code.internal_error, "scratch too small");
     var request = request_in;
+    collected.authorities = request.message.authorization_list orelse &.{};
     request.message.inspect = collected.inspect();
     switch (try eth.simulate(api, call, request)) {
         .invalid => |reason| return eth.fail_invalid(call, reason),
@@ -1259,6 +1265,7 @@ fn run_prestate(
         try executor.apply(&building, raw);
         if (!traced) continue;
         collected.collect(executor.state);
+        add_authorities(collected, executor, raw);
         if (collected.full) return error.TraceFull;
         if (collected.failed) return error.StateReadFailed;
         if (only == null) {
@@ -1271,6 +1278,24 @@ fn run_prestate(
         if (only == null) try w.end_object();
     }
     if (only == null) try w.end_array();
+}
+
+/// Lists the recoverable authorities of a stored EIP-7702 transaction (Nethermind's
+/// prestateTracer lists them even when their authorization was invalid).
+fn add_authorities(
+    collected: *prestate.Collected,
+    executor: *node.executor.Executor,
+    raw: []const u8,
+) void {
+    const envelope = consensus.Envelope.decode(raw) catch unreachable; // Stored by the chain.
+    if (envelope != .eip7702) return;
+    var authorizations = envelope.eip7702.tx.authorization_list.iterator();
+    var count: u32 = 0;
+    while (authorizations.next()) |authorization| : (count += 1) {
+        const authority = authorization.recover_authority(executor.recoverer) orelse continue;
+        collected.add_authority(executor.state, authority.bytes);
+    }
+    assert(count == envelope.eip7702.tx.authorization_list.count);
 }
 
 /// The struct logger over a stored block: each traced transaction's logs stream into the

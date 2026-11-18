@@ -533,9 +533,7 @@ fn apply_account_field(
     } else if (std.mem.eql(u8, field.key, "nonce")) {
         try state.set_nonce(account, try quantity_of(u64, field.value));
     } else if (std.mem.eql(u8, field.key, "code")) {
-        const code = json.parse_data(try string_of(field.value), space) catch
-            return error.InvalidParams;
-        try state.replace_code(account, code);
+        try state.replace_code(account, try parse_code(try string_of(field.value), space));
     } else if (std.mem.eql(u8, field.key, "state")) {
         // Fresh storage incarnation: database slots read as zero (never committed).
         account.storage_epoch += 1;
@@ -549,11 +547,35 @@ fn apply_account_field(
     } else return error.InvalidParams;
 }
 
+/// Override code as Nethermind's `ByteArrayConverter` reads it: an odd digit count decodes
+/// with a leading zero nibble (`0x601` is `0x0601`).
+fn parse_code(text: []const u8, space: []u8) OverrideError![]const u8 {
+    const odd = text.len > 2 and (text.len - 2) % 2 == 1;
+    if (!odd) return json.parse_data(text, space) catch error.InvalidParams;
+    if (text[0] != '0' or (text[1] != 'x' and text[1] != 'X')) return error.InvalidParams;
+    const size = (text.len - 2 + 1) / 2;
+    if (size > space.len) return error.InvalidParams;
+    space[0] = std.fmt.charToDigit(text[2], 16) catch return error.InvalidParams;
+    const rest = std.fmt.hexToBytes(space[1..size], text[3..]) catch return error.InvalidParams;
+    assert(rest.len + 1 == size);
+    return space[0..size];
+}
+
+test "simulate: override code with an odd digit count gets a leading zero nibble" {
+    var space: [4]u8 = undefined;
+    try std.testing.expectEqualSlices(u8, &.{ 0x06, 0x01 }, try parse_code("0x601", &space));
+    try std.testing.expectEqualSlices(u8, &.{0x0f}, try parse_code("0xf", &space));
+    try std.testing.expectEqualSlices(u8, &.{ 0x60, 0x01 }, try parse_code("0x6001", &space));
+    try std.testing.expectError(error.InvalidParams, parse_code("0x60g", &space));
+    try std.testing.expectError(error.InvalidParams, parse_code("0x123456789", &space));
+}
+
 fn write_slots(state: *evm.State, account: *evm.state.Account, raw: []const u8) OverrideError!void {
     var slots = try Members.init(raw);
     while (try slots.next(slots_max)) |slot| {
-        const key = json.parse_fixed(32, slot.key) catch return error.InvalidParams;
-        const value = json.parse_fixed(32, try string_of(slot.value)) catch
+        // Nethermind reads a slot key as a `UInt256` (`0x1` is slot one), a value as a hash.
+        const key = eth_proof.parse_slot_key(slot.key) orelse return error.InvalidParams;
+        const value = json.parse_hash(try string_of(slot.value)) catch
             return error.InvalidParams;
         const access = try state.storage_access(account, std.mem.readInt(u256, &key, .big));
         try state.storage_write(account, access.slot, std.mem.readInt(u256, &value, .big));
@@ -768,7 +790,11 @@ fn fail_invalid(
 ) HandlerError {
     const call = simulation.call;
     const buffer = simulation.space;
-    switch (reason) {
+    // Nethermind buys the gas (the balance check) before it checks the nonce.
+    const nonce_wrong = reason == .nonce_too_low or reason == .nonce_too_high;
+    const effective: evm.transaction.Invalid = if (nonce_wrong and
+        message.validate and sender.balance < cost_of(message)) .insufficient_funds else reason;
+    switch (effective) {
         .nonce_too_low => {
             const text = std.fmt.bufPrint(buffer, "nonce too low: next nonce {d}, tx nonce {d}", .{
                 sender.nonce, message.nonce orelse sender.nonce,
@@ -784,17 +810,23 @@ fn fail_invalid(
             return call.fail(code_intrinsic_gas, "intrinsic gas too low");
         },
         .insufficient_funds => {
-            const cost = @as(u512, message.gas.?) * message.gas_price + message.value;
             const text = std.fmt.bufPrint(
                 buffer,
                 "insufficient funds for gas * price + value: have {d} want {d}",
-                .{ sender.balance, cost },
+                .{ sender.balance, cost_of(message) },
             ) catch "insufficient funds for gas * price + value";
             return call.fail(code_insufficient_funds, text);
         },
         .initcode_too_large => return call.fail(code_initcode_size, "max initcode size exceeded"),
         else => return eth.fail_invalid(call, reason),
     }
+}
+
+/// What the sender must hold for the call: its gas at the gas price (the fee cap) plus value.
+fn cost_of(message: *const node.executor.Executor.Call) u512 {
+    const cost = @as(u512, message.gas.?) * message.gas_price + message.value;
+    assert(cost >= message.value);
+    return cost;
 }
 
 fn write_error(

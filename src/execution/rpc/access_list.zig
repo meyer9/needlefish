@@ -218,6 +218,7 @@ const Buffers = struct {
 const Executed = @FieldType(node.executor.Executor.Simulated, "executed");
 
 fn create_access_list(api: *Api, call: *Call) HandlerError!void {
+    try eth.refuse_deposit(call);
     var request = try eth.parse_call_request(api, call);
     // reth's third parameter: state overrides (no block overrides).
     const state_overrides = try call.params.optional_raw();

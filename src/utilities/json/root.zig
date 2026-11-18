@@ -433,6 +433,23 @@ pub fn parse_fixed(comptime N: usize, text: []const u8) (HexError || error{Inval
     return out;
 }
 
+/// Parses a 32-byte hash as Nethermind's strict `Hash256Converter` does: the prefix must be a
+/// lowercase `0x` (a capital `0X` is refused, unlike `parse_data`).
+pub fn parse_hash(text: []const u8) (HexError || error{InvalidLength})![32]u8 {
+    if (text.len >= 2 and text[1] == 'X') return error.MissingPrefix;
+    const hash = try parse_fixed(32, text);
+    assert(text[1] == 'x');
+    return hash;
+}
+
+test "json: parse_hash refuses a capital 0X prefix" {
+    const digits = "00000000000000000000000000000000000000000000000000000000000000ab";
+    const hash = try parse_hash("0x" ++ digits);
+    try std.testing.expectEqual(@as(u8, 0xab), hash[31]);
+    try std.testing.expectError(error.MissingPrefix, parse_hash("0X" ++ digits));
+    try std.testing.expectError(error.InvalidLength, parse_hash("0xab"));
+}
+
 const hex_digits = "0123456789abcdef";
 
 /// Formats a QUANTITY into `buffer` (no quotes). Returns the slice.

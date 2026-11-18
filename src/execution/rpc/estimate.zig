@@ -75,9 +75,18 @@ pub fn estimate(api: *Api, call: *Call, request: *const eth.CallRequest) Handler
     context.template.check_callee = true;
     const first = try context.run(highest, if (prices.gas_price > 0) .allowance else .none);
     context.template.check_callee = false;
-    if (prices.gas_price > 0) highest = @min(highest, context.last.allowance.?);
+    const allowance = context.last.allowance;
+    if (prices.gas_price > 0) highest = @min(highest, allowance.?);
+    // Nethermind (as geth) runs the transfer shortcut with the balance checked, so a
+    // transfer whose fee (gasPrice or maxFeePerGas) the sender cannot fund fails on to
+    // "gas required exceeds allowance".
+    const fee_given = request.fees.gas_price != null or request.fees.max_fee != null;
+    const affordable = prices.gas_price == 0 or !fee_given or
+        (allowance orelse 0) >= min_transaction_gas;
     const message = &context.message;
-    if (message.data.len == 0 and message.to != null and !context.last.callee_code) {
+    if (affordable and message.data.len == 0 and message.to != null and
+        !context.last.callee_code)
+    {
         switch (try context.run(@min(min_transaction_gas, gas_max), .none)) {
             .invalid => {},
             .executed => |executed| if (executed.success) return executed.gas_used,

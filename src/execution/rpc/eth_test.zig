@@ -697,9 +697,15 @@ test "eth: eth_simulateV1 call errors and validation" {
     try expect_failure(h, "eth_simulateV1", validated ++ "}]}]}]", "-38012", low_fee);
     const priced = validated ++ ",\"maxFeePerGas\":\"0x10000000000\"";
     const nonce = priced ++ ",\"nonce\":\"0x5\"}]}]}]";
-    try expect_failure(h, "eth_simulateV1", nonce, "-38011", "nonce too high\"}");
     const funds = "insufficient funds for gas * price + value: have 0 want ";
     try expect_failure(h, "eth_simulateV1", priced ++ "}]}]}]", "-38014", funds);
+    // As Nethermind, the balance is checked before the nonce.
+    try expect_failure(h, "eth_simulateV1", nonce, "-38014", funds);
+    const funded = "[{\"validation\":true,\"blockStateCalls\":[{\"stateOverrides\":{" ++
+        poor_sender ++ ":{\"balance\":\"0xffffffffffffffffffff\"}},\"calls\":[{\"from\":" ++
+        poor_sender ++ ",\"to\":" ++ address_target ++ ",\"maxFeePerGas\":\"0x10000000000\"";
+    const funded_nonce = funded ++ ",\"nonce\":\"0x5\"}]}]}]";
+    try expect_failure(h, "eth_simulateV1", funded_nonce, "-38011", "nonce too high\"}");
 }
 
 /// Reverts with `Error("nope")`: CODECOPY the 100 bytes after the 10-byte prefix, REVERT.
@@ -1199,9 +1205,11 @@ test "eth: a call request's access list is charged and warms its entries" {
         "\"result\":\"0x6b99\"",
         try h.request("eth_estimateGas", "[{\"input\":\"0x\"," ++ listed ++ "," ++ to ++ "}]"),
     );
-    // alloy requires both fields of an item.
+    // Nethermind requires an item's address, not its keys.
     const keyless = "[{\"accessList\":[{" ++ item_address ++ "}]}]";
-    try expect_contains(try h.request("eth_estimateGas", keyless), "-32602");
+    try expect_contains(try h.request("eth_estimateGas", keyless), "\"result\":\"0x");
+    const addressless = "[{\"accessList\":[{\"storageKeys\":[]}]}]";
+    try expect_contains(try h.request("eth_estimateGas", addressless), "-32602");
 }
 
 /// A call to code returning TIMESTAMP and NUMBER, the override installing it, and the
@@ -1272,7 +1280,7 @@ test "eth: a call request's authorizations are charged as a type-4 transaction" 
     const listed = try h.request("eth_createAccessList", "[{\"authorizationList\":[" ++
         authorization ++ "]," ++ to ++ "}]");
     try expect_contains(listed, "\"gasUsed\":\"0xb3b0\"");
-    // Every field is required.
+    // Every field but r and s (zero when absent, as Nethermind) is required.
     const partial = "[{\"authorizationList\":[{\"address\":" ++
         "\"0x0000000000000000000000000000000000000004\"}]," ++ to ++ "}]";
     try expect_contains(try h.request("eth_createAccessList", partial), "-32602");
@@ -1294,11 +1302,11 @@ test "eth: request fields parse as base/base's serde types" {
     try expect_contains(try h.request_runtime(both), "-32602");
     const open_end = "[{\"fromBlock\":\"latest\",\"toBlock\":null}]";
     try expect_contains(try h.request("eth_getLogs", open_end), "\"result\":[");
-    // A block number parameter is not a hash.
+    // A block number parameter reads a hash as that block (Nethermind's BlockParameter).
     const by_hash_format = request_prefix_format ++
         "eth_getBlockByNumber\",\"params\":[\"{s}\",false]}}";
     const by_hash = try std.fmt.bufPrint(&body, by_hash_format, .{&hash});
-    try expect_contains(try h.request_runtime(by_hash), "-32602");
+    try expect_contains(try h.request_runtime(by_hash), "\"number\":\"0x1\"");
     // eth_call ignores movePrecompileToAddress (only eth_simulateV1 applies it).
     const moved = "[{},\"latest\",{\"0x0000000000000000000000000000000000000001\":" ++
         "{\"movePrecompileToAddress\":\"0x8fe1cc26a5cc6c3299bc42ffe394466911fc0dea\"}}]";
@@ -1331,6 +1339,100 @@ test "eth: request fields parse as base/base's serde types" {
     // `JsonStorageKey` reads a bare 0x as slot zero.
     const proof = "[\"0x4200000000000000000000000000000000000007\",[\"0x\"],\"latest\"]";
     try expect_contains(try h.request("eth_getProof", proof), "\"storageProof\":[{");
+}
+
+test "eth: block parameters and indexes read as Nethermind's converters" {
+    const h = try Harness.create();
+    defer h.destroy();
+    var tx_buffer: [256]u8 = undefined;
+    try fixture.submit(h.node, 1, 0, 5, &tx_buffer);
+    const hash = try h.mine(12);
+    var body: [512]u8 = undefined;
+    // A hash names its block in a block-number parameter; "" and null read as latest.
+    const count_format = request_prefix_format ++
+        "eth_getBlockTransactionCountByNumber\",\"params\":[\"0x{x}\"]}}";
+    const count = try std.fmt.bufPrint(&body, count_format, .{&hash.bytes});
+    try expect_contains(try h.request_runtime(count), "\"result\":\"0x1\"}");
+    const at_format = request_prefix_format ++
+        "eth_getTransactionByBlockNumberAndIndex\",\"params\":[\"0x{x}\",\"0x0\"]}}";
+    const at = try std.fmt.bufPrint(&body, at_format, .{&hash.bytes});
+    try expect_contains(try h.request_runtime(at), "\"transactionIndex\":\"0x0\"");
+    for ([_][]const u8{ "[\"\",false]", "[null,false]" }) |params| {
+        const latest_format = request_prefix_format ++ "eth_getBlockByNumber\",\"params\":{s}}}";
+        const latest = try std.fmt.bufPrint(&body, latest_format, .{params});
+        try expect_contains(try h.request_runtime(latest), "\"number\":\"0x1\"");
+    }
+    // An index of 2^64 or more is past the end (Nethermind reads a `UInt256`).
+    const wide = "\"0x10000000000000000\"";
+    inline for (.{
+        "eth_getTransactionByBlockNumberAndIndex",
+        "eth_getRawTransactionByBlockNumberAndIndex",
+        "eth_getUncleByBlockNumberAndIndex",
+    }) |method| {
+        const past = try h.request(method, "[\"latest\"," ++ wide ++ "]");
+        try testing.expectEqualStrings("\"result\":null", past);
+    }
+    const by_hash_format = request_prefix_format ++
+        "eth_getTransactionByBlockHashAndIndex\",\"params\":[\"0x{x}\"," ++ wide ++ "]}}";
+    const by_hash = try std.fmt.bufPrint(&body, by_hash_format, .{&hash.bytes});
+    try expect_contains(try h.request_runtime(by_hash), "\"result\":null}");
+    // A capital 0X hash is refused.
+    for ([_][]const u8{ "eth_getBlockByHash", "eth_getBlockByNumber" }) |method| {
+        const capital_format = request_prefix_format ++ "{s}\",\"params\":[\"0X{x}\",false]}}";
+        const capital = try std.fmt.bufPrint(&body, capital_format, .{ method, &hash.bytes });
+        try expect_contains(try h.request_runtime(capital), "-32602");
+    }
+    // debug_traceBlockByNumber has no pending block.
+    const pending = try h.request("debug_traceBlockByNumber", "[\"pending\"]");
+    try expect_contains(pending, "{\"code\":-32000,\"message\":\"pending block is not available\"");
+}
+
+test "eth: call requests read as Nethermind's transaction converters" {
+    const h = try Harness.create();
+    defer h.destroy();
+    // Access list keys of any digit count, items without `storageKeys`.
+    const listed = "[{\"to\":" ++ address_target ++ ",\"accessList\":[{\"address\":" ++
+        address_target ++ ",\"storageKeys\":[\"0x1\",\"0xabc\"]},{\"address\":" ++
+        address_one ++ "},{\"address\":" ++ address_one ++ ",\"storageKeys\":null}]}]";
+    try testing.expectEqualStrings("\"result\":\"0x\"", try h.request("eth_call", listed));
+    const bare_key = "[{\"to\":" ++ address_target ++ ",\"accessList\":[{\"address\":" ++
+        address_target ++ ",\"storageKeys\":[\"0x\"]}]}]";
+    try expect_contains(try h.request("eth_call", bare_key), "-32602");
+    // An authorization without r and s has a zero signature (no authority).
+    const unsigned = "[{\"to\":" ++ address_target ++ ",\"authorizationList\":[{" ++
+        "\"chainId\":\"0x2105\",\"address\":" ++ address_one ++ ",\"nonce\":\"0x0\"," ++
+        "\"yParity\":\"0x0\"}]}]";
+    try testing.expectEqualStrings("\"result\":\"0x\"", try h.request("eth_call", unsigned));
+    // Override slot keys are numbers; override code of an odd digit count has a leading
+    // zero nibble (0x0 is STOP).
+    const slot_reader = "[{\"to\":" ++ override_target ++ "},\"latest\",{" ++ override_target ++
+        ":{\"code\":\"0x60015460005260206000f3\",\"stateDiff\":{\"0x1\":\"0x" ++ zero_word ++
+        "ff\"}}}]";
+    try expect_contains(try h.request("eth_call", slot_reader), "ff\"");
+    const odd_code = "[{\"to\":" ++ override_target ++ "},\"latest\",{" ++ override_target ++
+        ":{\"code\":\"0x0\"}}]";
+    try testing.expectEqualStrings("\"result\":\"0x\"", try h.request("eth_call", odd_code));
+    // Call data stays strict: an odd digit count is refused, as Nethermind's input.
+    const odd_input = "[{\"to\":" ++ address_target ++ ",\"input\":\"0x123\"}]";
+    try expect_contains(try h.request("eth_call", odd_input), "-32602");
+    // A deposit is no signable request; debug_traceCall still takes one.
+    const deposit = "[{\"to\":" ++ address_target ++ ",\"type\":\"0x7e\"}]";
+    const refused = "{\"code\":-32602,\"message\":\"invalid argument 0\"";
+    try expect_contains(try h.request("eth_call", deposit), refused);
+    try expect_contains(try h.request("eth_estimateGas", deposit), refused);
+    try expect_contains(try h.request("eth_createAccessList", deposit), refused);
+    const traced = try h.request("debug_traceCall", "[{\"to\":" ++ address_target ++
+        ",\"type\":\"0x7e\"},\"latest\",{\"tracer\":\"callTracer\"}]");
+    try expect_contains(traced, "\"result\":{\"type\":\"CALL\"");
+    // A priced transfer from an unfunded sender exceeds its allowance (no 21000 shortcut).
+    const unfunded = "[{\"from\":" ++ poor_sender ++ ",\"to\":" ++ address_target;
+    const exceeds = "{\"code\":-32000,\"message\":\"gas required exceeds allowance (0)\"";
+    inline for (.{ "gasPrice", "maxFeePerGas" }) |field| {
+        const priced = unfunded ++ ",\"" ++ field ++ "\":\"0x10000000000\"}]";
+        try expect_contains(try h.request("eth_estimateGas", priced), exceeds);
+    }
+    const free = try h.request("eth_estimateGas", unfunded ++ "}]");
+    try testing.expectEqualStrings("\"result\":\"0x5208\"", free);
 }
 
 fn fuzz_body(h: *Harness, body: []const u8) !void {
@@ -2595,8 +2697,9 @@ test "eth: prestateTracer reports revm's loaded accounts as revm-inspectors does
     // A transaction without a tip still pays the coinbase (nothing), which revm loads.
     try expect_contains(traced, "\"0xfefefefefefefefefefefefefefefefefefefefe\":{\"balance\"");
     // The L1 fee parameters are read outside the EVM: no L1Block slot is listed.
+    // Nethermind lists an account's code hash next to its code.
     try expect_contains(traced, "\"0x4200000000000000000000000000000000000015\":{" ++
-        "\"balance\":\"0x1\",\"code\":\"0x00\"}");
+        "\"balance\":\"0x1\",\"code\":\"0x00\",\"codeHash\":" ++ code_hash_00 ++ "}");
     // A call charges no fee, yet credits the fee vaults; empty accounts are left out.
     const call = try h.request("debug_traceCall", "[{\"from\":" ++
         "\"0x7dc6c0165f09500b75146b66eec05a39dbbc40d2\",\"to\":" ++
@@ -2604,9 +2707,12 @@ test "eth: prestateTracer reports revm's loaded accounts as revm-inspectors does
         "\"prestateTracer\",\"tracerConfig\":{\"disableCode\":true}}]");
     try testing.expect(std.mem.startsWith(u8, call, "\"result\":{" ++
         "\"0x4200000000000000000000000000000000000019\":{\"balance\":\"0x"));
-    try testing.expect(std.mem.endsWith(u8, call, "\"}," ++
-        "\"0x420000000000000000000000000000000000001a\":{\"balance\":\"0x1\"}," ++
-        "\"0x420000000000000000000000000000000000001b\":{\"balance\":\"0x1\"}}"));
+    // `disableCode` keeps the code hash.
+    try testing.expect(std.mem.endsWith(u8, call, ",\"codeHash\":" ++ code_hash_00 ++ "}," ++
+        "\"0x420000000000000000000000000000000000001a\":{\"balance\":\"0x1\"," ++
+        "\"codeHash\":" ++ code_hash_00 ++ "}," ++
+        "\"0x420000000000000000000000000000000000001b\":{\"balance\":\"0x1\"," ++
+        "\"codeHash\":" ++ code_hash_00 ++ "}}"));
     try testing.expectEqual(@as(usize, 3), count_of(call, "balance"));
     // An overridden account the call never loads is not reported; the sender, empty
     // before, is in a diff's pre, and the account it creates only in post.
@@ -2618,6 +2724,41 @@ test "eth: prestateTracer reports revm's loaded accounts as revm-inspectors does
         "\"0x7dc6c0165f09500b75146b66eec05a39dbbc40d2\":{\"balance\":\"0x0\"}},\"post\":{" ++
         "\"0x5c7d5a7b707d05be9a3f8f28eb3099ed20e22f9f\":{\"nonce\":1}," ++
         "\"0x7dc6c0165f09500b75146b66eec05a39dbbc40d2\":{\"nonce\":1}}}", created);
+}
+
+/// keccak256(0x00), the code hash of the one-byte code `0x00`.
+const code_hash_00 = "\"0xbc36789e7a1e281436464229828f817d6612f7b477d66591ff96a9e064bcc98a\"";
+
+test "eth: prestateTracer lists an authority whose authorization is invalid" {
+    const h = try Harness.create();
+    defer h.destroy();
+    // Key 1's account (funded by the fixture) signs for chain 1: the authorization is
+    // skipped, yet Nethermind's tracer still looks the authority up.
+    var authorization: consensus.tx_fields.Authorization = .{
+        .chain_id = 1,
+        .address = .{ .bytes = @splat(0xcc) },
+        .nonce = 0,
+        .y_parity = 0,
+        .r = 0,
+        .s = 0,
+    };
+    const signature = try consensus.signature.sign(fixture.key(1), authorization.signing_hash());
+    authorization.y_parity = @intFromBool(signature.y_parity);
+    authorization.r = signature.r;
+    authorization.s = signature.s;
+    var body: [1024]u8 = undefined;
+    const format = request_prefix_format ++ "debug_traceCall\",\"params\":[{{\"to\":" ++
+        "\"0x00000000000000000000000000000000000000aa\",\"authorizationList\":[{{" ++
+        "\"chainId\":\"0x1\",\"address\":\"0x{x}\",\"nonce\":\"0x0\",\"yParity\":\"0x{x}\"," ++
+        "\"r\":\"0x{x}\",\"s\":\"0x{x}\"}}]}},\"latest\",{{\"tracer\":\"prestateTracer\"}}]}}";
+    const request = try std.fmt.bufPrint(&body, format, .{
+        &authorization.address.bytes,
+        authorization.y_parity,
+        authorization.r,
+        authorization.s,
+    });
+    const traced = try h.request_runtime(request);
+    try expect_contains(traced, "\"0x7e5f4552091a69125d5dfcb7b8c2659029395bdf\":{\"balance\"");
 }
 
 const override_target = "\"0x0000000000000000000000000000000000007777\"";
@@ -2692,10 +2833,10 @@ test "eth: eth_call, eth_estimateGas and eth_createAccessList report reth's call
         "(maxFeePerGas or maxPriorityFeePerGas) specified\"}");
     const poor = "[{\"from\":" ++ poor_sender ++ ",\"to\":" ++ override_target;
     const priced = poor ++ ",\"gasPrice\":\"0x1\"}]";
-    // A plain transfer takes reth's 21000 shortcut, which the allowance does not cap.
-    try expect_contains(try h.request("eth_estimateGas", priced), "\"result\":\"0x5208\"");
-    const priced_create = "[{\"from\":" ++ poor_sender ++ ",\"gasPrice\":\"0x1\"}]";
+    // As Nethermind (and geth), the 21000 transfer shortcut needs the sender to fund it.
     const allowance = "gas required exceeds allowance (0)\"}";
+    try expect_failure(h, "eth_estimateGas", priced, "-32000", allowance);
+    const priced_create = "[{\"from\":" ++ poor_sender ++ ",\"gasPrice\":\"0x1\"}]";
     try expect_failure(h, "eth_estimateGas", priced_create, "-32000", allowance);
     try expect_contains(try h.request("eth_call", poor ++ ",\"gasPrice\":\"0x1\"," ++
         "\"value\":\"0x1\"}]"), "{\"code\":-32003,\"message\":\"insufficient funds for gas * " ++

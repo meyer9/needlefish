@@ -188,6 +188,13 @@ pub const Params = struct {
         return json.parse_fixed(N, token.bytes) catch error.InvalidParams;
     }
 
+    /// A 32-byte hash param (`json.parse_hash`: a capital `0X` prefix is refused).
+    pub fn hash(params: *Params) ParamsError![32]u8 {
+        const token = try params.next_token() orelse return error.InvalidParams;
+        if (token.tag != .string) return error.InvalidParams;
+        return json.parse_hash(token.bytes) catch error.InvalidParams;
+    }
+
     /// A string param without escapes (method names, block tags like "latest").
     pub fn string(params: *Params) ParamsError![]const u8 {
         const token = try params.next_token() orelse return error.InvalidParams;

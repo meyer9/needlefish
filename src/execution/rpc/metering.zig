@@ -45,7 +45,7 @@ pub const bundle_transactions_max = 256;
 pub const bundle_base_fee_max: u64 = 5_000_000;
 
 fn meter_by_hash(api: *Api, call: *Call) HandlerError!void {
-    const hash = try call.params.fixed(32);
+    const hash = try call.params.hash();
     try call.params.finish();
     try meter(api, call, hash);
 }
@@ -53,7 +53,7 @@ fn meter_by_hash(api: *Api, call: *Call) HandlerError!void {
 fn meter_by_number(api: *Api, call: *Call) HandlerError!void {
     const raw = try call.params.raw();
     try call.params.finish();
-    const hash = eth.resolve_numbered(api, call, raw) catch |err| switch (err) {
+    const hash = eth.resolve_block(api, call, raw) catch |err| switch (err) {
         error.Failed => return call.fail(rpc.code.server_error, "block not found"),
         else => return err,
     };
