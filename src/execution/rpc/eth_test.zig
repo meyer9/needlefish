@@ -1931,6 +1931,110 @@ test "eth: debug_trace callTracer values follow revm-inspectors" {
     try testing.expectEqual(@as(usize, 2), count_of(text, "\"value\""));
 }
 
+test "eth: debug_trace tracerConfig fields are typed as alloy's config structs" {
+    const h = try Harness.create();
+    defer h.destroy();
+    try put_trace_contracts(h);
+    const head = "[{\"to\":" ++ counter_at ++ "},\"latest\",";
+    const invalid = "-32602";
+    const config = "invalid tracer config";
+    const prestate = "{\"tracer\":\"prestateTracer\",\"tracerConfig\":";
+    try expect_failure(h, "debug_traceCall", head ++
+        "{\"tracer\":\"callTracer\",\"tracerConfig\":{\"onlyTopCall\":[]}}]", invalid, config);
+    try expect_failure(h, "debug_traceCall", head ++
+        "{\"tracer\":\"callTracer\",\"tracerConfig\":{\"withLog\":1}}]", invalid, config);
+    const yes = prestate ++ "{\"diffMode\":\"yes\"}}]";
+    try expect_failure(h, "debug_traceCall", head ++ yes, invalid, config);
+    const object = prestate ++ "{\"diffMode\":{}}}]";
+    try expect_failure(h, "debug_traceCall", head ++ object, invalid, config);
+    const finalized = prestate ++ "{\"disableCode\":\"finalized\"}}]";
+    try expect_failure(h, "debug_traceCall", head ++ finalized, invalid, config);
+    const zero = prestate ++ "{\"disableStorage\":0}}]";
+    try expect_failure(h, "debug_traceCall", head ++ zero, invalid, config);
+    try expect_failure(h, "debug_traceCall", head ++ "{\"tracer\":\"flatCallTracer\"," ++
+        "\"tracerConfig\":{\"convertParityErrors\":\"no\"}}]", invalid, config);
+    try expect_failure(h, "debug_traceCall", head ++ "{\"tracer\":\"flatCallTracer\"," ++
+        "\"tracerConfig\":{\"includePrecompiles\":[true]}}]", invalid, config);
+    // A config that is no object (or an array longer than the struct) does not deserialize.
+    try expect_failure(h, "debug_traceCall", head ++
+        "{\"tracer\":\"callTracer\",\"tracerConfig\":5}]", invalid, config);
+    try expect_failure(h, "debug_traceCall", head ++
+        "{\"tracer\":\"callTracer\",\"tracerConfig\":[true,true,true]}]", invalid, config);
+    // Null reads as absent, unknown fields and other tracers' fields are ignored, an array
+    // fills the fields by position, and tracers without a config never read it.
+    const top = try h.request("debug_traceCall", head ++ "{\"tracer\":\"callTracer\"," ++
+        "\"tracerConfig\":{\"onlyTopCall\":null,\"diffMode\":\"yes\",\"other\":[]}}]");
+    try expect_contains(top, "\"type\":\"CALL\"");
+    const positional = try h.request("debug_traceCall", head ++
+        "{\"tracer\":\"callTracer\",\"tracerConfig\":[null,true]}]");
+    try expect_contains(positional, "\"logs\":[{");
+    try expect_contains(try h.request("debug_traceCall", head ++
+        "{\"tracer\":\"4byteTracer\",\"tracerConfig\":5}]"), "\"result\":{}");
+    // The struct logger's flags fail the params, as serde reads the whole options object.
+    try expect_failure(h, "debug_traceCall", head ++ "{\"debug\":\"x\"}]", invalid, "invalid");
+    try expect_failure(h, "debug_traceCall", head ++ "{\"timeout\":5}]", invalid, "invalid");
+    try expect_failure(h, "debug_traceCall", head ++ "{\"limit\":\"5\"}]", invalid, "invalid");
+    // A bad config is refused once the transaction is found, as reth builds its tracer.
+    const missing = "[\"0x" ++ zeros_62 ++ "01\",{\"tracer\":\"callTracer\",\"tracerConfig\":1}]";
+    try expect_failure(h, "debug_traceTransaction", missing, "-32000", "transaction not found");
+}
+
+test "eth: debug_traceCall without gas runs with the RPC gas cap" {
+    const h = try Harness.create();
+    defer h.destroy();
+    try put_trace_contracts(h);
+    // reth's `prepare_call_env`: the 50M cap, not the block's gas limit.
+    const tracer = "{\"tracer\":\"callTracer\"}]";
+    const bare = try h.request("debug_traceCall", "[{},\"latest\"," ++ tracer);
+    try expect_contains(bare, "\"gas\":\"0x2faf080\"");
+    const call = try h.request("debug_traceCall", "[{\"to\":" ++ counter_at ++ "}," ++
+        "\"latest\"," ++ tracer);
+    try expect_contains(call, "\"gas\":\"0x2faf080\"");
+    // A priced call without gas runs with what the caller can afford: 100000 wei at 1 wei.
+    const priced = try h.request("debug_traceCall", "[{\"from\":" ++ poor_sender ++
+        ",\"to\":" ++ counter_at ++ ",\"gasPrice\":\"0x1\"},\"latest\",{\"tracer\":" ++
+        "\"callTracer\",\"stateOverrides\":{" ++ poor_sender ++ ":{\"balance\":\"0x186a0\"}}}]");
+    try expect_contains(priced, "\"gas\":\"0x186a0\"");
+    // A given gas is kept.
+    const given = try h.request("debug_traceCall", "[{\"to\":" ++ counter_at ++
+        ",\"gas\":\"0x30d40\"},\"latest\"," ++ tracer);
+    try expect_contains(given, "\"gas\":\"0x30d40\"");
+}
+
+/// Routes `body` into a response that grows on demand, as an HTTP response moves into a
+/// large send buffer; returns the response (caller frees).
+fn request_growing(h: *Harness, body: []const u8) ![]u8 {
+    var allocating: std.Io.Writer.Allocating = .init(testing.allocator);
+    errdefer allocating.deinit();
+    _ = eth.Router.handle(&h.api, body, &allocating.writer);
+    return allocating.toOwnedSlice();
+}
+
+test "eth: debug_trace struct logs stream past the scratch into the response" {
+    const h = try Harness.create();
+    defer h.destroy();
+    // JUMPDEST; PUSH0; JUMP: 11 gas a turn. 79000 gas after the intrinsic is 7181 turns
+    // and a JUMP that runs out with 6 left: 21546 steps, megabytes of logs where the
+    // scratch holds 256 KiB.
+    const looper: [20]u8 = @splat(0x5a);
+    try h.node.db.put_account(looper, 0, 0, &.{ 0x5b, 0x5f, 0x56 });
+    const body = request_prefix ++ "debug_traceCall\",\"params\":[{\"to\":" ++
+        "\"0x5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a\",\"gas\":\"0x186a0\"},\"latest\"]}";
+    const text = try request_growing(h, body);
+    defer testing.allocator.free(text);
+    try json.validate(text);
+    try testing.expect(text.len > h.scratch.len);
+    try testing.expect(std.mem.startsWith(u8, text, "{\"jsonrpc\":\"2.0\",\"id\":1," ++
+        "\"result\":{\"failed\":true,\"gas\":100000,\"returnValue\":\"0x\",\"structLogs\":[{"));
+    try testing.expectEqual(@as(usize, 21546), count_of(text, "\"pc\":"));
+    try expect_contains(text, "{\"pc\":2,\"op\":\"JUMP\",\"gas\":6,\"gasCost\":6,\"depth\":1," ++
+        "\"error\":\"Some(OutOfGas)\",\"stack\":[\"0x0\"],\"refund\":0}]}}");
+    // A response that cannot grow past its buffer fails cleanly.
+    const too_large = try h.request_runtime(body);
+    try expect_contains(too_large, "{\"code\":-32603,\"message\":\"response too large\"}");
+    try testing.expect(h.node.chain.executor.machine.tracer == null);
+}
+
 test "eth: debug_trace 4byteTracer, noopTracer and flatCallTracer" {
     const h = try Harness.create();
     defer h.destroy();

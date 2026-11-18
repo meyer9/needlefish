@@ -385,11 +385,19 @@ pub const Options = struct {
     diff_mode: bool = false,
     /// flatCallTracer `includePrecompiles`.
     include_precompiles: bool = false,
+    /// Read and type checked as alloy's `PreStateConfig` and `FlatCallConfig` do; not
+    /// applied (prestateTracer always writes code and storage, flatCallTracer parity text).
+    disable_code: bool = false,
+    disable_storage: bool = false,
+    convert_parity_errors: bool = false,
     struct_log: struct_log.Config = .{},
 };
 
 pub const OptionsError = error{
     InvalidParams,
+    /// The selected tracer's `tracerConfig` does not deserialize into its config struct
+    /// (reth: `InvalidTracerConfig`, refused while tracing).
+    InvalidConfig,
     /// A built-in tracer reth serves that needlefish does not (muxTracer, erc7562Tracer,
     /// stateGasTracer).
     Unsupported,
@@ -406,6 +414,8 @@ const DefaultFlags = struct {
     disable_storage: ?bool = null,
     enable_return_data: ?bool = null,
     disable_return_data: ?bool = null,
+    /// Type checked only.
+    debug: ?bool = null,
     limit: u64 = 0,
 
     fn config(flags: DefaultFlags) struct_log.Config {
@@ -424,7 +434,9 @@ const DefaultFlags = struct {
 };
 
 /// Parses geth tracing options: `tracer`, its `tracerConfig`, and the struct logger's
-/// flags (absent options: the struct logger with its defaults).
+/// flags (absent options: the struct logger with its defaults). A malformed field fails
+/// first (serde rejects the whole object), then an unservable tracer, then a config that
+/// is not the selected tracer's (`InvalidConfig`).
 pub fn parse_options(raw: ?[]const u8) OptionsError!Options {
     var options: Options = .{};
     const text = raw orelse return options;
@@ -433,26 +445,51 @@ pub fn parse_options(raw: ?[]const u8) OptionsError!Options {
     if (first.tag == .null) return options;
     if (first.tag != .object_begin) return error.InvalidParams;
     var flags: DefaultFlags = .{};
+    var tracer: OptionsError!TracerKind = .struct_log;
+    var config: ?[]const u8 = null;
     while (true) {
         const name = scanner.next() catch return error.InvalidParams;
         if (name.tag == .object_end) break;
         if (name.tag != .string) return error.InvalidParams;
         const value = scanner.next() catch return error.InvalidParams;
+        const start = value_start(&scanner, value);
         if (std.mem.eql(u8, name.bytes, "tracer")) {
-            options.tracer = try tracer_of(value);
-        } else if (std.mem.eql(u8, name.bytes, "tracerConfig") and value.tag == .object_begin) {
-            try parse_config(&scanner, &options);
+            if (value.tag != .null and value.tag != .string) return error.InvalidParams;
+            tracer = tracer_of(value);
+        } else if (std.mem.eql(u8, name.bytes, "timeout")) {
+            if (value.tag != .null and value.tag != .string) return error.InvalidParams;
         } else if (!try parse_flag(&flags, name.bytes, value)) {
             scanner.skip(value) catch return error.InvalidParams;
+            if (std.mem.eql(u8, name.bytes, "tracerConfig")) {
+                config = text[start..scanner.offset()];
+            }
         }
     }
+    options.tracer = try tracer;
     options.struct_log = flags.config();
+    try parse_config(config, &options);
     return options;
+}
+
+/// Where the value whose first token is `value` starts in the scanner's input.
+fn value_start(scanner: *const json.Scanner, value: json.Token) u32 {
+    const input_start = @intFromPtr(scanner.input.ptr);
+    return switch (value.tag) {
+        .object_begin, .array_begin => scanner.offset() - 1,
+        .string => @intCast(@intFromPtr(value.bytes.ptr) - input_start - 1),
+        .number => @intCast(@intFromPtr(value.bytes.ptr) - input_start),
+        .true, .null => scanner.offset() - 4,
+        .false => scanner.offset() - 5,
+        .object_end, .array_end, .end => unreachable,
+    };
 }
 
 fn tracer_of(value: json.Token) OptionsError!TracerKind {
     if (value.tag == .null) return .struct_log;
-    if (value.tag != .string) return error.InvalidParams;
+    assert(value.tag == .string);
+    var buffer: [32]u8 = undefined;
+    // Longer than every built-in name: JavaScript.
+    const text = json.unescape(value, &buffer) catch return error.JsTracer;
     const names = [_]struct { []const u8, TracerKind }{
         .{ "", .struct_log },
         .{ "callTracer", .call },
@@ -461,9 +498,9 @@ fn tracer_of(value: json.Token) OptionsError!TracerKind {
         .{ "noopTracer", .noop },
         .{ "flatCallTracer", .flat_call },
     };
-    for (names) |entry| if (std.mem.eql(u8, value.bytes, entry[0])) return entry[1];
+    for (names) |entry| if (std.mem.eql(u8, text, entry[0])) return entry[1];
     const unsupported = [_][]const u8{ "muxTracer", "erc7562Tracer", "stateGasTracer" };
-    for (unsupported) |name| if (std.mem.eql(u8, value.bytes, name)) return error.Unsupported;
+    for (unsupported) |name| if (std.mem.eql(u8, text, name)) return error.Unsupported;
     return error.JsTracer;
 }
 
@@ -482,6 +519,7 @@ fn parse_flag(flags: *DefaultFlags, name: []const u8, value: json.Token) Options
         .{ "disableStorage", &flags.disable_storage },
         .{ "enableReturnData", &flags.enable_return_data },
         .{ "disableReturnData", &flags.disable_return_data },
+        .{ "debug", &flags.debug },
     };
     for (fields) |field| {
         if (!std.mem.eql(u8, name, field[0])) continue;
@@ -496,49 +534,126 @@ fn parse_flag(flags: *DefaultFlags, name: []const u8, value: json.Token) Options
     return false;
 }
 
-fn parse_config(scanner: *json.Scanner, options: *Options) error{InvalidParams}!void {
-    while (true) {
-        const name = scanner.next() catch return error.InvalidParams;
-        if (name.tag == .object_end) return;
-        if (name.tag != .string) return error.InvalidParams;
-        const value = scanner.next() catch return error.InvalidParams;
-        // A container value is skipped whole, so the next token read is a member name.
-        scanner.skip(value) catch return error.InvalidParams;
-        const flag = value.tag == .true;
-        if (std.mem.eql(u8, name.bytes, "onlyTopCall")) {
-            options.only_top_call = flag;
-        } else if (std.mem.eql(u8, name.bytes, "withLog")) {
-            options.with_logs = flag;
-        } else if (std.mem.eql(u8, name.bytes, "diffMode")) {
-            options.diff_mode = flag;
-        } else if (std.mem.eql(u8, name.bytes, "includePrecompiles")) {
-            options.include_precompiles = flag;
-        }
+/// The `Option<bool>` fields of the selected tracer's alloy config struct, in declaration
+/// order (a JSON array fills them by position); none for tracers that never read it.
+fn config_names(tracer: TracerKind) []const []const u8 {
+    return switch (tracer) {
+        .call => &.{ "onlyTopCall", "withLog" },
+        .prestate => &.{ "diffMode", "disableCode", "disableStorage" },
+        .flat_call => &.{ "convertParityErrors", "includePrecompiles" },
+        .struct_log, .four_byte, .noop => &.{},
+    };
+}
+
+/// Reads `tracerConfig` as serde reads the selected tracer's config from a JSON value:
+/// null is the default, an object sets the fields it names (others ignored, the last of a
+/// repeated one wins), an array sets them by position, and a field that is not a bool or
+/// null (or any other value) fails.
+fn parse_config(raw: ?[]const u8, options: *Options) OptionsError!void {
+    const names = config_names(options.tracer);
+    if (names.len == 0) return;
+    const text = raw orelse return;
+    const targets: [3]*bool = switch (options.tracer) {
+        .call => .{ &options.only_top_call, &options.with_logs, undefined },
+        .prestate => .{ &options.diff_mode, &options.disable_code, &options.disable_storage },
+        .flat_call => .{
+            &options.convert_parity_errors,
+            &options.include_precompiles,
+            undefined,
+        },
+        .struct_log, .four_byte, .noop => unreachable, // No config names.
+    };
+    var scanner = json.Scanner.init(text);
+    const first = scanner.next() catch return error.InvalidParams;
+    switch (first.tag) {
+        .null => {},
+        .object_begin => try config_object(&scanner, names, targets[0..names.len]),
+        .array_begin => try config_array(&scanner, targets[0..names.len]),
+        else => return error.InvalidConfig,
     }
 }
 
-fn options_of(call: *Call, raw: ?[]const u8) HandlerError!Options {
-    return options_or_refuse(call, try options_deferred(raw));
+fn config_object(
+    scanner: *json.Scanner,
+    names: []const []const u8,
+    targets: []const *bool,
+) OptionsError!void {
+    assert(names.len == targets.len);
+    // Every member takes at least one byte.
+    var members: u32 = 0;
+    while (members <= scanner.input.len) : (members += 1) {
+        const name = scanner.next() catch return error.InvalidParams;
+        if (name.tag == .object_end) return;
+        assert(name.tag == .string);
+        const value = scanner.next() catch return error.InvalidParams;
+        var buffer: [32]u8 = undefined;
+        // Longer than every field name: ignored.
+        const text = json.unescape(name, &buffer) catch "";
+        const index = for (names, 0..) |field, index| {
+            if (std.mem.eql(u8, text, field)) break index;
+        } else null;
+        if (index) |field| {
+            targets[field].* = try config_bool(value);
+        } else {
+            scanner.skip(value) catch return error.InvalidParams;
+        }
+    }
+    unreachable;
+}
+
+fn config_array(scanner: *json.Scanner, targets: []const *bool) OptionsError!void {
+    assert(targets.len > 0);
+    for (0..targets.len + 1) |index| {
+        const value = scanner.next() catch return error.InvalidParams;
+        if (value.tag == .array_end) return;
+        // serde: "invalid length", more elements than the struct has fields.
+        if (index == targets.len) return error.InvalidConfig;
+        targets[index].* = try config_bool(value);
+    }
+    unreachable;
+}
+
+/// An `Option<bool>` config field: null reads as absent (false).
+fn config_bool(value: json.Token) OptionsError!bool {
+    return switch (value.tag) {
+        .true => true,
+        .false, .null => false,
+        else => error.InvalidConfig,
+    };
 }
 
 /// Trace options, or the refusal of a tracer reth only refuses while tracing, after the
 /// block or transaction is found; a malformed config fails with the params.
-const Deferred = union(enum) { options: Options, refused: []const u8 };
+const Deferred = union(enum) {
+    options: Options,
+    refused: struct { code: i32, message: []const u8 },
+};
 
+/// reth: `EthApiError::Unsupported` is an internal error, `InvalidTracerConfig` invalid
+/// params.
 fn options_deferred(raw: ?[]const u8) HandlerError!Deferred {
     const options = parse_options(raw) catch |err| return switch (err) {
         error.InvalidParams => error.InvalidParams,
-        error.Unsupported => .{ .refused = "unsupported tracer" },
-        error.JsTracer => .{ .refused = "JS Tracer is not enabled" },
+        error.InvalidConfig => .{ .refused = .{
+            .code = rpc.code.invalid_params,
+            .message = "invalid tracer config",
+        } },
+        error.Unsupported => .{ .refused = .{
+            .code = rpc.code.internal_error,
+            .message = "unsupported tracer",
+        } },
+        error.JsTracer => .{ .refused = .{
+            .code = rpc.code.internal_error,
+            .message = "JS Tracer is not enabled",
+        } },
     };
     return .{ .options = options };
 }
 
-/// reth: `EthApiError::Unsupported`, an internal error.
 fn options_or_refuse(call: *Call, deferred: Deferred) HandlerError!Options {
     return switch (deferred) {
         .options => |options| options,
-        .refused => |message| call.fail(rpc.code.internal_error, message),
+        .refused => |refused| call.fail(refused.code, refused.message),
     };
 }
 
@@ -575,7 +690,7 @@ fn trace_block_by_hash(api: *Api, call: *Call) HandlerError!void {
 fn trace_call(api: *Api, call: *Call) HandlerError!void {
     var request = try eth.parse_call_request(api, call);
     const config = try call.params.optional_raw();
-    const options = try options_of(call, config);
+    const deferred = try options_deferred(config);
     try call.params.finish();
     // geth reads `stateOverrides` and `blockOverrides` from the trace config.
     if (config) |text| {
@@ -585,6 +700,8 @@ fn trace_call(api: *Api, call: *Call) HandlerError!void {
             return error.InvalidParams;
         try eth.set_overrides(api, call, &request, state_overrides, block_overrides);
     }
+    // reth builds the tracer once the call's env is prepared (`prepare_call_env`).
+    const options = try options_or_refuse(call, deferred);
     // The recorder sits between the request's scratch (call data, override code) and the
     // proof tail.
     const data_end = eth.scratch_used(api, &request);
@@ -628,8 +745,10 @@ fn trace_call_frames(
     };
     if (recorder.full) return call.fail(rpc.code.server_error, "trace exceeds the trace buffers");
     const env = try eth.request_env(api, call, &request);
-    const limit = request.message.gas orelse executor.default_call_gas(&env);
-    const top: TopGas = .{ .limit = limit, .used = executed.gas_used };
+    // The gas `eth.simulate` ran with: the request's, else the RPC gas cap (or what a priced
+    // caller can afford), as reth's `prepare_call_env` sets it.
+    assert(executed.gas_limit <= eth.rpc_gas_cap);
+    const top: TopGas = .{ .limit = executed.gas_limit, .used = executed.gas_used };
     // A call has no block hash or transaction; it runs in the block `eth.simulate` uses.
     const locator: flat_call.Locator = .{ .block_number = env.number };
     const range: Range = .{ .first = 0, .end = recorder.frame_count };
@@ -643,9 +762,9 @@ fn trace_call_struct(
     space: []u8,
     options: Options,
 ) HandlerError!void {
-    var logger = struct_log.Logger.init(space, options.struct_log) orelse
+    var logger = struct_log.Logger.init(space, options.struct_log, call.writer.out) orelse
         return call.fail(rpc.code.internal_error, "scratch too small");
-    logger.begin_transaction();
+    try logger.begin_transaction(call.writer);
     const tracer = logger.tracer();
     const executor = api.chain.executor;
     executor.machine.tracer = &tracer;
@@ -656,7 +775,8 @@ fn trace_call_struct(
         .executed => |executed| executed,
     };
     if (logger.full) return call.fail(rpc.code.server_error, "trace exceeds the trace buffers");
-    try logger.write(call.writer, executed.gas_used);
+    if (logger.overflow) return error.WriteFailed;
+    try logger.write(executed.gas_used);
 }
 
 /// `debug_traceBlock(rlp, options)`: traces an RLP block (canonical or not) on its
@@ -945,6 +1065,21 @@ test "trace: options select callTracer and its config" {
     );
     try testing.expect(pre.tracer == .prestate and pre.diff_mode);
     try testing.expectError(error.InvalidParams, parse_options("[1]"));
+    // A malformed field fails before the tracer is refused, the tracer before its config.
+    try testing.expectError(error.InvalidParams, parse_options(
+        "{\"tracer\":\"muxTracer\",\"disableStack\":1}",
+    ));
+    try testing.expectError(error.Unsupported, parse_options(
+        "{\"tracerConfig\":1,\"tracer\":\"muxTracer\"}",
+    ));
+    try testing.expectError(error.InvalidConfig, parse_options(
+        "{\"tracerConfig\":{\"only\\u0054opCall\":1},\"tracer\":\"callTracer\"}",
+    ));
+    const positional = try parse_options(
+        "{\"tracer\":\"prestateTracer\",\"tracerConfig\":[true,null,true]}",
+    );
+    try testing.expect(positional.diff_mode and !positional.disable_code);
+    try testing.expect(positional.disable_storage);
 }
 
 /// Random frame trees (each depth at most one more than the previous) write valid JSON.
@@ -1152,9 +1287,9 @@ fn run_prestate(
     if (only == null) try w.end_array();
 }
 
-/// The struct logger over a stored block: each traced transaction's logs are staged while
-/// it executes, then written with its result (`failed`, `gas`, `returnValue`) straight into
-/// the response (a failure later rewinds the whole response).
+/// The struct logger over a stored block: each traced transaction's logs stream into the
+/// response while it executes, and its result head (`failed`, `gas`, `returnValue`) is
+/// slid in front of them after (a failure later rewinds the whole response).
 fn trace_struct(
     api: *Api,
     call: *Call,
@@ -1165,14 +1300,14 @@ fn trace_struct(
     history: *node.HistoryDatabase,
     space: []u8,
 ) HandlerError!void {
-    var logger = struct_log.Logger.init(space, options.struct_log) orelse
+    var logger = struct_log.Logger.init(space, options.struct_log, call.writer.out) orelse
         return call.fail(rpc.code.internal_error, "scratch too small");
     const executor = api.chain.executor;
     const database = history.database();
     run_struct(executor, env, transactions, only, &logger, call.writer, database) catch |err| {
         if (history.failure) |failure| return eth_proof.fail_history(call, failure);
         return switch (err) {
-            error.WriteFailed => error.WriteFailed,
+            error.WriteFailed, error.TraceOverflow => error.WriteFailed,
             error.TraceFull => call.fail(rpc.code.server_error, "trace exceeds the trace buffers"),
             else => call.fail(rpc.code.server_error, @errorName(err)),
         };
@@ -1198,20 +1333,21 @@ fn run_struct(
     if (only == null) try w.begin_array();
     for (transactions, 0..) |raw, index| {
         const traced = only == null or only.? == index;
-        if (traced) logger.begin_transaction();
+        if (traced and only == null) {
+            try w.begin_object();
+            try w.key("txHash");
+            try w.data(&primitives.keccak256(raw).bytes);
+            try w.key("result");
+        }
+        if (traced) try logger.begin_transaction(w);
         executor.known_sender = executor.senders[index];
         executor.machine.tracer = if (traced) &tracer else null;
         const before = building.gas_used;
         try executor.apply(&building, raw);
         if (!traced) continue;
         if (logger.full) return error.TraceFull;
-        if (only == null) {
-            try w.begin_object();
-            try w.key("txHash");
-            try w.data(&primitives.keccak256(raw).bytes);
-            try w.key("result");
-        }
-        try logger.write(w, building.gas_used - before);
+        if (logger.overflow) return error.TraceOverflow;
+        try logger.write(building.gas_used - before);
         if (only == null) try w.end_object();
     }
     if (only == null) try w.end_array();

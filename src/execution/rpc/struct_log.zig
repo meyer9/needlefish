@@ -6,9 +6,14 @@
 //! state before the instruction (stack, return data, memory: whichever the config enables)
 //! into a bounded fragment, `step_end` writes the whole struct log object (program counter,
 //! op name, gas before, gas cost, depth, error, the fragment, the storage snapshot, the
-//! refund counter) into a bounded staging buffer. The transaction's result (`failed`,
-//! `returnValue`) comes from its top frame's outcome. Every buffer is carved from scratch at
-//! the start; a full buffer marks the logger `full` and the request fails instead.
+//! refund counter) straight into the response. The transaction's result (`failed`,
+//! `returnValue`) comes from its top frame's outcome once it ends, so its head is built in
+//! the fragment and slid in front of the logs. The fragment, slots and output are carved
+//! from scratch at the start; a full one marks the logger `full` and the request fails.
+//! The response bounds the logs: the first entry that does not fit asks the writer for
+//! room (`ensureUnusedCapacity`), which moves an HTTP response into a large send buffer
+//! once (`http.ResponseBuilder`); an entry past that marks the logger `overflow`, and the
+//! request fails as a response too large.
 //!
 //! revm-inspectors semantics kept here:
 //!   - `gas` is the frame's gas before the instruction, `gasCost` what it left the frame
@@ -58,10 +63,19 @@ const Pending = struct {
 /// Frames open at once: the call depth bound and the SELFDESTRUCT pseudo-frame.
 const open_max = 1026;
 
+/// A struct log entry's bytes beyond its fragment and storage: `pc`, `op`, `gas`,
+/// `gasCost`, `depth`, `error`, `refund` and the punctuation.
+const entry_fields_max = 512;
+/// One `storage` member: two quoted 32-byte hex words, a colon and a comma.
+const slot_entry_max = 2 * (2 + 2 + 64) + 2;
+/// The result head's bytes beyond its hex output.
+const head_fields_max = 128;
+
 pub const Logger = struct {
     config: Config,
-    /// The transaction's struct logs, comma separated, without the enclosing brackets.
-    logs: std.Io.Writer,
+    /// The response: the transaction's struct logs, comma separated, from `logs_start`.
+    out: *std.Io.Writer,
+    logs_start: usize = 0,
     /// The current instruction's pre-execution fields (`,"stack":[...]` and so on).
     fragment: std.Io.Writer,
     slots: []Slot,
@@ -77,6 +91,8 @@ pub const Logger = struct {
     failed: bool = true,
     /// A bound was hit; the result is incomplete and must not be served.
     full: bool = false,
+    /// The response had no room left for an entry.
+    overflow: bool = false,
     /// The current instruction is being recorded.
     recording: bool = false,
     pc: u32 = 0,
@@ -86,36 +102,42 @@ pub const Logger = struct {
     refund: i64 = 0,
     pending: Pending = .{},
 
-    /// Carves the logger's buffers out of `space`; null when it is too small.
-    pub fn init(space: []u8, config: Config) ?Logger {
+    /// Carves the logger's buffers out of `space`, writing to `out`; null when `space` is
+    /// too small. The fragment takes most: a step's memory is its largest part.
+    pub fn init(space: []u8, config: Config, out: *std.Io.Writer) ?Logger {
         var fixed: std.heap.FixedBufferAllocator = .init(space);
         const allocator = fixed.allocator();
-        const slots = allocator.alloc(Slot, space.len / 32 / @sizeOf(Slot)) catch return null;
-        const output = allocator.alloc(u8, space.len / 32) catch return null;
-        const fragment = allocator.alloc(u8, space.len / 4) catch return null;
-        const logs = allocator.alloc(u8, space.len - fixed.end_index) catch return null;
-        if (slots.len == 0 or logs.len < 1024) return null;
+        const slots = allocator.alloc(Slot, space.len / 16 / @sizeOf(Slot)) catch return null;
+        const output = allocator.alloc(u8, space.len / 8) catch return null;
+        const fragment = allocator.alloc(u8, space.len - fixed.end_index) catch return null;
+        if (slots.len == 0 or fragment.len < 1024) return null;
         assert(fixed.end_index == space.len);
+        // The result head (hex output and a few fields) is built in the fragment.
+        assert(fragment.len >= 2 * output.len + head_fields_max);
         return .{
             .config = config,
-            .logs = .fixed(logs),
+            .out = out,
             .fragment = .fixed(fragment),
             .slots = slots,
             .output = output,
         };
     }
 
-    /// Resets the per-transaction state; call before each traced transaction.
-    pub fn begin_transaction(logger: *Logger) void {
+    /// Resets the per-transaction state and starts its result as the next value of `w`
+    /// (which writes to `out`); call before each traced transaction.
+    pub fn begin_transaction(logger: *Logger, w: *json.Writer) json.Writer.WriteError!void {
         assert(logger.open_count == 0);
-        logger.logs.end = 0;
+        assert(w.out == logger.out);
+        assert(!logger.full and !logger.overflow);
+        try w.raw(""); // The separator; the result is written raw from here on.
+        logger.logs_start = logger.out.end;
         logger.slot_count = 0;
         logger.output_len = 0;
         logger.step_count = 0;
         logger.top_done = false;
         logger.failed = true;
         logger.recording = false;
-        assert(logger.logs.buffered().len == 0);
+        assert(logger.out.end == logger.logs_start);
     }
 
     pub fn tracer(logger: *Logger) evm.evm.Tracer {
@@ -160,7 +182,7 @@ pub const Logger = struct {
     fn on_step(context: *anyopaque, frame: *const evm.evm.Frame, machine: *const evm.evm.Evm) void {
         const logger = of(context);
         logger.recording = false;
-        if (logger.full) return;
+        if (logger.full or logger.overflow) return;
         if (logger.config.limit != 0 and logger.step_count >= logger.config.limit) return;
         assert(frame.pc < frame.analyzed.code.len);
         logger.recording = true;
@@ -194,9 +216,7 @@ pub const Logger = struct {
         if (logger.config.storage and touches_storage) {
             logger.record_slot(frame, machine, end.exit);
         }
-        logger.write_log(frame, result) catch {
-            logger.full = true;
-        };
+        logger.write_log(frame, result);
     }
 
     fn write_fragment(
@@ -293,13 +313,34 @@ pub const Logger = struct {
         assert(logger.slot_count <= logger.slots.len);
     }
 
-    fn write_log(
+    /// Appends the instruction's entry to the response, asking it for room once when the
+    /// entry does not fit; marks the logger `overflow` when it still does not.
+    fn write_log(logger: *Logger, frame: *const evm.evm.Frame, result: StepResult) void {
+        const out = logger.out;
+        const start = out.end;
+        logger.write_entry(frame, result) catch {
+            out.end = start;
+            // Entries are bounded by their fixed fields, the fragment and the slots.
+            const slot_bytes = @as(usize, logger.slot_count) * slot_entry_max;
+            const bound = entry_fields_max + logger.fragment.end + slot_bytes;
+            out.ensureUnusedCapacity(bound) catch {
+                logger.overflow = true;
+                return;
+            };
+            logger.write_entry(frame, result) catch {
+                out.end = start;
+                logger.overflow = true;
+            };
+        };
+    }
+
+    fn write_entry(
         logger: *Logger,
         frame: *const evm.evm.Frame,
         result: StepResult,
     ) std.Io.Writer.Error!void {
-        const w = &logger.logs;
-        if (w.end > 0) try w.writeByte(',');
+        const w = logger.out;
+        if (w.end > logger.logs_start) try w.writeByte(',');
         try w.print("{{\"pc\":{d},\"op\":\"{s}\",\"gas\":{d},\"gasCost\":{d},\"depth\":{d}", .{
             logger.pc,
             op_name(logger.opcode),
@@ -316,7 +357,7 @@ pub const Logger = struct {
 
     /// `,"storage":{...}`: the slots of `address` seen so far, in key order.
     fn write_storage(logger: *Logger, address: Address) std.Io.Writer.Error!void {
-        const w = &logger.logs;
+        const w = logger.out;
         try w.writeAll(",\"storage\":{");
         var written: u32 = 0;
         for (logger.slots[0..logger.slot_count]) |*slot| {
@@ -336,22 +377,32 @@ pub const Logger = struct {
         try w.writeByte('}');
     }
 
-    /// The transaction's `DefaultFrame`: `gas` is its receipt gas used.
-    pub fn write(logger: *const Logger, w: *json.Writer, gas: u64) json.Writer.WriteError!void {
-        assert(!logger.full);
+    /// Completes the transaction's `DefaultFrame` around its logs: `gas` is its receipt gas
+    /// used. The head (`failed`, `gas`, `returnValue`) is slid in front of the logs.
+    pub fn write(logger: *Logger, gas: u64) std.Io.Writer.Error!void {
+        assert(!logger.full and !logger.overflow);
         assert(logger.open_count == 0);
-        try w.begin_object();
-        try w.key("failed");
-        try w.boolean(logger.failed);
-        try w.key("gas");
-        try w.integer(gas);
-        try w.key("returnValue");
-        try w.data(logger.output[0..logger.output_len]);
-        try w.key("structLogs");
-        try w.raw("[");
-        try w.out.writeAll(logger.logs.buffered());
-        try w.out.writeByte(']');
-        try w.end_object();
+        const head = &logger.fragment;
+        head.end = 0;
+        try head.print("{{\"failed\":{s},\"gas\":{d},\"returnValue\":\"0x", .{
+            if (logger.failed) "true" else "false",
+            gas,
+        });
+        try json.write_hex(head, logger.output[0..logger.output_len]);
+        try head.writeAll("\",\"structLogs\":[");
+        const out = logger.out;
+        try out.ensureUnusedCapacity(head.end + 2);
+        const logs = out.end - logger.logs_start;
+        const buffer = out.buffer;
+        assert(out.end + head.end + 2 <= buffer.len);
+        std.mem.copyBackwards(
+            u8,
+            buffer[logger.logs_start + head.end ..][0..logs],
+            buffer[logger.logs_start..][0..logs],
+        );
+        @memcpy(buffer[logger.logs_start..][0..head.end], head.buffered());
+        out.end += head.end;
+        try out.writeAll("]}");
     }
 };
 
@@ -560,7 +611,9 @@ test "struct_log: step gas costs and errors follow revm" {
 
 test "struct_log: storage view stays sorted by address and key" {
     var space: [1 << 16]u8 = undefined;
-    var logger = Logger.init(&space, .{}).?;
+    var out_buffer: [1024]u8 = undefined;
+    var out: std.Io.Writer = .fixed(&out_buffer);
+    var logger = Logger.init(&space, .{}, &out).?;
     logger.put_slot(@splat(2), 5, 1);
     logger.put_slot(@splat(1), 9, 2);
     logger.put_slot(@splat(2), 3, 3);
@@ -574,6 +627,6 @@ test "struct_log: storage view stays sorted by address and key" {
     try testing.expectEqualStrings(
         ",\"storage\":{\"0x" ++ zeros ++ "03\":\"0x" ++ zeros ++ "03\",\"0x" ++ zeros ++
             "05\":\"0x" ++ zeros ++ "04\"}",
-        logger.logs.buffered(),
+        out.buffered(),
     );
 }

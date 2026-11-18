@@ -192,11 +192,11 @@ pub const Limits = struct {
         .changeset = undefined,
         .depth_max = 1024,
     },
-    /// Bound on a `debug_executionWitness` result's JSON: an HTTP large send buffer (16 MiB)
-    /// less the head reserve (1 KiB) and the JSON-RPC envelope (id up to ~1 KiB). A
-    /// storage-heavy witness is ~2.6 MB of JSON. Larger witnesses fail with "witness too
-    /// large" instead of an overflowing response. Raising it needs a larger
-    /// `http.large_send_buffer_size` too.
+    /// Bound on a `debug_executionWitness` result's JSON: 16 MiB less the head reserve
+    /// (1 KiB) and the JSON-RPC envelope (id up to ~1 KiB), inside an HTTP large send
+    /// buffer. A storage-heavy witness is ~2.6 MB of JSON. Larger witnesses fail with
+    /// "witness too large" instead of an overflowing response (and the generator's buffers
+    /// are sized from it). Raising it past `http.large_send_buffer_size` needs that too.
     witness_response_bytes_max: u32 = (16 << 20) - (2 << 10),
     http: http.server.Options = .{
         // Devnet: each consensus node holds two (watcher + provider), plus the batcher.
@@ -204,10 +204,12 @@ pub const Limits = struct {
         .recv_buffer_size = 4 << 20,
         .send_buffer_size = 1 << 20,
         .limits = .{ .head_size_max = 8 * 1024, .body_size_max = (4 << 20) - 16 * 1024 },
-        // Responses sized up front past 1 MiB (witnesses): 32 MiB reserved, committed only
-        // as written; two connections can send one at a time.
+        // Responses past 1 MiB (witnesses, struct-log traces): two buffers reserved,
+        // committed only as written; two connections can send one at a time. Each holds
+        // reth's default `--rpc.max-response-size` (160 MiB) after the 1 KiB head reserve:
+        // a block's struct logs with memory and `limit: 512` run ~100 MiB.
         .large_send_buffers_max = 2,
-        .large_send_buffer_size = 16 << 20,
+        .large_send_buffer_size = (160 << 20) + 1024,
     },
     beacon_http: http.server.Options = .{
         .connections_max = 8,
