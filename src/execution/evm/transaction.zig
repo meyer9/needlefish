@@ -247,13 +247,15 @@ fn validate_env(comptime fork: Fork, evm: *const Evm, tx: *const TxEnv) ?Invalid
 }
 
 fn validate_blobs(comptime fork: Fork, evm: *const Evm, tx: *const TxEnv) ?Invalid {
-    if (tx.to == null) return .blob_create;
+    // revm `validate_eip4844_tx`'s order: the fee cap, then emptiness, versions, count.
+    if (tx.max_fee_per_blob_gas < evm.block.blob_base_fee) return .blob_fee_too_low;
     if (tx.blob_hashes.len == 0) return .blob_empty;
-    if (tx.blob_hashes.len > blobs_per_tx_max(fork)) return .blob_too_many;
     for (tx.blob_hashes) |hash| {
         if (hash[0] != blob_version_kzg) return .blob_version;
     }
-    if (tx.max_fee_per_blob_gas < evm.block.blob_base_fee) return .blob_fee_too_low;
+    if (tx.blob_hashes.len > blobs_per_tx_max(fork)) return .blob_too_many;
+    // A type-3 envelope cannot create; revm leaves that to decoding, so it comes last.
+    if (tx.to == null) return .blob_create;
     return null;
 }
 

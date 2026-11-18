@@ -861,6 +861,12 @@ pub fn parse_call(
             const data = json.parse_data(text, space[used..]) catch return error.InvalidParams;
             result.data = data;
             used += data.len;
+        } else if (std.mem.eql(u8, name.bytes, "blobVersionedHashes")) {
+            result.blob_hashes = try parse_blob_hashes(&scanner, value, space, &used);
+        } else if (std.mem.eql(u8, name.bytes, "maxFeePerBlobGas")) {
+            if (value.tag != .string) return error.InvalidParams;
+            result.max_fee_per_blob_gas = json.parse_quantity(u256, text) catch
+                return error.InvalidParams;
         } else if (std.mem.eql(u8, name.bytes, "chainId")) {
             // Checked against the chain's by the EVM (revm `InvalidChainId`).
             if (value.tag != .string) return error.InvalidParams;
@@ -874,6 +880,29 @@ pub fn parse_call(
         }
     }
     return result;
+}
+
+/// A request's `blobVersionedHashes` (each a `B256`), stored in `space` after `used`.
+fn parse_blob_hashes(
+    scanner: *json.Scanner,
+    first: json.Token,
+    space: []u8,
+    used: *usize,
+) HandlerError![]const [32]u8 {
+    if (first.tag != .array_begin) return error.InvalidParams;
+    const start = used.*;
+    var count: usize = 0;
+    while (true) : (count += 1) {
+        const token = try scanner_next(scanner);
+        if (token.tag == .array_end) break;
+        if (token.tag != .string) return error.InvalidParams;
+        if (start + (count + 1) * 32 > space.len) return error.InvalidParams;
+        space[start + count * 32 ..][0..32].* = json.parse_fixed(32, token.bytes) catch
+            return error.InvalidParams;
+    }
+    used.* = start + count * 32;
+    assert(used.* <= space.len);
+    return std.mem.bytesAsSlice([32]u8, space[start..used.*]);
 }
 
 const Authorization = evm.transaction.Authorization;
@@ -1085,6 +1114,8 @@ pub fn scratch_used(api: *Api, request: *const CallRequest) usize {
         const bytes = std.mem.sliceAsBytes(list);
         if (bytes.len > 0) end = @max(end, @intFromPtr(bytes.ptr) + bytes.len);
     }
+    const blobs = std.mem.sliceAsBytes(message.blob_hashes);
+    if (blobs.len > 0) end = @max(end, @intFromPtr(blobs.ptr) + blobs.len);
     return if (end == 0) 0 else end - base;
 }
 

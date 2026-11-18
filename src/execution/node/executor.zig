@@ -692,6 +692,11 @@ pub const Executor = struct {
         authorization_list: ?[]const evm.transaction.Authorization = null,
         /// The request's `chainId`, checked against the chain's (null: the chain's).
         chain_id: ?u64 = null,
+        /// The request's `blobVersionedHashes`: non-empty makes the call a type-3
+        /// transaction (alloy's `minimal_tx_type`), checked as revm checks one.
+        blob_hashes: []const [32]u8 = &.{},
+        /// `maxFeePerBlobGas`; null takes the block's blob base fee (`CallFees`).
+        max_fee_per_blob_gas: ?u256 = null,
         /// Sees the state right after the call executes, before it is discarded
         /// (debug_traceCall prestateTracer).
         inspect: ?Inspect = null,
@@ -802,6 +807,7 @@ pub const Executor = struct {
 
     fn call_type(call: *const Call) evm.transaction.TxType {
         if (call.authorization_list != null) return .eip7702;
+        if (call.blob_hashes.len > 0) return .eip4844;
         return if (call.priority_fee == null) .legacy else .eip1559;
     }
 
@@ -823,6 +829,9 @@ pub const Executor = struct {
             .chain_id = call.chain_id orelse executor.spec.chain_id,
             .access_list = call.access_list,
             .authorization_list = call.authorization_list orelse &.{},
+            .blob_hashes = call.blob_hashes,
+            .max_fee_per_blob_gas = call.max_fee_per_blob_gas orelse
+                executor.machine.block.blob_base_fee,
             .skip_sender_code_check = true,
             .disable_fee_charge = !call.validate,
             .disable_tx_gas_cap = true,
@@ -878,6 +887,9 @@ pub const Executor = struct {
             .chain_id = call.chain_id orelse executor.spec.chain_id,
             .access_list = call.access_list,
             .authorization_list = call.authorization_list orelse &.{},
+            .blob_hashes = call.blob_hashes,
+            .max_fee_per_blob_gas = call.max_fee_per_blob_gas orelse
+                executor.machine.block.blob_base_fee,
             .skip_sender_code_check = true,
             .disable_fee_charge = true,
             .disable_tx_gas_cap = true,

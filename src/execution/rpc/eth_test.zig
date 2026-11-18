@@ -1186,6 +1186,19 @@ test "eth: request fields parse as base/base's serde types" {
     const blob_hash = "\"0x02" ++ zero_word ++ "\"";
     const blob = "[{\"blobVersionedHashes\":[" ++ blob_hash ++ "]}]";
     try expect_failure(h, "eth_call", blob, "-32003", "blob hash version mismatch");
+    // A call with blob hashes is a type-3 transaction: its blob fee cap is checked (revm
+    // `validate_eip4844_tx`), while no fee is charged.
+    const kzg_hash = "\"0x01" ++ zero_word ++ "\"";
+    const blob_call = "[{\"blobVersionedHashes\":[" ++ kzg_hash ++ "],\"to\":" ++
+        "\"0x4ac857f04be60f4f00ba2f2a6aa1f62b40459e53\",\"maxFeePerBlobGas\":";
+    const blob_fee = "max fee per blob gas less than block blob gas fee";
+    try expect_failure(h, "eth_call", blob_call ++ "\"0x0\"}]", "-32003", blob_fee);
+    try expect_failure(h, "eth_estimateGas", blob_call ++ "\"0x0\"}]", "-32003", blob_fee);
+    const traced = try h.request("debug_traceCall", blob_call ++ "\"0x0\"},\"latest\"," ++
+        "{\"tracer\":\"callTracer\"}]");
+    try expect_contains(traced, "{\"code\":-32003,\"message\":\"" ++ blob_fee);
+    const paid = try h.request("eth_estimateGas", blob_call ++ "\"0x1\"}]");
+    try testing.expectEqualStrings("\"result\":\"0x5208\"", paid);
     // `JsonStorageKey` reads a bare 0x as slot zero.
     const proof = "[\"0x4200000000000000000000000000000000000007\",[\"0x\"],\"latest\"]";
     try expect_contains(try h.request("eth_getProof", proof), "\"storageProof\":[{");

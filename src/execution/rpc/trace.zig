@@ -760,7 +760,7 @@ fn trace_call_frames(
     const simulated = eth.simulate(api, call, request);
     executor.machine.tracer = null;
     const executed = switch (try simulated) {
-        .invalid => |reason| return call.fail(rpc.code.server_error, @tagName(reason)),
+        .invalid => |reason| return eth.fail_invalid(call, reason),
         .executed => |executed| executed,
     };
     if (recorder.full) return call.fail(rpc.code.server_error, "trace exceeds the trace buffers");
@@ -791,7 +791,7 @@ fn trace_call_struct(
     const simulated = eth.simulate(api, call, request);
     executor.machine.tracer = null;
     const executed = switch (try simulated) {
-        .invalid => |reason| return call.fail(rpc.code.server_error, @tagName(reason)),
+        .invalid => |reason| return eth.fail_invalid(call, reason),
         .executed => |executed| executed,
     };
     if (logger.full) return call.fail(rpc.code.server_error, "trace exceeds the trace buffers");
@@ -1187,7 +1187,7 @@ fn trace_call_prestate(
     const simulated = eth.simulate(api, call, request);
     executor.machine.tracer = null;
     switch (try simulated) {
-        .invalid => |reason| return call.fail(rpc.code.server_error, @tagName(reason)),
+        .invalid => |reason| return eth.fail_invalid(call, reason),
         .executed => {},
     }
     if (collected.failed) return call.fail(rpc.code.internal_error, "state read failed");
