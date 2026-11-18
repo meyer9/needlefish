@@ -67,10 +67,9 @@ pub fn parse_request(scanner: *json.Scanner) RequestError!Request {
             request.method = value.bytes;
             method_seen = true;
         } else if (std.mem.eql(u8, key.bytes, "params")) {
-            if (value.tag != .array_begin and value.tag != .object_begin) {
-                return error.InvalidRequest;
-            }
-            request.params = raw;
+            // jsonrpsee takes any value (null as none); the method refuses other scalars
+            // as invalid params.
+            request.params = if (value.tag == .null) "" else raw;
         } else if (std.mem.eql(u8, key.bytes, "id")) {
             switch (value.tag) {
                 .string, .number, .null => request.id = raw,
@@ -112,7 +111,8 @@ pub const Params = struct {
         const named = text[0] == '{';
         var params: Params = .{ .scanner = json.Scanner.init(text), .named = named };
         const first = params.scanner.next() catch return error.InvalidParams;
-        assert(first.tag == .array_begin or first.tag == .object_begin);
+        if (first.tag != .array_begin and first.tag != .object_begin) return error.InvalidParams;
+        assert(params.scanner.depth == 1);
         return params;
     }
 

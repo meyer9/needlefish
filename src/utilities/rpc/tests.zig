@@ -128,6 +128,17 @@ test "rpc: protocol errors" {
             ,
             \\{"jsonrpc":"2.0","id":1,"error":{"code":-32601,"message":"method not found"}}
         },
+        // jsonrpsee parses the request and the method refuses scalar params.
+        .{
+            \\{"jsonrpc":"2.0","id":1,"method":"eth_chainId","params":true}
+            ,
+            \\{"jsonrpc":"2.0","id":1,"error":{"code":-32602,"message":"invalid params"}}
+        },
+        .{
+            \\{"jsonrpc":"2.0","id":1,"method":"eth_chainId","params":null}
+            ,
+            \\{"jsonrpc":"2.0","id":1,"result":"0x2105"}
+        },
         .{ "[]", invalid_request },
         .{ "7", invalid_request },
     };
