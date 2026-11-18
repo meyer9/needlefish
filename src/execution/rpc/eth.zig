@@ -570,6 +570,16 @@ pub fn resolve_block(api: *Api, call: *Call, raw: []const u8) HandlerError!Hash 
     };
 }
 
+/// Resolves a `BlockNumberOrTag` parameter (tag or number; a hash or block object is
+/// invalid params, as alloy deserializes it) to a canonical hash.
+pub fn resolve_numbered(api: *Api, call: *Call, raw: []const u8) HandlerError!Hash {
+    if (raw.len > 0 and raw[0] == '{') return error.InvalidParams;
+    const number = try resolve_number(api, call, raw);
+    return api.chain.store.canonical_hash(number) orelse {
+        return call.fail(rpc.code.server_error, "block not found");
+    };
+}
+
 /// An EIP-1898 block object: `blockHash` (with an optional boolean `requireCanonical`) or
 /// `blockNumber`. Any other member is refused, as alloy's `BlockId` refuses unknown fields.
 fn resolve_block_object(api: *Api, call: *Call, raw: []const u8) HandlerError!Hash {
@@ -663,7 +673,7 @@ fn block_size(record: node.chain.Record) usize {
 fn get_block_by_number(api: *Api, call: *Call) HandlerError!void {
     const raw = try call.params.raw();
     const full = try call.params.absent_or_boolean() orelse false;
-    const hash = resolve_block(api, call, raw) catch |err| switch (err) {
+    const hash = resolve_numbered(api, call, raw) catch |err| switch (err) {
         error.Failed => return call.writer.null_value(),
         else => return err,
     };
@@ -842,9 +852,23 @@ pub fn parse_call(
         } else if (std.mem.eql(u8, name.bytes, "value")) {
             result.value = json.parse_quantity(u256, text) catch return error.InvalidParams;
         } else if (std.mem.eql(u8, name.bytes, "data") or std.mem.eql(u8, name.bytes, "input")) {
+            if (value.tag != .string) return error.InvalidParams;
+            // alloy's `Bytes`, like geth's hexutil.Bytes, reads "" as empty.
+            if (text.len == 0) {
+                result.data = &.{};
+                continue;
+            }
             const data = json.parse_data(text, space[used..]) catch return error.InvalidParams;
             result.data = data;
             used += data.len;
+        } else if (std.mem.eql(u8, name.bytes, "chainId")) {
+            // Checked against the chain's by the EVM (revm `InvalidChainId`).
+            if (value.tag != .string) return error.InvalidParams;
+            result.chain_id = json.parse_quantity(u64, text) catch return error.InvalidParams;
+        } else if (std.mem.eql(u8, name.bytes, "type")) {
+            // alloy reads `type` as a u8 quantity; the request's fields pick the type.
+            if (value.tag != .string) return error.InvalidParams;
+            _ = json.parse_quantity(u8, text) catch return error.InvalidParams;
         } else {
             scanner.skip(value) catch return error.InvalidParams;
         }
@@ -1471,13 +1495,19 @@ pub fn parse_filter(api: *Api, raw: []const u8) HandlerError!Filter {
     var filter: Filter = .{ .from = head, .to = head };
     var scanner = json.Scanner.init(raw);
     if ((try scanner_next(&scanner)).tag != .object_begin) return error.InvalidParams;
+    // alloy's `Filter`: null reads as absent, and a block hash excludes a range.
+    var range_given = false;
     while (true) {
         const name = try scanner_next(&scanner);
         if (name.tag == .object_end) break;
         if (name.tag != .string) return error.InvalidParams;
         const value = try scanner_next(&scanner);
+        const block_field = std.mem.eql(u8, name.bytes, "fromBlock") or
+            std.mem.eql(u8, name.bytes, "toBlock") or std.mem.eql(u8, name.bytes, "blockHash");
+        if (block_field and value.tag == .null) continue;
         if (std.mem.eql(u8, name.bytes, "fromBlock") or std.mem.eql(u8, name.bytes, "toBlock")) {
             if (value.tag != .string) return error.InvalidParams;
+            range_given = true;
             const number = try number_of_tag(api, value.bytes);
             if (name.bytes[0] == 'f') filter.from = number else filter.to = number;
             if (name.bytes[0] == 't') filter.to_given = std.mem.startsWith(u8, value.bytes, "0x");
@@ -1497,6 +1527,7 @@ pub fn parse_filter(api: *Api, raw: []const u8) HandlerError!Filter {
             }
         } else scanner.skip(value) catch return error.InvalidParams;
     }
+    if (range_given and filter.block_hash != null) return error.InvalidParams;
     return filter;
 }
 

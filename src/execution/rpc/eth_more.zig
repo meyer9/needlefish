@@ -39,7 +39,7 @@ pub const methods = [_]rpc.Method(*Api){
 /// The block named by a number/tag parameter, or null (answered with JSON null).
 fn block_by_number(api: *Api, call: *Call) HandlerError!?Hash {
     const raw = try call.params.raw();
-    return eth.resolve_block(api, call, raw) catch |err| switch (err) {
+    return eth.resolve_numbered(api, call, raw) catch |err| switch (err) {
         error.Failed => return null,
         else => return err,
     };

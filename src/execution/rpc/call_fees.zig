@@ -21,6 +21,8 @@ pub const Fees = struct {
     max_fee_per_blob_gas: ?u256 = null,
     /// The length of `blobVersionedHashes` when given.
     blob_hashes: ?u32 = null,
+    /// Some blob hash lacks the KZG version byte (0x01).
+    blob_version_mismatch: bool = false,
 };
 
 /// The prices a call runs with (`CallFees`).
@@ -63,7 +65,7 @@ pub fn parse(raw: []const u8) HandlerError!Fees {
                     return error.InvalidParams;
             }
         } else if (std.mem.eql(u8, name.bytes, "blobVersionedHashes") and value.tag != .null) {
-            fees.blob_hashes = try count_elements(&scanner, value);
+            fees.blob_hashes = try parse_blob_hashes(&scanner, value, &fees);
         } else {
             scanner.skip(value) catch return error.InvalidParams;
         }
@@ -71,16 +73,22 @@ pub fn parse(raw: []const u8) HandlerError!Fees {
     return error.InvalidParams;
 }
 
-fn count_elements(scanner: *json.Scanner, first: json.Token) HandlerError!u32 {
+/// Counts the `B256` hashes and notes a version other than KZG's.
+fn parse_blob_hashes(scanner: *json.Scanner, first: json.Token, fees: *Fees) HandlerError!u32 {
     if (first.tag != .array_begin) return error.InvalidParams;
     var count: u32 = 0;
     while (count < 4096) : (count += 1) {
         const token = scanner.next() catch return error.InvalidParams;
         if (token.tag == .array_end) return count;
-        scanner.skip(token) catch return error.InvalidParams;
+        if (token.tag != .string) return error.InvalidParams;
+        const hash = json.parse_fixed(32, token.bytes) catch return error.InvalidParams;
+        if (hash[0] != blob_version_kzg) fees.blob_version_mismatch = true;
     }
     return error.InvalidParams;
 }
+
+/// EIP-4844 `VERSIONED_HASH_VERSION_KZG`.
+const blob_version_kzg: u8 = 0x01;
 
 /// `CallFees::ensure_fees` against `base_fee` (the block's, after block overrides).
 pub fn ensure(fees: Fees, base_fee: u64) Result {
@@ -89,6 +97,7 @@ pub fn ensure(fees: Fees, base_fee: u64) Result {
     if (fees.max_fee_per_blob_gas == null and !eip1559) {
         // Legacy, or no fee field: unpriced.
         const price = saturate(fees.gas_price orelse 0);
+        if (fees.blob_version_mismatch) return blob_version_mismatch;
         return .{ .prices = .{ .gas_price = price, .priority_fee = null } };
     }
     if (fees.gas_price != null) return .{ .failure = .{
@@ -102,9 +111,16 @@ pub fn ensure(fees: Fees, base_fee: u64) Result {
     }
     var prices = price.prices;
     prices.priority_fee = if (fees.max_priority_fee) |priority| saturate(priority) else null;
+    if (fees.blob_version_mismatch) return blob_version_mismatch;
     assert(prices.priority_fee == null or prices.priority_fee.? <= std.math.maxInt(u128));
     return .{ .prices = prices };
 }
+
+/// revm `validate_eip4844_tx` `BlobVersionNotSupported`, after the fee checks.
+const blob_version_mismatch: Result = .{ .failure = .{
+    .code = call_error.code_transaction_rejected,
+    .message = "blob hash version mismatch",
+} };
 
 const missing_blob_hashes: Result = .{ .failure = .{
     .code = call_error.code_transaction_rejected,

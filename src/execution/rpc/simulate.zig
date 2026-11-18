@@ -497,6 +497,10 @@ fn apply_account_field(
         try write_slots(state, account, field.value);
     } else if (std.mem.eql(u8, field.key, "stateDiff")) {
         try write_slots(state, account, field.value);
+    } else if (std.mem.eql(u8, field.key, "movePrecompileToAddress")) {
+        // alloy's `AccountOverride` reads it, but only reth's eth_simulateV1 applies it
+        // (`apply_precompile_overrides`); other calls ignore it. Not applied here yet.
+        _ = json.parse_fixed(20, try string_of(field.value)) catch return error.InvalidParams;
     } else return error.InvalidParams;
 }
 

@@ -672,7 +672,7 @@ fn trace_block_by_number(api: *Api, call: *Call) HandlerError!void {
     const raw = try call.params.raw();
     const deferred = try options_deferred(try call.params.optional_raw());
     try call.params.finish();
-    const hash = eth.resolve_block(api, call, raw) catch |err| switch (err) {
+    const hash = eth.resolve_numbered(api, call, raw) catch |err| switch (err) {
         error.Failed => return call.fail(rpc.code.server_error, "block not found"),
         else => return err,
     };

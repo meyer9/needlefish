@@ -690,6 +690,8 @@ pub const Executor = struct {
         /// The request's EIP-7702 authorizations: present (even empty) makes the call a
         /// type-4 transaction, as alloy's `TransactionRequest::preferred_type`.
         authorization_list: ?[]const evm.transaction.Authorization = null,
+        /// The request's `chainId`, checked against the chain's (null: the chain's).
+        chain_id: ?u64 = null,
         /// Sees the state right after the call executes, before it is discarded
         /// (debug_traceCall prestateTracer).
         inspect: ?Inspect = null,
@@ -818,7 +820,7 @@ pub const Executor = struct {
             .value = call.value,
             .data = call.data,
             .nonce = if (call.validate) call.nonce orelse caller.info.nonce else caller.info.nonce,
-            .chain_id = executor.spec.chain_id,
+            .chain_id = call.chain_id orelse executor.spec.chain_id,
             .access_list = call.access_list,
             .authorization_list = call.authorization_list orelse &.{},
             .skip_sender_code_check = true,
@@ -873,7 +875,7 @@ pub const Executor = struct {
             .value = call.value,
             .data = call.data,
             .nonce = caller.info.nonce,
-            .chain_id = executor.spec.chain_id,
+            .chain_id = call.chain_id orelse executor.spec.chain_id,
             .access_list = call.access_list,
             .authorization_list = call.authorization_list orelse &.{},
             .skip_sender_code_check = true,

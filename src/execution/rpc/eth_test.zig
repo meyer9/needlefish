@@ -1004,7 +1004,7 @@ test "eth: block objects refuse unknown members instead of spinning" {
     try expect_contains(by_number, "\"result\":\"0x");
     const config = try h.request("debug_traceCall", "[{}, \"latest\"," ++
         "{\"tracer\":\"callTracer\",\"tracerConfig\":{\"onlyTopCall\":[],\"x\":1}}]");
-    try expect_contains(config, "\"result\"");
+    try expect_contains(config, "invalid tracer config");
 }
 
 test "eth: getStorageAt reads a full-width slot key and defaults to latest" {
@@ -1018,7 +1018,10 @@ test "eth: getStorageAt reads a full-width slot key and defaults to latest" {
         "," ++ wide ++ "]"));
     try testing.expectEqualStrings(short, try h.request("eth_getStorageAt", "[" ++ account ++
         ",\"0x007\"]"));
-    for ([_][]const u8{ "\"0x\"", "\"7\"", "\"0x+7\"", "\"0x1_2\"" }) |slot| {
+    // A bare 0x is slot zero (ruint reads no digits as zero), as base answers eth_getProof.
+    const bare = try h.request("eth_getStorageAt", "[" ++ account ++ ",\"0x\"]");
+    try expect_contains(bare, "\"result\":\"0x");
+    for ([_][]const u8{ "\"7\"", "\"0x+7\"", "\"0x1_2\"" }) |slot| {
         var body: [256]u8 = undefined;
         const text = try std.fmt.bufPrint(&body, request_prefix_format ++
             "eth_getStorageAt\",\"params\":[{s},{s}]}}", .{ account, slot });
@@ -1144,6 +1147,48 @@ test "eth: a call request's authorizations are charged as a type-4 transaction" 
     const partial = "[{\"authorizationList\":[{\"address\":" ++
         "\"0x0000000000000000000000000000000000000004\"}]," ++ to ++ "}]";
     try expect_contains(try h.request("eth_createAccessList", partial), "-32602");
+}
+
+test "eth: request fields parse as base/base's serde types" {
+    const h = try Harness.create();
+    defer h.destroy();
+    _ = try h.mine(2);
+    // alloy's `Filter`: a block hash excludes a range; null bounds read as absent.
+    const block = try h.request("eth_getBlockByNumber", "[\"latest\",false]");
+    const at = std.mem.indexOf(u8, block, "\"hash\":\"").? + 8;
+    var hash: [66]u8 = undefined;
+    @memcpy(&hash, block[at..][0..66]);
+    var body: [512]u8 = undefined;
+    const both_format = request_prefix_format ++ "eth_getLogs\",\"params\":[{{" ++
+        "\"blockHash\":\"{s}\",\"toBlock\":\"latest\"}}]}}";
+    const both = try std.fmt.bufPrint(&body, both_format, .{&hash});
+    try expect_contains(try h.request_runtime(both), "-32602");
+    const open_end = "[{\"fromBlock\":\"latest\",\"toBlock\":null}]";
+    try expect_contains(try h.request("eth_getLogs", open_end), "\"result\":[");
+    // A block number parameter is not a hash.
+    const by_hash_format = request_prefix_format ++
+        "eth_getBlockByNumber\",\"params\":[\"{s}\",false]}}";
+    const by_hash = try std.fmt.bufPrint(&body, by_hash_format, .{&hash});
+    try expect_contains(try h.request_runtime(by_hash), "-32602");
+    // eth_call ignores movePrecompileToAddress (only eth_simulateV1 applies it).
+    const moved = "[{},\"latest\",{\"0x0000000000000000000000000000000000000001\":" ++
+        "{\"movePrecompileToAddress\":\"0x8fe1cc26a5cc6c3299bc42ffe394466911fc0dea\"}}]";
+    try testing.expectEqualStrings("\"result\":\"0x\"", try h.request("eth_call", moved));
+    // The chain id is checked; empty bytes read as empty; `type` must be a u8 quantity.
+    try expect_failure(h, "eth_call", "[{\"chainId\":\"0x1\"}]", "-32000", "invalid chain ID");
+    try testing.expectEqualStrings(
+        "\"result\":\"0x\"",
+        try h.request("eth_call", "[{\"input\":\"\"}]"),
+    );
+    try expect_contains(try h.request("eth_call", "[{\"type\":\"finalized\"}]"), "-32602");
+    try expect_contains(try h.request("eth_call", "[{\"type\":-1}]"), "-32602");
+    try expect_contains(try h.request("eth_call", "[{\"type\":\"0x2\"}]"), "\"result\"");
+    const blob_hash = "\"0x02" ++ zero_word ++ "\"";
+    const blob = "[{\"blobVersionedHashes\":[" ++ blob_hash ++ "]}]";
+    try expect_failure(h, "eth_call", blob, "-32003", "blob hash version mismatch");
+    // `JsonStorageKey` reads a bare 0x as slot zero.
+    const proof = "[\"0x4200000000000000000000000000000000000007\",[\"0x\"],\"latest\"]";
+    try expect_contains(try h.request("eth_getProof", proof), "\"storageProof\":[{");
 }
 
 fn fuzz_body(h: *Harness, body: []const u8) !void {
