@@ -1140,8 +1140,10 @@ pub fn DatabaseType(comptime Storage: type) type {
         /// (`input.changeset` is the changeset it applied on top of the head): inserts the
         /// block and moves the head without touching state, as one `block_and_head` entry.
         /// Replay applies the changeset through the usual path and ends in the same state.
-        /// A block already stored only moves the head (re-applying its changeset is
-        /// idempotent: changesets carry absolute values).
+        /// A block already stored (a side block executed again, e.g. after a restart dropped
+        /// the caller's copy) moves the head the same way but journals only a `head` entry.
+        /// Its stored changeset must not be applied again: re-applying is not idempotent (a
+        /// removed account's storage wipe finds no account the second time).
         pub fn commit_applied(self: *Self, input: *const BlockInput) OperationError!Commit {
             if (!self.head_info.present) return error.ParentNotHead;
             if (!std.mem.eql(u8, &self.head_info.hash, &input.parent_hash)) {
@@ -1150,14 +1152,18 @@ pub fn DatabaseType(comptime Storage: type) type {
             const size = block_entry_size(input);
             if (size > self.config.engine.entry_body_size_max) return error.BlockTooLarge;
             try self.check_accepting(1, journal_module.entry_size_bytes(size));
-            if (self.chain.meta(input.hash) != null) {
-                const sequence = try self.set_head(input.hash);
-                return .{ .sequence = sequence, .state_root = self.head_info.state_root };
-            }
-            try self.insert_check(input);
+            // A stored block's changeset (replay applies it) has the same account and storage
+            // changes as the caller's, from the same block on the same parent; only its codes
+            // may differ, as a code already stored is not listed again.
+            const stored = self.chain.block(input.hash);
+            if (stored) |view| {
+                assert(std.mem.eql(u8, &view.meta.parent_hash, &input.parent_hash));
+                assert(view.meta.number == input.number);
+            } else try self.insert_check(input);
             try self.flat_reserve_applied(input);
-            try self.chain_insert(input);
+            if (stored == null) try self.chain_insert(input);
             self.chain.plan_reorg(input.hash, &self.plan) catch |err| {
+                if (stored != null) return err;
                 // Stored in memory: journal it alone so replay stays in step.
                 const body = encode_block(input, self.queue_slot());
                 _ = self.queue_push(@intCast(body.len));
@@ -1181,8 +1187,12 @@ pub fn DatabaseType(comptime Storage: type) type {
                 .state_root = state_root,
             };
             self.history_commit_head();
-            const body = encode_block_and_head(input, self.queue_slot());
+            const body = if (stored == null)
+                encode_block_and_head(input, self.queue_slot())
+            else
+                encode_head(&input.hash, self.queue_slot());
             const sequence = self.queue_push(@intCast(body.len));
+            assert(sequence == self.submitted_sequence);
             return .{ .sequence = sequence, .state_root = state_root };
         }
 

@@ -694,3 +694,58 @@ test "database: execute_and_commit journals one entry with one sync" {
     }
     try check_equal_after_reopen(harness);
 }
+
+/// Side block A's writes: removes `empty` and deploys a code (stored once, so a second
+/// execution's changeset no longer lists it).
+fn execute_side(overlay: *Overlay, empty: state_module.Address) !void {
+    try overlay.set_account(empty, null);
+    const code_hash = try overlay.insert_code(codes[2]);
+    try overlay.set_account(address_of(21), .{ .nonce = 1, .code_hash = code_hash });
+}
+
+test "database: commit_applied of a stored side block does not apply its changeset twice" {
+    var prng = Prng.init(19);
+    var sim = try sim_create(19, &prng);
+    defer sim.deinit(testing.allocator);
+    const harness = try Harness.create(&sim, 19);
+    defer harness.destroy();
+    try harness.format(19);
+    const db = &harness.db;
+    // The parent holds an empty account with storage; side block A removes it (EIP-161),
+    // which wipes its slot, and sibling B becomes the head.
+    const empty = address_of(20);
+    try harness.overlay.set_account(empty, .{});
+    try harness.overlay.set_storage(empty, 3, 9);
+    var parent = harness.block_input(db.head_info.hash, db.head_info.number + 1);
+    _ = try db.execute_and_commit(&harness.overlay, &parent);
+    const parent_hash = parent.hash;
+    try execute_side(&harness.overlay, empty);
+    var side = harness.block_input(parent_hash, parent.number + 1);
+    const side_root = (try db.execute_and_commit(&harness.overlay, &side)).state_root;
+    _ = try db.set_head(parent_hash);
+    try harness.overlay.set_storage(address_of(1), 2, 77);
+    var sibling = harness.block_input(parent_hash, parent.number + 1);
+    _ = try db.execute_and_commit(&harness.overlay, &sibling);
+    try harness.tick_until(Harness.idle);
+    // A restart drops the caller's copy of A: it moves back to the parent, executes A on
+    // the state again, and commits it while the database still stores A.
+    try harness.reopen();
+    try testing.expectEqualSlices(u8, &sibling.hash, &db.head_info.hash);
+    _ = try db.set_head(parent_hash);
+    try execute_side(&harness.overlay, empty);
+    _ = try harness.overlay.commit(&db.changeset_built);
+    var again = side;
+    again.header = db.chain.block(side.hash).?.header;
+    again.changeset = db.changeset_built.encode(db.changeset_buffer);
+    const commit = try db.commit_applied(&again);
+    try testing.expectEqualSlices(u8, &side_root, &commit.state_root);
+    try testing.expectEqualSlices(u8, &side.hash, &db.head_info.hash);
+    try harness.tick_until(Harness.idle);
+    try testing.expectEqual(db.submitted_sequence, db.durable_sequence);
+    // Replay of the journaled head move reaches the same state.
+    try harness.reopen();
+    try testing.expectEqualSlices(u8, &side.hash, &db.head_info.hash);
+    try testing.expectEqualSlices(u8, &side_root, &db.head_info.state_root);
+    try testing.expectEqualSlices(u8, &side_root, &(try db.state.state_root()));
+    try testing.expect(db.state.basic(empty) == null);
+}
