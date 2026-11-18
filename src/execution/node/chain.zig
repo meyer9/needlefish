@@ -150,6 +150,8 @@ pub const JournalBlock = struct {
     header: []const u8,
     record: []const u8,
     changeset: []const u8,
+    /// A forkchoice update adopts the block: the journal's forkchoice head moves to it.
+    forkchoice: bool = false,
 };
 
 pub const JournalError = error{ JournalBusy, JournalFailed };
@@ -162,6 +164,9 @@ pub const Journal = struct {
     context: *anyopaque,
     commit_block: *const fn (context: *anyopaque, block: *const JournalBlock) JournalError!void,
     move_head: *const fn (context: *anyopaque, hash: Hash) JournalError!void,
+    /// `move_head` for a forkchoice update: also records `hash` as the head a restart
+    /// resumes from (a no-op when the head and that record already are `hash`).
+    move_forkchoice: *const fn (context: *anyopaque, hash: Hash) JournalError!void,
     /// Holds checkpoints while the shared state holds an unjournaled block (`pending`).
     hold_checkpoints: *const fn (context: *anyopaque, held: bool) void,
     /// Execution witness of a stored canonical block, with the state moved in memory only
@@ -446,7 +451,7 @@ pub const Chain = struct {
         state: engine.ForkchoiceState,
     ) engine.EngineError!engine.ForkchoiceApplied {
         const head = state.head_block_hash.bytes;
-        chain.move_state(head) catch return .syncing;
+        chain.move_state_to(head, true) catch return .syncing;
         chain.mark_canonical(head);
         chain.forkchoice = state;
         return .applied;
@@ -668,6 +673,17 @@ pub const Chain = struct {
         assert(std.mem.eql(u8, &chain.head_hash(), &hash));
     }
 
+    /// Re-adds a stored block off the restored branch (`Durable.retained_side`, before
+    /// `restore`): known again, so a forkchoice update can move to it through the journal,
+    /// but neither canonical nor indexed.
+    pub fn restore_side(chain: *Chain, record_bytes: []const u8) Error!void {
+        const stored = Record.decode(record_bytes) catch return error.StateUnavailable;
+        const hash = stored.header.hash().bytes;
+        try chain.store.put(ref_of(&stored.header, hash), record_bytes);
+        assert(chain.store.ref(hash) != null);
+        assert(!std.mem.eql(u8, &chain.state_hash, &hash));
+    }
+
     fn index_transaction(chain: *Chain, raw: []const u8, block_hash: Hash, index: u32) void {
         const tx_hash = primitives.keccak256(raw).bytes;
         const location: TxLocation = .{ .block_hash = block_hash, .index = index };
@@ -875,11 +891,17 @@ pub const Chain = struct {
     /// block. Adopting the block costs one journal entry and no state movement. A failure
     /// keeps it pending (the state and journal unchanged) for the next move to retry.
     pub fn flush_pending(chain: *Chain) Error!void {
+        return chain.flush_pending_as(false);
+    }
+
+    /// `forkchoice`: a forkchoice update adopts the pending block.
+    fn flush_pending_as(chain: *Chain, forkchoice: bool) Error!void {
         const hash = chain.pending orelse return;
         const journal = chain.journal.?;
         assert(std.mem.eql(u8, &chain.state_hash, &hash));
         const child = chain.header(hash).?;
-        const entry = journal_block(&child, hash, chain.store.record(hash).?, chain.db);
+        var entry = journal_block(&child, hash, chain.store.record(hash).?, chain.db);
+        entry.forkchoice = forkchoice;
         journal.commit_block(journal.context, &entry) catch return error.StateUnavailable;
         chain.pending = null;
         journal.hold_checkpoints(journal.context, false);
@@ -887,16 +909,29 @@ pub const Chain = struct {
     }
 
     pub fn move_state(chain: *Chain, target: Hash) Error!void {
-        try chain.flush_pending();
-        if (std.mem.eql(u8, &target, &chain.state_hash)) return;
+        return chain.move_state_to(target, false);
+    }
+
+    /// `move_state`; `forkchoice`: a forkchoice update moves to `target`, which the journal
+    /// records as the head a restart resumes from (other moves, such as executing a side
+    /// block on its parent, leave that record).
+    fn move_state_to(chain: *Chain, target: Hash, forkchoice: bool) Error!void {
+        const adopt = if (chain.pending) |hash| std.mem.eql(u8, &hash, &target) else false;
+        try chain.flush_pending_as(forkchoice and adopt);
+        const moved = !std.mem.eql(u8, &target, &chain.state_hash);
         if (chain.journal) |journal| {
             // The journal unwinds/applies stored changesets on the shared state.
-            journal.move_head(journal.context, target) catch return error.StateUnavailable;
+            const move = if (forkchoice) journal.move_forkchoice else journal.move_head;
+            if (moved or forkchoice) {
+                move(journal.context, target) catch return error.StateUnavailable;
+            }
+            if (!moved) return;
             chain.db.clear_undo();
             chain.state_hash = target;
             chain.sync_history();
             return;
         }
+        if (!moved) return;
         var path: [reexecute_max]Hash = undefined;
         var path_len: u32 = 0;
         var rollbacks: u32 = 0;

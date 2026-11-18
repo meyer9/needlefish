@@ -15,6 +15,9 @@ const fixture = @import("test_fixture.zig");
 const durable_module = @import("durable.zig");
 const witness_module = @import("witness.zig");
 const StateDb = @import("state_db.zig").StateDb;
+const chain_module = @import("chain.zig");
+const payload = @import("../payload/root.zig");
+const engine_types = @import("../engine/root.zig").types;
 
 const Durable = durable_module.Durable(SimStorage);
 const B256 = primitives.B256;
@@ -138,7 +141,10 @@ const Harness = struct {
         });
         errdefer node.destroy();
         var records: [64][]const u8 = undefined;
-        if (!fresh) for (durable.retained(&records)) |record| try node.chain.restore(record);
+        if (!fresh) {
+            for (durable.retained_side(&records)) |record| try node.chain.restore_side(record);
+            for (durable.retained(&records)) |record| try node.chain.restore(record);
+        }
         node.chain.journal = durable.journal();
         harness.node = node;
         try harness.settle();
@@ -241,6 +247,89 @@ test "durable: a restart resumes on the forkchoice head, not an unadopted block"
     try h.settle();
     try h.crash_and_reopen();
     try testing.expectEqualSlices(u8, &second.bytes, &h.head().bytes);
+}
+
+/// Sends block `hash` of `from` to `to` through newPayload.
+fn import(from: *Node, to: *Node, hash: B256) !engine_types.PayloadStatus {
+    var transactions: [64][]const u8 = undefined;
+    var withdrawals: [chain_module.withdrawals_max]payload.Withdrawal = undefined;
+    const p = from.chain.payload_of(hash.bytes, &transactions, &withdrawals).?;
+    const stored = from.chain.record(hash.bytes).?;
+    var requests: [2][]const u8 = undefined;
+    var requests_decoder = stored.requests;
+    var count: usize = 0;
+    while (!requests_decoder.is_empty()) : (count += 1) {
+        requests[count] = try requests_decoder.bytes();
+    }
+    const params: engine_types.NewPayloadParams = .{
+        .versioned_hashes = &.{},
+        .parent_beacon_block_root = stored.header.parent_beacon_block_root,
+        .execution_requests = requests[0..count],
+    };
+    const version = engine_types.new_payload_version(to.spec, p.timestamp);
+    return to.engine.new_payload(version, &p, &params);
+}
+
+test "durable: a side payload executed on an older parent leaves the restart head" {
+    const h = try Harness.create(8);
+    defer h.destroy();
+    const other = try Harness.create(9);
+    defer other.destroy();
+    const genesis_hash = h.head();
+    try testing.expectEqualSlices(u8, &genesis_hash.bytes, &other.head().bytes);
+    const side = try other.build_head(genesis_hash, 12, 0xfd);
+    var buffers: [2][256]u8 = undefined;
+    try fixture.submit(h.node.?, 1, 0, 5, &buffers[0]);
+    const first = try h.build_head(genesis_hash, 12, 0xfe);
+    try fixture.submit(h.node.?, 1, 1, 7, &buffers[1]);
+    const second = try h.build_head(first, 24, 0xfe);
+    const root = try h.node.?.db.root();
+    // A side payload on genesis: the journal moves the state to its parent (a head entry)
+    // and the node executes it there; the process dies before any forkchoice update.
+    const status = try import(other.node.?, h.node.?, side);
+    try testing.expectEqual(engine_types.Status.valid, status.status);
+    const database = &h.durable.database;
+    try testing.expectEqualSlices(u8, &genesis_hash.bytes, &database.head_info.hash);
+    try testing.expectEqualSlices(u8, &second.bytes, &database.forkchoice_head.?);
+    try h.settle();
+    try h.crash_and_reopen();
+    // The restart resumes on the forkchoice head with its canonical chain.
+    try testing.expectEqualSlices(u8, &second.bytes, &h.head().bytes);
+    try testing.expectEqualSlices(u8, &root, &(try h.node.?.db.root()));
+    try testing.expectEqualSlices(u8, &first.bytes, &h.node.?.chain.store.canonical_hash(1).?);
+    // It keeps following the forkchoice, and that survives another restart.
+    const third = try h.build_head(second, 36, 0xfe);
+    try h.crash_and_reopen();
+    try testing.expectEqualSlices(u8, &third.bytes, &h.head().bytes);
+}
+
+test "durable: a restart keeps stored side blocks for a forkchoice update to adopt" {
+    const h = try Harness.create(10);
+    defer h.destroy();
+    const other = try Harness.create(11);
+    defer other.destroy();
+    const genesis_hash = h.head();
+    const side = try other.build_head(genesis_hash, 12, 0xfd);
+    const side_root = try other.node.?.db.root();
+    var buffer: [256]u8 = undefined;
+    try fixture.submit(h.node.?, 1, 0, 5, &buffer);
+    const first = try h.build_head(genesis_hash, 12, 0xfe);
+    const status = try import(other.node.?, h.node.?, side);
+    try testing.expectEqual(engine_types.Status.valid, status.status);
+    // A head read moves back to the forkchoice head, journaling the side block first.
+    try h.node.?.chain.ensure_head_state();
+    try h.settle();
+    try h.crash_and_reopen();
+    try testing.expectEqualSlices(u8, &first.bytes, &h.head().bytes);
+    // The CL switches to the side block without resending it.
+    const version = engine_types.forkchoice_version(fixture.spec, 12);
+    const updated = try h.node.?.engine.forkchoice_updated(version, fixture.forkchoice(side), null);
+    try testing.expectEqual(engine_types.Status.valid, updated.payload_status.status);
+    try testing.expectEqualSlices(u8, &side.bytes, &h.head().bytes);
+    try testing.expectEqualSlices(u8, &side_root, &(try h.node.?.db.root()));
+    try h.settle();
+    try h.crash_and_reopen();
+    try testing.expectEqualSlices(u8, &side.bytes, &h.head().bytes);
 }
 
 test "durable: reads during a pending block journal it and serve the head" {

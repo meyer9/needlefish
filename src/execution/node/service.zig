@@ -610,6 +610,7 @@ pub fn Service(comptime IO: type) type {
             const blocks_max = durable.database.config.chain.blocks_max;
             const records = try allocator.alloc([]const u8, blocks_max);
             defer allocator.free(records);
+            for (durable.retained_side(records)) |record| try service.chain.restore_side(record);
             for (durable.retained(records)) |record| try service.chain.restore(record);
         }
 
