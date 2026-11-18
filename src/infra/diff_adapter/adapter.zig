@@ -150,6 +150,9 @@ pub const Adapter = struct {
     /// Accounts the last commit recreated after destroying them in the block (storage
     /// cleared, present at the end).
     destroyed: std.AutoHashMapUnmanaged(Address, void) = .empty,
+    /// File system access for `trie` mode's databases (its directory); without it trie
+    /// requests fail.
+    io: ?std.Io = null,
 
     pub const changeset_config: db.changeset.Config = .{
         .accounts_max = 1 << 16,

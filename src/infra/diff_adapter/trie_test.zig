@@ -1,0 +1,624 @@
+//! `trie` mode end to end: request lines through `handle_line`, over real database files in
+//! a temporary directory. Known roots come from an independent trie implementation; the
+//! seeded fuzz checks the primary (the hashed-key commit path over disk mode) against
+//! `hash-builder` and every other variant, block by block, and every proof against the
+//! state root.
+
+const std = @import("std");
+const assert = std.debug.assert;
+const testing = std.testing;
+
+const diff = @import("root.zig");
+const trie = @import("../../execution/trie/root.zig");
+const primitives = @import("../../common/primitives/root.zig");
+const Prng = @import("../../testing/prng.zig").Prng;
+const build_options = @import("build_options");
+
+const Hash = [32]u8;
+const Value = std.json.Value;
+const keccak256 = trie.node.keccak256;
+
+const empty_root = "0x56e81f171bcc55a6ff8345e692c0f86e5b48e01b996cadc001622fb5e363b421";
+const empty_code = "0xc5d2460186f7233c927e7db2dcc703c0e500b653ca82273b7bfad8045d85a470";
+/// Roots of `key_a` (0x11 x 32) holding nonce 1, balance 0x10, the empty code hash and the
+/// storage below, from an independent trie implementation.
+const root_single = "0x11fdff7752c13a5344b74d5ff69bc6768666103ea3b885d670a468d56702e994";
+const root_single_storage =
+    "0xbd7d0d897f5608b731b5d6ec0abb5b12fc8385c91cef734c88aa0be94bdf2621";
+/// The storage root of slot `slot_a` (0x22 x 32) = 0x2a.
+const storage_root_a = "0x8bc48a1174aae6e2c4c27c39722129cf64ab409bbf50268841795c65c8d14e99";
+/// `key_a` as above and `key_b` (0x11 x 31, 0x12) with nonce 2, balance 0.
+const root_two = "0x80a4b7db39596963807d466e45f971c234c39eb6bef2ba69472728461d84f62e";
+
+fn repeat(comptime pair: *const [2]u8, comptime count: usize) *const [2 * count]u8 {
+    const pairs: [count][2]u8 = @splat(pair.*);
+    const flat: [2 * count]u8 = @bitCast(pairs);
+    return &flat;
+}
+
+const key_a = "0x" ++ repeat("11", 32);
+const key_b = "0x" ++ repeat("11", 31) ++ "12";
+const slot_a = "0x" ++ repeat("22", 32);
+const word_2a = "0x" ++ repeat("00", 31) ++ "2a";
+
+const account_a = "{\"op\":\"account\",\"key\":\"" ++ key_a ++
+    "\",\"nonce\":\"0x1\",\"balance\":\"0x10\",\"codeHash\":\"" ++ empty_code ++ "\"}";
+const account_b = "{\"op\":\"account\",\"key\":\"" ++ key_b ++
+    "\",\"nonce\":\"0x2\",\"balance\":\"0x0\",\"codeHash\":\"" ++ empty_code ++ "\"}";
+const storage_a = "{\"op\":\"storage\",\"key\":\"" ++ key_a ++ "\",\"slot\":\"" ++ slot_a ++
+    "\",\"value\":\"" ++ word_2a ++ "\"}";
+const wipe_a = "{\"op\":\"wipe\",\"key\":\"" ++ key_a ++ "\"}";
+const delete_a = "{\"op\":\"delete\",\"key\":\"" ++ key_a ++ "\"}";
+const delete_b = "{\"op\":\"delete\",\"key\":\"" ++ key_b ++ "\"}";
+const proof_a = "{\"key\":\"" ++ key_a ++ "\",\"slots\":[\"" ++ slot_a ++ "\"]}";
+
+/// An adapter with file IO and a fresh temporary directory for `trie.dir`.
+const Harness = struct {
+    adapter: *diff.Adapter,
+    tmp: testing.TmpDir,
+    dir_buffer: [256]u8 = undefined,
+    dir: []const u8 = "",
+    arena_state: std.heap.ArenaAllocator,
+    output: std.Io.Writer.Allocating,
+
+    fn create() !*Harness {
+        const self = try testing.allocator.create(Harness);
+        errdefer testing.allocator.destroy(self);
+        self.* = .{
+            .adapter = try testing.allocator.create(diff.Adapter),
+            .tmp = testing.tmpDir(.{}),
+            .arena_state = .init(testing.allocator),
+            .output = .init(testing.allocator),
+        };
+        try self.adapter.init(testing.allocator);
+        self.adapter.io = testing.io;
+        self.dir = try std.fmt.bufPrint(
+            &self.dir_buffer,
+            ".zig-cache/tmp/{s}/job",
+            .{self.tmp.sub_path},
+        );
+        return self;
+    }
+
+    fn destroy(self: *Harness) void {
+        self.output.deinit();
+        self.arena_state.deinit();
+        self.adapter.deinit();
+        testing.allocator.destroy(self.adapter);
+        self.tmp.cleanup();
+        testing.allocator.destroy(self);
+    }
+
+    /// Answers `{"id":"t","mode":"trie","trie":{"dir":...,"blocks":[blocks]}}`; the parsed
+    /// response lives until the next call. The directory is gone afterwards.
+    fn request(self: *Harness, blocks: []const u8) !Value {
+        _ = self.arena_state.reset(.retain_capacity);
+        const arena = self.arena_state.allocator();
+        const line = try std.fmt.allocPrint(
+            arena,
+            "{{\"id\":\"t\",\"mode\":\"trie\",\"trie\":{{\"dir\":\"{s}\",\"blocks\":[{s}]}}}}",
+            .{ self.dir, blocks },
+        );
+        self.output.clearRetainingCapacity();
+        try diff.handle_line(self.adapter, arena, line, &self.output.writer, null);
+        const text = try arena.dupe(u8, self.output.written());
+        const gone = std.Io.Dir.cwd().access(testing.io, self.dir, .{});
+        try testing.expectError(error.FileNotFound, gone);
+        return std.json.parseFromSliceLeaky(Value, arena, text, .{});
+    }
+};
+
+fn field(value: Value, name: []const u8) Value {
+    return value.object.get(name) orelse std.debug.panic("no field {s}", .{name});
+}
+
+fn expect_ok(response: Value) !void {
+    if (field(response, "ok").bool) return;
+    std.debug.print("response error: {s}\n", .{field(response, "error").string});
+    return error.TestUnexpectedResult;
+}
+
+/// Every block of `blocks` and of every variant has `roots[i]` as its state root.
+fn expect_roots(response: Value, roots: []const []const u8) !void {
+    try expect_ok(response);
+    const blocks = field(response, "blocks").array.items;
+    try testing.expectEqual(roots.len, blocks.len);
+    for (blocks, roots) |block, root| {
+        try testing.expectEqualStrings(root, field(block, "stateRoot").string);
+    }
+    var variants = field(response, "variants").object.iterator();
+    var count: u32 = 0;
+    while (variants.next()) |entry| : (count += 1) {
+        for (entry.value_ptr.array.items, roots) |block, root| {
+            if (block.object.get("error")) |text| {
+                std.debug.print("{s}: {s}\n", .{ entry.key_ptr.*, text.string });
+                return error.TestUnexpectedResult;
+            }
+            try testing.expectEqualStrings(root, field(block, "stateRoot").string);
+        }
+    }
+    try testing.expect(count >= 3);
+}
+
+test "diff trie: empty root, a single account, absent-key proofs" {
+    const harness = try Harness.create();
+    defer harness.destroy();
+    const response = try harness.request(
+        "{\"number\":\"0x1\",\"ops\":[],\"proofs\":[" ++ proof_a ++ "]}," ++
+            "{\"number\":\"0x2\",\"ops\":[" ++ account_a ++ "],\"proofs\":[" ++ proof_a ++
+            ",{\"key\":\"" ++ key_b ++ "\",\"slots\":[]}]}",
+    );
+    try expect_roots(response, &.{ empty_root, root_single });
+    const blocks = field(response, "blocks").array.items;
+    // The empty trie: no nodes, no account, a zero value.
+    const absent = field(blocks[0], "proofs").array.items[0];
+    try testing.expectEqual(Value.null, field(absent, "account"));
+    try testing.expectEqual(@as(usize, 0), field(absent, "accountProof").array.items.len);
+    const empty_slot = field(absent, "storage").array.items[0];
+    try testing.expectEqualStrings("0x" ++ repeat("00", 32), field(empty_slot, "value").string);
+    try testing.expectEqual(@as(usize, 0), field(empty_slot, "proof").array.items.len);
+    // One leaf: its account, a one-node proof, an empty storage proof; key_b is absent and
+    // proven by the same leaf.
+    const proofs = field(blocks[1], "proofs").array.items;
+    const account = field(proofs[0], "account");
+    try testing.expectEqualStrings("0x1", field(account, "nonce").string);
+    try testing.expectEqualStrings("0x10", field(account, "balance").string);
+    try testing.expectEqualStrings(empty_root, field(account, "storageRoot").string);
+    try testing.expectEqual(@as(usize, 1), field(proofs[0], "accountProof").array.items.len);
+    try testing.expectEqual(Value.null, field(proofs[1], "account"));
+    try testing.expectEqual(@as(usize, 1), field(proofs[1], "accountProof").array.items.len);
+    const roots = field(blocks[1], "storageRoots").object;
+    try testing.expectEqualStrings(empty_root, roots.get(key_a).?.string);
+}
+
+test "diff trie: storage write, wipe, rewrite, delete, recreate" {
+    const harness = try Harness.create();
+    defer harness.destroy();
+    const response = try harness.request(
+        "{\"number\":\"0x1\",\"ops\":[" ++ account_a ++ "," ++ storage_a ++ "],\"proofs\":[" ++
+            proof_a ++ "]}," ++
+            "{\"number\":\"0x2\",\"ops\":[" ++ wipe_a ++ "],\"proofs\":[" ++ proof_a ++ "]}," ++
+            "{\"number\":\"0x3\",\"ops\":[" ++ storage_a ++ "],\"proofs\":[]}," ++
+            "{\"number\":\"0x4\",\"ops\":[" ++ delete_a ++ "],\"proofs\":[" ++ proof_a ++ "]}," ++
+            "{\"number\":\"0x5\",\"ops\":[" ++ account_a ++ "],\"proofs\":[" ++ proof_a ++ "]}," ++
+            // Storage, then delete and recreate in one block: the storage is gone.
+            "{\"number\":\"0x6\",\"ops\":[" ++ storage_a ++ "," ++ delete_a ++ "," ++ account_a ++
+            "],\"proofs\":[]}",
+    );
+    try expect_roots(response, &.{
+        root_single_storage, root_single, root_single_storage,
+        empty_root,          root_single, root_single,
+    });
+    const blocks = field(response, "blocks").array.items;
+    const first = field(blocks[0], "proofs").array.items[0];
+    const slot = field(first, "storage").array.items[0];
+    try testing.expectEqualStrings(word_2a, field(slot, "value").string);
+    try testing.expectEqual(@as(usize, 1), field(slot, "proof").array.items.len);
+    try testing.expectEqualStrings(
+        storage_root_a,
+        field(blocks[0], "storageRoots").object.get(key_a).?.string,
+    );
+    // Deleted: no storage root, no account.
+    try testing.expectEqual(@as(usize, 0), field(blocks[3], "storageRoots").object.count());
+    const deleted = field(blocks[3], "proofs").array.items[0];
+    try testing.expectEqual(Value.null, field(deleted, "account"));
+}
+
+test "diff trie: unwinds, native and beyond the database's reorg bound" {
+    const harness = try Harness.create();
+    defer harness.destroy();
+    // Block 2 again on block 1 (with the revert); an unwind of an empty block omits its
+    // empty revert.
+    const response = try harness.request(
+        "{\"number\":\"0x1\",\"ops\":[" ++ account_a ++ "],\"proofs\":[]}," ++
+            "{\"number\":\"0x2\",\"ops\":[" ++ account_b ++ "],\"proofs\":[]}," ++
+            "{\"number\":\"0x2\",\"unwind\":1,\"revert\":[" ++ delete_b ++ "],\"ops\":[" ++
+            storage_a ++ "],\"proofs\":[" ++ proof_a ++ "]}," ++
+            "{\"number\":\"0x3\",\"ops\":[],\"proofs\":[]}," ++
+            "{\"number\":\"0x3\",\"unwind\":1,\"ops\":[" ++ account_b ++ "],\"proofs\":[]}",
+    );
+    try expect_roots(response, &.{
+        root_single,
+        root_two,
+        root_single_storage,
+        root_single_storage,
+        root_two_storage,
+    });
+    // Twelve blocks, then back to block 1: deeper than a head move may unwind, so the
+    // primary applies the revert and the ops as one block.
+    var blocks: std.Io.Writer.Allocating = .init(testing.allocator);
+    defer blocks.deinit();
+    const writer = &blocks.writer;
+    for (1..13) |number| {
+        if (number > 1) try writer.writeAll(",");
+        try writer.print(
+            "{{\"number\":\"0x{x}\",\"ops\":[{{\"op\":\"account\",\"key\":\"" ++ key_a ++
+                "\",\"nonce\":\"0x{x}\",\"balance\":\"0x10\",\"codeHash\":\"" ++ empty_code ++
+                "\"}}],\"proofs\":[]}}",
+            .{ number, number },
+        );
+    }
+    try writer.writeAll(",{\"number\":\"0x2\",\"unwind\":11,\"revert\":[" ++ account_a ++
+        "],\"ops\":[],\"proofs\":[]}");
+    const deep = try harness.request(blocks.written());
+    try expect_ok(deep);
+    const results = field(deep, "blocks").array.items;
+    try testing.expectEqualStrings(root_single, field(results[0], "stateRoot").string);
+    try testing.expectEqualStrings(root_single, field(results[12], "stateRoot").string);
+    try expect_variants_agree(deep);
+}
+
+test "diff trie: a preimage that does not hash to its key refuses the request" {
+    const harness = try Harness.create();
+    defer harness.destroy();
+    var address: [20]u8 = @splat(0xab);
+    const key = keccak256(&address);
+    var slot_key: Hash = @splat(0xcd);
+    const slot = keccak256(&slot_key);
+    var line: std.Io.Writer.Allocating = .init(testing.allocator);
+    defer line.deinit();
+    // 0: all hash to their keys; 1: a wrong address; 2: a wrong slotKey; 3: a wrong
+    // slotKeys entry; 4: a wrong address with no other preimage in the request.
+    for (0..5) |case| {
+        if (case == 1 or case == 4) address[0] ^= 1;
+        if (case == 2) slot_key[0] ^= 1;
+        const proof_slot_key: Hash = if (case == 3) @splat(0xee) else slot_key;
+        line.clearRetainingCapacity();
+        const w = &line.writer;
+        try w.print("{{\"number\":\"0x1\",\"ops\":[{{\"op\":\"account\",\"key\":\"0x{x}\"," ++
+            "\"address\":\"0x{x}\",\"nonce\":\"0x1\",\"balance\":\"0x0\",\"codeHash\":\"" ++
+            empty_code ++ "\"}}", .{ &key, &address });
+        if (case < 4) {
+            try w.print(",{{\"op\":\"storage\",\"key\":\"0x{x}\",\"address\":\"0x{x}\"," ++
+                "\"slot\":\"0x{x}\",\"slotKey\":\"0x{x}\",\"value\":\"" ++ word_2a ++ "\"}}", .{
+                &key, &address, &slot, &slot_key,
+            });
+        }
+        try w.print("],\"proofs\":[{{\"key\":\"0x{x}\",\"slots\":[\"0x{x}\"]", .{ &key, &slot });
+        if (case < 4) {
+            try w.print(",\"address\":\"0x{x}\",\"slotKeys\":[\"0x{x}\"]", .{
+                &address, &proof_slot_key,
+            });
+        }
+        try w.writeAll("}]}");
+        if (case == 1 or case == 4) address[0] ^= 1;
+        if (case == 2) slot_key[0] ^= 1;
+        const response = try harness.request(line.written());
+        if (case == 0) {
+            try expect_ok(response);
+            try testing.expect(field(response, "variants").object.contains("node-address"));
+            continue;
+        }
+        try testing.expect(!field(response, "ok").bool);
+        const text = field(response, "error").string;
+        try testing.expect(std.mem.indexOf(u8, text, "PreimageMismatch") != null);
+    }
+}
+
+/// A root of `key_a` with storage and `key_b` (as `root_two`).
+const root_two_storage = "0x22277f4e35f680dceefaba949c8fae906faf8f1a43d22064775d865620f7d544";
+
+/// Every variant block reports the primary's state root and storage roots (where it
+/// reports them), and every proof verifies against the state root.
+fn expect_variants_agree(response: Value) !void {
+    try expect_ok(response);
+    const blocks = field(response, "blocks").array.items;
+    for (blocks) |block| try expect_proofs_verify(block);
+    var variants = field(response, "variants").object.iterator();
+    while (variants.next()) |entry| {
+        const results = entry.value_ptr.array.items;
+        try testing.expectEqual(blocks.len, results.len);
+        for (blocks, results) |block, result| {
+            if (result.object.get("error")) |text| {
+                std.debug.print("{s}: {s}\n", .{ entry.key_ptr.*, text.string });
+                return error.TestUnexpectedResult;
+            }
+            const want = field(block, "stateRoot").string;
+            try testing.expectEqualStrings(want, field(result, "stateRoot").string);
+            try expect_same_storage_roots(block, result);
+            if (result.object.get("proofs")) |proofs| {
+                try expect_same_proofs(field(block, "proofs"), proofs);
+            }
+        }
+    }
+}
+
+fn expect_same_storage_roots(want: Value, got: Value) !void {
+    const roots = (got.object.get("storageRoots") orelse return).object;
+    const expected = field(want, "storageRoots").object;
+    try testing.expectEqual(expected.count(), roots.count());
+    var entries = expected.iterator();
+    while (entries.next()) |entry| {
+        const root = roots.get(entry.key_ptr.*) orelse return error.TestUnexpectedResult;
+        try testing.expectEqualStrings(entry.value_ptr.string, root.string);
+    }
+}
+
+/// Same accounts, values and node lists (after dropping embedded nodes but the first).
+fn expect_same_proofs(want: Value, got: Value) !void {
+    var buffer_want: [4096]u8 = undefined;
+    var buffer_got: [4096]u8 = undefined;
+    try testing.expectEqual(want.array.items.len, got.array.items.len);
+    for (want.array.items, got.array.items) |a, b| {
+        const account_a_json = std.json.fmt(field(a, "account"), .{});
+        const account_b_json = std.json.fmt(field(b, "account"), .{});
+        const json_a = try std.fmt.bufPrint(&buffer_want, "{f}", .{account_a_json});
+        const json_b = try std.fmt.bufPrint(&buffer_got, "{f}", .{account_b_json});
+        try testing.expectEqualStrings(json_a, json_b);
+        try expect_same_nodes(field(a, "accountProof"), field(b, "accountProof"));
+        for (field(a, "storage").array.items, field(b, "storage").array.items) |x, y| {
+            try testing.expectEqualStrings(field(x, "value").string, field(y, "value").string);
+            try expect_same_nodes(field(x, "proof"), field(y, "proof"));
+        }
+    }
+}
+
+fn expect_same_nodes(want: Value, got: Value) !void {
+    var a: usize = 0;
+    var b: usize = 0;
+    const left = want.array.items;
+    const right = got.array.items;
+    while (true) {
+        while (a < left.len and a > 0 and left[a].string.len < 2 + 64) a += 1;
+        while (b < right.len and b > 0 and right[b].string.len < 2 + 64) b += 1;
+        if (a == left.len or b == right.len) break;
+        try testing.expectEqualStrings(left[a].string, right[b].string);
+        a += 1;
+        b += 1;
+    }
+    try testing.expectEqual(left.len - a, right.len - b);
+}
+
+fn arena_bytes(arena: std.mem.Allocator, text: []const u8) ![]u8 {
+    const out = try arena.alloc(u8, (text.len - 2) / 2);
+    try primitives.hex.decode(out, text);
+    return out;
+}
+
+fn nodes_list(arena: std.mem.Allocator, nodes: Value) ![]const []const u8 {
+    const out = try arena.alloc([]const u8, nodes.array.items.len);
+    for (nodes.array.items, out) |item, *bytes| bytes.* = try arena_bytes(arena, item.string);
+    return out;
+}
+
+/// Every account proof proves the reported account (or its absence) under the state root,
+/// and every storage proof the reported value under the account's storage root.
+fn expect_proofs_verify(block: Value) !void {
+    var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const root = (try arena_bytes(arena, field(block, "stateRoot").string))[0..32].*;
+    for (field(block, "proofs").array.items) |proof| {
+        const key = try arena_bytes(arena, field(proof, "key").string);
+        const account_nodes = try nodes_list(arena, field(proof, "accountProof"));
+        const leaf = try trie.verify_proof(root, key, account_nodes);
+        const account = field(proof, "account");
+        try testing.expectEqual(account == .null, leaf == null);
+        var storage_root: Hash = trie.empty_root;
+        if (account != .null) {
+            const text = field(account, "storageRoot").string;
+            storage_root = (try arena_bytes(arena, text))[0..32].*;
+        }
+        for (field(proof, "storage").array.items) |slot| {
+            const slot_key = try arena_bytes(arena, field(slot, "slot").string);
+            const nodes = try nodes_list(arena, field(slot, "proof"));
+            const value = try trie.verify_proof(storage_root, slot_key, nodes);
+            const word = try arena_bytes(arena, field(slot, "value").string);
+            const zero = std.mem.allEqual(u8, word, 0);
+            try testing.expectEqual(zero, value == null);
+        }
+    }
+}
+
+// Seeded fuzz: random blocks over a small key universe (shared key prefixes, so the tries
+// branch and extend), random unwinds with a revert that restores the target block's state,
+// half the requests with preimages (so `node-address` runs too).
+
+const keys_max = 6;
+const slots_max = 5;
+
+const FuzzAccount = struct {
+    nonce: u64,
+    balance: u64,
+    code: u8,
+    slots: [slots_max]u64 = @splat(0),
+};
+
+const FuzzState = [keys_max]?FuzzAccount;
+
+const Fuzz = struct {
+    prng: Prng,
+    preimages: bool,
+    keys: [keys_max]Hash = undefined,
+    addresses: [keys_max][20]u8 = undefined,
+    slots: [slots_max]Hash = undefined,
+    slot_keys: [slots_max]Hash = undefined,
+    /// The state after each block of the canonical chain, by height.
+    states: [64]FuzzState = undefined,
+    height: u32 = 0,
+
+    fn init(seed: u64) Fuzz {
+        var fuzz: Fuzz = .{ .prng = Prng.init(seed), .preimages = seed % 2 == 1 };
+        var base: Hash = undefined;
+        fuzz.prng.fill(&base);
+        for (&fuzz.keys, &fuzz.addresses, 0..) |*key, *address, index| {
+            if (fuzz.preimages) {
+                fuzz.prng.fill(address);
+                key.* = keccak256(address);
+            } else {
+                // Keys that share long prefixes and differ in one nibble.
+                key.* = base;
+                key[31 - fuzz.prng.below(3) * 15] ^= @intCast(index * 17 + 1);
+            }
+        }
+        for (&fuzz.slots, &fuzz.slot_keys, 0..) |*slot, *slot_key, index| {
+            fuzz.prng.fill(slot_key);
+            slot.* = if (fuzz.preimages) keccak256(slot_key) else base;
+            if (!fuzz.preimages) slot[30] ^= @intCast(index + 1);
+        }
+        fuzz.states[0] = @splat(null);
+        return fuzz;
+    }
+
+    fn code_hash(code: u8) Hash {
+        if (code == 0) return trie.node.empty_code_hash;
+        return keccak256(&.{code});
+    }
+
+    fn write_key(fuzz: *const Fuzz, writer: *std.Io.Writer, index: usize) !void {
+        try writer.print("\"key\":\"0x{x}\"", .{&fuzz.keys[index]});
+        if (fuzz.preimages) try writer.print(",\"address\":\"0x{x}\"", .{&fuzz.addresses[index]});
+    }
+
+    fn write_account(fuzz: *const Fuzz, w: *std.Io.Writer, index: usize, a: FuzzAccount) !void {
+        try w.writeAll("{\"op\":\"account\",");
+        try fuzz.write_key(w, index);
+        const code = code_hash(a.code);
+        try w.print(",\"nonce\":\"0x{x}\",\"balance\":\"0x{x}\",\"codeHash\":\"0x{x}\"}}", .{
+            a.nonce, a.balance, &code,
+        });
+    }
+
+    fn write_storage(
+        fuzz: *const Fuzz,
+        w: *std.Io.Writer,
+        index: usize,
+        slot: usize,
+        value: u64,
+    ) !void {
+        try w.writeAll("{\"op\":\"storage\",");
+        try fuzz.write_key(w, index);
+        try w.print(",\"slot\":\"0x{x}\",\"value\":\"0x{x:0>64}\"", .{ &fuzz.slots[slot], value });
+        if (fuzz.preimages) try w.print(",\"slotKey\":\"0x{x}\"", .{&fuzz.slot_keys[slot]});
+        try w.writeAll("}");
+    }
+
+    fn write_plain(fuzz: *const Fuzz, w: *std.Io.Writer, op: []const u8, index: usize) !void {
+        try w.print("{{\"op\":\"{s}\",", .{op});
+        try fuzz.write_key(w, index);
+        try w.writeAll("}");
+    }
+
+    /// One block: maybe an unwind (with its revert), then random ops and proofs.
+    fn block(fuzz: *Fuzz, w: *std.Io.Writer) !void {
+        var unwind: u32 = 0;
+        if (fuzz.height > 0 and fuzz.prng.chance(1, 4)) {
+            unwind = @intCast(fuzz.prng.range(1, @min(fuzz.height, 10)));
+        }
+        const parent = fuzz.height - unwind;
+        try w.print("{{\"number\":\"0x{x}\",\"unwind\":{d}", .{ parent + 1, unwind });
+        var state = fuzz.states[parent];
+        if (unwind > 0) {
+            try w.writeAll(",\"revert\":[");
+            try fuzz.write_revert(w, &fuzz.states[fuzz.height], &state);
+            try w.writeAll("]");
+        }
+        try w.writeAll(",\"ops\":[");
+        const ops = fuzz.prng.range(1, 8);
+        for (0..ops) |op_index| {
+            if (op_index > 0) try w.writeAll(",");
+            try fuzz.random_op(w, &state);
+        }
+        try w.writeAll("],\"proofs\":[");
+        for (0..3) |proof_index| {
+            if (proof_index > 0) try w.writeAll(",");
+            const index = fuzz.prng.below(keys_max);
+            try w.writeAll("{");
+            try fuzz.write_key(w, index);
+            try w.writeAll(",\"slots\":[");
+            const slot_a_index = fuzz.prng.below(slots_max);
+            const slot_b_index = fuzz.prng.below(slots_max);
+            const slots = .{ &fuzz.slots[slot_a_index], &fuzz.slots[slot_b_index] };
+            try w.print("\"0x{x}\",\"0x{x}\"]", slots);
+            if (fuzz.preimages) {
+                try w.print(",\"slotKeys\":[\"0x{x}\",\"0x{x}\"]", .{
+                    &fuzz.slot_keys[slot_a_index], &fuzz.slot_keys[slot_b_index],
+                });
+            }
+            try w.writeAll("}");
+        }
+        try w.writeAll("]}");
+        fuzz.height = parent + 1;
+        fuzz.states[fuzz.height] = state;
+    }
+
+    /// Writes that turn `tip` into `target`: delete what differs, then recreate it.
+    fn write_revert(
+        fuzz: *const Fuzz,
+        w: *std.Io.Writer,
+        tip: *const FuzzState,
+        target: *const FuzzState,
+    ) !void {
+        var first = true;
+        for (tip, target, 0..) |a, b, index| {
+            if (std.meta.eql(a, b)) continue;
+            if (!first) try w.writeAll(",");
+            first = false;
+            try fuzz.write_plain(w, "delete", index);
+            const account = b orelse continue;
+            try w.writeAll(",");
+            try fuzz.write_account(w, index, account);
+            for (account.slots, 0..) |value, slot| {
+                if (value == 0) continue;
+                try w.writeAll(",");
+                try fuzz.write_storage(w, index, slot, value);
+            }
+        }
+    }
+
+    fn random_op(fuzz: *Fuzz, w: *std.Io.Writer, state: *FuzzState) !void {
+        const index = fuzz.prng.below(keys_max);
+        const choice = fuzz.prng.below(10);
+        if (choice < 5 and state[index] != null) {
+            const slot = fuzz.prng.below(slots_max);
+            const value: u64 = if (fuzz.prng.chance(1, 3)) 0 else fuzz.prng.range(1, 1 << 40);
+            state[index].?.slots[slot] = value;
+            return fuzz.write_storage(w, index, slot, value);
+        }
+        if (choice == 8) {
+            if (state[index]) |*account| account.slots = @splat(0);
+            return fuzz.write_plain(w, "wipe", index);
+        }
+        if (choice == 9) {
+            state[index] = null;
+            return fuzz.write_plain(w, "delete", index);
+        }
+        // Never an empty account: nonce or balance is nonzero.
+        var account: FuzzAccount = .{
+            .nonce = fuzz.prng.range(1, 3),
+            .balance = fuzz.prng.below(1 << 20),
+            .code = @intCast(fuzz.prng.below(3)),
+        };
+        if (state[index]) |current| account.slots = current.slots;
+        state[index] = account;
+        return fuzz.write_account(w, index, account);
+    }
+};
+
+test "diff trie: seeded fuzz, the primary against hash-builder and every variant" {
+    const harness = try Harness.create();
+    defer harness.destroy();
+    var blocks: std.Io.Writer.Allocating = .init(testing.allocator);
+    defer blocks.deinit();
+    const rounds = 6 * build_options.fuzz_soak;
+    for (0..rounds) |round| {
+        var fuzz: Fuzz = .init(0x7e1e_0000 + round + build_options.fuzz_seed);
+        blocks.clearRetainingCapacity();
+        const count = fuzz.prng.range(4, 16);
+        for (0..count) |index| {
+            if (index > 0) try blocks.writer.writeAll(",");
+            try fuzz.block(&blocks.writer);
+        }
+        const response = harness.request(blocks.written()) catch |err| {
+            std.debug.print("diff trie fuzz: failing round {d}\n", .{round});
+            return err;
+        };
+        expect_variants_agree(response) catch |err| {
+            std.debug.print("diff trie fuzz: failing round {d}\n", .{round});
+            return err;
+        };
+        const variants = field(response, "variants").object;
+        try testing.expectEqual(fuzz.preimages, variants.contains("node-address"));
+        try testing.expect(variants.contains("hash-builder"));
+    }
+}

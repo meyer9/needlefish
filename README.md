@@ -136,6 +136,15 @@ pre-state from a stateless witness, and answers with every header field, receipt
 change it computes. A differential fuzz harness compares those answers with base/base and
 other clients. The protocol and its code live in `src/infra/diff_adapter`.
 
+Its `trie` mode (base/base's `TRIE_PROTOCOL.md`) applies blocks of state writes given in
+hashed key space to needlefish's own on-disk database in the request's `trie.dir`: disk mode,
+committed as the node commits a block (`StateDb.commit_hashed`, `Database.commit_applied`),
+with native unwinds and eth_getProof's proofs. Its `variants` are other root paths: `sparse`
+(the stateless `SparseState`), `state-trie` (the in-memory `StateTrie`), `hash-builder` (the
+whole state from scratch), and, when the request carries preimages, `node-address` (the
+durable node's address-keyed path). Its coverage is `nf:edge:<index>` of the trie, state
+database and storage engine functions only.
+
 For coverage-guided fuzzing, build with `-Ddiff-coverage` and set `BASE_DIFF_COVERAGE=1`:
 
 ```sh

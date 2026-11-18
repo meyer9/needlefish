@@ -59,6 +59,8 @@ pub const RawRequest = struct {
     trace: ?[]const u8 = null,
     /// `systemConfig` mode only.
     systemConfig: ?@import("system_config.zig").RawSystemConfig = null,
+    /// `trie` mode only.
+    trie: ?@import("trie_request.zig").RawTrie = null,
 };
 
 /// A decoded request.
@@ -85,6 +87,8 @@ pub const Error = error{
     InvalidField,
     InvalidAncestors,
     OutOfMemory,
+    /// `trie` mode: an `address`, `slotKey` or `slotKeys` entry does not hash to its key.
+    PreimageMismatch,
 };
 
 /// Parses a request line. The result borrows `line` and `arena`.
