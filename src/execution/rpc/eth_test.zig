@@ -2322,7 +2322,9 @@ test "eth: debug_trace prestateTracer reports pre-transaction state and diffs" {
     const first_hash = primitives.keccak256(first).bytes;
     const changes = try trace_request(h, "debug_traceTransaction", &first_hash, diff);
     const post = changes[std.mem.indexOf(u8, changes, "\"post\"").?..];
-    try expect_contains(changes[0 .. changes.len - post.len], word_zero);
+    // The counter's slot was zero: a diff leaves zero values out (revm-inspectors).
+    const pre_side = changes[0 .. changes.len - post.len];
+    try testing.expect(std.mem.indexOf(u8, pre_side, "storage") == null);
     try expect_contains(post, word_one);
     try expect_contains(post, "\"nonce\":1");
     const by_hash = try trace_request(h, "debug_traceBlockByHash", &block.bytes, plain);
@@ -2415,6 +2417,78 @@ test "eth: prestateTracer keeps accounts and slots touched by reverted frames" {
     );
     try expect_contains(text, counter_at ++ ":{");
     try expect_contains(text, "\"storage\":{\"0x" ++ zeros_62 ++ "00\":" ++ word_zero);
+}
+
+fn tip_free_call_raw(buffer: []u8, chain_id: u64, to: [20]u8) ![]const u8 {
+    const tx: consensus.Eip1559 = .{
+        .chain_id = chain_id,
+        .nonce = 0,
+        .max_priority_fee_per_gas = 0,
+        .max_fee_per_gas = 10_000_000_000,
+        .gas_limit = 200_000,
+        .to = .{ .call = .{ .bytes = to } },
+        .value = 0,
+        .input = &.{},
+        .access_list = .empty,
+    };
+    const envelope = try consensus.tx.sign(tx, fixture.key(1));
+    return envelope.encode_to(buffer);
+}
+
+test "eth: prestateTracer reports revm's loaded accounts as revm-inspectors does" {
+    const h = try Harness.create_for(&denim_rpc_spec);
+    defer h.destroy();
+    var store = try meter_history();
+    defer store.deinit(testing.allocator);
+    try h.node.db.trie().track_changes(testing.allocator);
+    try h.node.chain.attach_history(&store);
+    const vaults = [_][]const u8{ "19", "1a", "1b" };
+    for (vaults) |last| {
+        var address: [20]u8 = @splat(0);
+        address[0] = 0x42;
+        address[19] = std.fmt.parseInt(u8, last, 16) catch unreachable;
+        try h.node.db.put_account(address, 1, 0, &.{0x00});
+    }
+    // The coinbase, and the L1Block contract the L1 fee parameters are read from.
+    try h.node.db.put_account(@splat(0xfe), 1, 0, &.{});
+    var l1_block: [20]u8 = @splat(0);
+    l1_block[0] = 0x42;
+    l1_block[19] = 0x15;
+    try h.node.db.put_account(l1_block, 1, 0, &.{0x00});
+    _ = try h.mine(2);
+    var buffer: [256]u8 = undefined;
+    const raw = try tip_free_call_raw(&buffer, h.node.spec.chain_id, l1_block);
+    try expect_contains(try send_raw(h, raw), "\"result\":\"0x");
+    _ = try h.mine(4);
+    const hash = primitives.keccak256(raw).bytes;
+    const plain = "{\"tracer\":\"prestateTracer\"}";
+    const traced = try trace_request(h, "debug_traceTransaction", &hash, plain);
+    // A transaction without a tip still pays the coinbase (nothing), which revm loads.
+    try expect_contains(traced, "\"0xfefefefefefefefefefefefefefefefefefefefe\":{\"balance\"");
+    // The L1 fee parameters are read outside the EVM: no L1Block slot is listed.
+    try expect_contains(traced, "\"0x4200000000000000000000000000000000000015\":{" ++
+        "\"balance\":\"0x1\",\"code\":\"0x00\"}");
+    // A call charges no fee, yet credits the fee vaults; empty accounts are left out.
+    const call = try h.request("debug_traceCall", "[{\"from\":" ++
+        "\"0x7dc6c0165f09500b75146b66eec05a39dbbc40d2\",\"to\":" ++
+        "\"0x00000000000000000000000000000000000000aa\"},\"latest\",{\"tracer\":" ++
+        "\"prestateTracer\",\"tracerConfig\":{\"disableCode\":true}}]");
+    try testing.expect(std.mem.startsWith(u8, call, "\"result\":{" ++
+        "\"0x4200000000000000000000000000000000000019\":{\"balance\":\"0x"));
+    try testing.expect(std.mem.endsWith(u8, call, "\"}," ++
+        "\"0x420000000000000000000000000000000000001a\":{\"balance\":\"0x1\"}," ++
+        "\"0x420000000000000000000000000000000000001b\":{\"balance\":\"0x1\"}}"));
+    try testing.expectEqual(@as(usize, 3), count_of(call, "balance"));
+    // An overridden account the call never loads is not reported; the sender, empty
+    // before, is in a diff's pre, and the account it creates only in post.
+    const created = try h.request("debug_traceCall", "[{\"from\":" ++
+        "\"0x7dc6c0165f09500b75146b66eec05a39dbbc40d2\"},\"latest\",{\"stateOverrides\":" ++
+        "{\"0x5b76c950a887b42e74fdde348bf928517f41cf70\":{\"code\":\"0x\"}},\"tracer\":" ++
+        "\"prestateTracer\",\"tracerConfig\":{\"diffMode\":true}}]");
+    try testing.expectEqualStrings("\"result\":{\"pre\":{" ++
+        "\"0x7dc6c0165f09500b75146b66eec05a39dbbc40d2\":{\"balance\":\"0x0\"}},\"post\":{" ++
+        "\"0x5c7d5a7b707d05be9a3f8f28eb3099ed20e22f9f\":{\"nonce\":1}," ++
+        "\"0x7dc6c0165f09500b75146b66eec05a39dbbc40d2\":{\"nonce\":1}}}", created);
 }
 
 const override_target = "\"0x0000000000000000000000000000000000007777\"";

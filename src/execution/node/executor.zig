@@ -697,8 +697,8 @@ pub const Executor = struct {
         blob_hashes: []const [32]u8 = &.{},
         /// `maxFeePerBlobGas`; null takes the block's blob base fee (`CallFees`).
         max_fee_per_blob_gas: ?u256 = null,
-        /// Sees the state right after the call executes, before it is discarded
-        /// (debug_traceCall prestateTracer).
+        /// Sees the state right before and after the call executes, before it is
+        /// discarded (debug_traceCall prestateTracer).
         inspect: ?Inspect = null,
         /// Runs on the fresh state before the call (eth_call state overrides, the gas cap
         /// of a priced call); it may adjust the call and fail through its own context,
@@ -720,6 +720,8 @@ pub const Executor = struct {
 
     pub const Inspect = struct {
         context: *anyopaque,
+        /// Sees the state just before the call executes (overrides applied).
+        begin: *const fn (context: *anyopaque, state: *const evm.State) void,
         run: *const fn (context: *anyopaque, state: *evm.State) void,
     };
 
@@ -895,6 +897,7 @@ pub const Executor = struct {
             .disable_tx_gas_cap = true,
             .disable_block_gas_limit = true,
         };
+        if (call.inspect) |inspect| inspect.begin(inspect.context, executor.state);
         const result = try evm.transaction.transact(executor.machine, fork, &tx);
         const executed = switch (result) {
             .invalid => |reason| return .{ .invalid = reason },

@@ -304,7 +304,7 @@ fn warm_addresses(comptime fork: Fork, evm: *Evm, tx: *const TxEnv) state_module
     if (tx.to) |to| _ = try evm.state.access(to);
     try warm_system_addresses(fork, evm);
     for (tx.access_list) |item| {
-        _ = try evm.state.access(item.address);
+        try evm.state.warm_listed_account(item.address);
         for (item.storage_keys) |key| {
             try evm.state.warm_listed_slot(item.address, primitives.b256_to_u256(key));
         }
@@ -414,7 +414,7 @@ pub fn transact_fork(comptime fork: Fork, evm: *Evm, tx: *const TxEnv) evm_modul
     const intrinsic = intrinsic_gas(fork, tx);
     const outcome = try execute_top(fork, evm, tx, intrinsic);
     const accounted = account_gas(fork, tx, outcome, intrinsic, authorization_refund);
-    if (!tx.disable_fee_charge) try pay_fees(fork, evm, tx, accounted.gas_used, fees);
+    try pay_fees(fork, evm, tx, accounted.gas_used, fees);
     return .{ .executed = finish(fork, evm, outcome, accounted) };
 }
 
@@ -529,8 +529,9 @@ fn account_gas(
     return .{ .gas_used = gas_used, .refund = refund };
 }
 
-/// Reimburse unused gas and pay the tip; on the OP Stack also refund the unused operator
-/// fee and credit the base fee, L1 fee, and operator fee vaults (the base fee is not burned).
+/// Reimburse unused gas and pay the tip (unless fee charge is disabled); on the OP Stack
+/// also refund the unused operator fee and credit the base fee, L1 fee, and operator fee
+/// vaults (the base fee is not burned).
 fn pay_fees(
     comptime fork: Fork,
     evm: *Evm,
@@ -539,16 +540,18 @@ fn pay_fees(
     fees: ?*const op.Fees,
 ) evm_module.Error!void {
     assert(gas_used <= tx.gas_limit);
-    const price = effective_gas_price(tx, evm.block.base_fee);
-    var reimbursement = @as(u256, tx.gas_limit - gas_used) * price;
     var operator_used: u256 = 0;
-    if (fees) |f| {
-        operator_used = f.operator_used(evm.block.op.?.rules(), tx.envelope, gas_used);
-        reimbursement += f.operator_charge - operator_used;
+    if (fees) |f| operator_used = f.operator_used(evm.block.op.?.rules(), tx.envelope, gas_used);
+    // base/base `reward_beneficiary`: a call without fee charge (reth's eth_call) neither
+    // reimburses the caller nor pays the coinbase, but still credits the OP fee vaults.
+    if (!tx.disable_fee_charge) {
+        const price = effective_gas_price(tx, evm.block.base_fee);
+        var reimbursement = @as(u256, tx.gas_limit - gas_used) * price;
+        if (fees) |f| reimbursement += f.operator_charge - operator_used;
+        try credit(evm, tx.caller, reimbursement, false);
+        const tip_per_gas = if (fork.at_least(.london)) price - evm.block.base_fee else price;
+        try credit(evm, evm.block.coinbase, @as(u256, gas_used) * tip_per_gas, true);
     }
-    try credit(evm, tx.caller, reimbursement, false);
-    const tip_per_gas = if (fork.at_least(.london)) price - evm.block.base_fee else price;
-    try credit(evm, evm.block.coinbase, @as(u256, gas_used) * tip_per_gas, true);
     const f = fees orelse return;
     try credit(evm, op.l1_fee_vault, f.l1, true);
     try credit(evm, op.base_fee_vault, evm.block.base_fee * gas_used, true);

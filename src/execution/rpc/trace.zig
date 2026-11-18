@@ -405,10 +405,11 @@ pub const Options = struct {
     diff_mode: bool = false,
     /// flatCallTracer `includePrecompiles`.
     include_precompiles: bool = false,
-    /// Read and type checked as alloy's `PreStateConfig` and `FlatCallConfig` do; not
-    /// applied (prestateTracer always writes code and storage, flatCallTracer parity text).
+    /// prestateTracer `disableCode` and `disableStorage`.
     disable_code: bool = false,
     disable_storage: bool = false,
+    /// Read and type checked as alloy's `FlatCallConfig` does; not applied (flatCallTracer
+    /// parity text).
     convert_parity_errors: bool = false,
     struct_log: struct_log.Config = .{},
 };
@@ -1181,18 +1182,22 @@ fn trace_call_prestate(
         return call.fail(rpc.code.internal_error, "scratch too small");
     var request = request_in;
     request.message.inspect = collected.inspect();
-    const tracer = collected.tracer();
-    const executor = api.chain.executor;
-    executor.machine.tracer = &tracer;
-    const simulated = eth.simulate(api, call, request);
-    executor.machine.tracer = null;
-    switch (try simulated) {
+    switch (try eth.simulate(api, call, request)) {
         .invalid => |reason| return eth.fail_invalid(call, reason),
         .executed => {},
     }
     if (collected.failed) return call.fail(rpc.code.internal_error, "state read failed");
     if (collected.full) return call.fail(rpc.code.server_error, "trace exceeds the trace buffers");
-    try prestate.write(call.writer, &collected, options.diff_mode);
+    try prestate.write(call.writer, &collected, prestate_config(options));
+}
+
+fn prestate_config(options: Options) prestate.Config {
+    assert(options.tracer == .prestate);
+    return .{
+        .diff = options.diff_mode,
+        .code = !options.disable_code,
+        .storage = !options.disable_storage,
+    };
 }
 
 /// prestateTracer over a stored block: each traced transaction's result is written into
@@ -1246,14 +1251,11 @@ fn run_prestate(
     try executor.recover_all(transactions);
     var building = try executor.begin_block(env);
     defer executor.known_sender = null;
-    const tracer = collected.tracer();
-    defer executor.machine.tracer = null;
     if (only == null) try w.begin_array();
     for (transactions, 0..) |raw, index| {
         const traced = only == null or only.? == index;
         if (traced) collected.take_snapshot(executor.state);
         executor.known_sender = executor.senders[index];
-        executor.machine.tracer = if (traced) &tracer else null;
         try executor.apply(&building, raw);
         if (!traced) continue;
         collected.collect(executor.state);
@@ -1265,7 +1267,7 @@ fn run_prestate(
             try w.data(&primitives.keccak256(raw).bytes);
             try w.key("result");
         }
-        try prestate.write(w, collected, options.diff_mode);
+        try prestate.write(w, collected, prestate_config(options));
         if (only == null) try w.end_object();
     }
     if (only == null) try w.end_array();

@@ -1,21 +1,20 @@
-//! geth's `prestateTracer` (config `diffMode`) over the executor's journaled state.
+//! revm-inspectors' `prestateTracer` (`geth_prestate_traces`, configs `diffMode`,
+//! `disableCode`, `disableStorage`) over the executor's journaled state.
 //!
-//! No evm hook is needed: after a transaction executes, the state cache stamps every
-//! account and slot it warmed with the transaction id, and each slot keeps its value from
-//! the transaction's start (`original`). The pre-transaction account infos come from a
-//! snapshot of the cache taken just before the transaction (earlier transactions of the
-//! block live only there), else from the session database. `collect` copies everything
-//! (code included) into bounded scratch, so writing never reads the live state.
+//! No evm hook is needed: the state cache stamps every account a transaction loads
+//! (`seen_tx`, kept when a frame reverts) and every slot it reads or writes keeps its value
+//! from the transaction's start (`original`, stamped `original_tx`). Those are the accounts
+//! and slots of revm's post-transaction state, which reth hands to the tracer. System reads
+//! (the L1 fee parameters) leave no stamp, as they bypass revm's journal. The pre-transaction
+//! account infos come from a snapshot of the cache taken just before the transaction
+//! (earlier transactions of the block, state overrides), else from the session database.
+//! `collect` copies everything (code included) into bounded scratch, so writing never reads
+//! the live state.
 //!
-//! An account is reported when the transaction warmed or changed it, or ran as a call
-//! frame; a slot when it was warmed or changed, or read by the transaction in a frame's
-//! account (system reads such as the L1 fee parameters neither warm nor run as frames).
-//! Frames come from the evm call-frame hook (`tracer`), so frames that later revert, whose
-//! warm stamps the revert clears, still count. An account reached only by BALANCE or
-//! EXTCODE* inside a reverted frame is still missed.
-//! Output is sorted by address (and slot). Diff mode reports, as geth, `pre` for changed
-//! accounts that existed (with only their changed slots) and `post` with only changed
-//! fields, so created accounts appear only in `post` and destroyed ones only in `pre`.
+//! Output is sorted by address (and slot). The default mode reports each account that was
+//! not empty before the transaction, with every slot read; diff mode follows
+//! `geth_prestate_diff_traces`: only changed accounts and changed non-zero slots, `pre`
+//! without created accounts, `post` without destroyed ones and with only changed fields.
 
 const std = @import("std");
 const assert = std.debug.assert;
@@ -39,13 +38,22 @@ pub const Info = struct {
     nonce: u64 = 0,
     code_hash: Hash = evm.primitives.keccak_empty,
     code: []const u8 = &.{},
-    exists: bool = false,
+
+    /// revm-inspectors' `account_was_empty` (the code hash, whatever `disableCode` says).
+    fn is_empty(info: *const Info) bool {
+        const no_code = std.mem.eql(u8, &info.code_hash, &evm.primitives.keccak_empty);
+        return info.balance == 0 and info.nonce == 0 and no_code;
+    }
 };
 
 pub const AccountEntry = struct {
     address: Address,
     pre: Info,
     post: Info,
+    /// Created by CREATE in the transaction (revm `is_created`).
+    created: bool = false,
+    /// Destroyed by SELFDESTRUCT in the transaction (revm `is_selfdestructed`).
+    destroyed: bool = false,
 };
 
 pub const SlotEntry = struct {
@@ -55,8 +63,14 @@ pub const SlotEntry = struct {
     post: u256,
 };
 
+/// The tracer config (alloy `PreStateConfig`).
+pub const Config = struct {
+    diff: bool = false,
+    code: bool = true,
+    storage: bool = true,
+};
+
 const Snapshot = std.AutoHashMapUnmanaged(Address, evm.state.AccountInfo);
-const FrameSet = std.AutoHashMapUnmanaged(Address, void);
 
 pub const Collected = struct {
     accounts: []AccountEntry,
@@ -71,15 +85,10 @@ pub const Collected = struct {
     full: bool = false,
     /// The database failed while reading a pre-state.
     failed: bool = false,
-    /// Addresses that ran as call frames (from and to) in the traced transaction, at most
-    /// `frames_max` (as many as account entries).
-    frames: FrameSet = .empty,
-    frames_max: u32 = 0,
 
     /// Carves the collector out of `space` (left untouched until used); null when it is too
     /// small. An eighth each goes to accounts and slots, a quarter to the snapshot of the
-    /// cached accounts, the frame set takes what its accounts' worth of entries need, and
-    /// the rest holds the accounts' code.
+    /// cached accounts, and the rest holds the accounts' code.
     pub fn init(space: []u8) ?Collected {
         const carve = @import("trace.zig").carve;
         var used: usize = 0;
@@ -89,18 +98,12 @@ pub const Collected = struct {
         const slots = carve(SlotEntry, space, &used, slot_count) orelse return null;
         const snapshot_space = carve(u8, space, &used, space.len / 4) orelse return null;
         if (accounts.len == 0 or slots.len == 0) return null;
-        // A hash map entry is its key and a metadata byte, at most 80% full.
-        const frames_space = carve(u8, space, &used, accounts.len * 2 * 32) orelse return null;
-        var fixed: std.heap.FixedBufferAllocator = .init(frames_space);
-        var frames: FrameSet = .empty;
-        frames.ensureTotalCapacity(fixed.allocator(), @intCast(accounts.len)) catch return null;
+        assert(used <= space.len);
         return .{
             .accounts = accounts,
             .slots = slots,
             .bytes = space[used..],
             .snapshot_space = snapshot_space,
-            .frames = frames,
-            .frames_max = @intCast(accounts.len),
         };
     }
 
@@ -108,7 +111,6 @@ pub const Collected = struct {
     pub fn take_snapshot(collected: *Collected, state: *const evm.State) void {
         var fixed: std.heap.FixedBufferAllocator = .init(collected.snapshot_space);
         collected.snapshot = .empty;
-        collected.frames.clearRetainingCapacity();
         const count = state.accounts.count();
         collected.snapshot.ensureTotalCapacity(fixed.allocator(), count) catch {
             collected.full = true;
@@ -137,7 +139,6 @@ pub const Collected = struct {
         collected: *Collected,
         state: *State,
         info: evm.state.AccountInfo,
-        exists: bool,
         same: ?*const Info,
     ) Info {
         if (same) |other| if (std.mem.eql(u8, &other.code_hash, &info.code_hash)) return .{
@@ -145,7 +146,6 @@ pub const Collected = struct {
             .nonce = info.nonce,
             .code_hash = info.code_hash,
             .code = other.code,
-            .exists = exists and !info.is_empty(),
         };
         const code: []const u8 = if (info.code) |code| code else if (info.has_code())
             state.database.code_by_hash(info.code_hash) catch blk: {
@@ -159,7 +159,6 @@ pub const Collected = struct {
             .nonce = info.nonce,
             .code_hash = info.code_hash,
             .code = collected.copy(code),
-            .exists = exists and !info.is_empty(),
         };
     }
 
@@ -172,19 +171,18 @@ pub const Collected = struct {
         var accounts = state.accounts.iterator();
         while (accounts.next()) |item| {
             const account = item.value_ptr;
-            const pre = collected.pre_of(state, account.address);
-            const post_exists = !account.self_destructed;
-            const post = collected.info_of(state, account.info, post_exists, &pre);
-            const framed = collected.is_frame(&account.address);
-            if (account.warm_tx != tx_id and !framed and !info_changed(&pre, &post)) continue;
+            if (account.seen_tx != tx_id) continue;
             if (collected.account_count == collected.accounts.len) {
                 collected.full = true;
                 return;
             }
+            const pre = collected.pre_of(state, account.address);
             collected.accounts[collected.account_count] = .{
                 .address = account.address,
                 .pre = pre,
-                .post = post,
+                .post = collected.info_of(state, account.info, &pre),
+                .created = account.created_tx == tx_id,
+                .destroyed = account.destroyed_tx == tx_id,
             };
             collected.account_count += 1;
         }
@@ -194,23 +192,22 @@ pub const Collected = struct {
 
     fn pre_of(collected: *Collected, state: *State, address: Address) Info {
         if (collected.snapshot.get(address)) |info| {
-            return collected.info_of(state, info, true, null);
+            return collected.info_of(state, info, null);
         }
         const found = state.database.basic(address) catch {
             collected.failed = true;
             return .{};
         };
-        return collected.info_of(state, found orelse .{}, found != null, null);
+        return collected.info_of(state, found orelse .{}, null);
     }
 
+    /// The slots the transaction read or wrote (stamped `original_tx`).
     fn collect_slots(collected: *Collected, state: *State) void {
         const tx_id = state.tx_id;
         var slots = state.slots.iterator();
         while (slots.next()) |item| {
             const slot = item.value_ptr;
             if (slot.original_tx != tx_id) continue;
-            const warm_or_changed = slot.warm_tx == tx_id or slot.present != slot.original;
-            if (!warm_or_changed and !collected.is_frame(&item.key_ptr.address)) continue;
             if (collected.slot_count == collected.slots.len) {
                 collected.full = true;
                 return;
@@ -225,37 +222,15 @@ pub const Collected = struct {
         }
     }
 
-    fn is_frame(collected: *const Collected, address: *const Address) bool {
-        return collected.frames.contains(address.*);
-    }
-
-    fn note_frame(collected: *Collected, address: Address) void {
-        if (collected.is_frame(&address)) return;
-        if (collected.frames.count() == collected.frames_max) {
-            collected.full = true;
-            return;
-        }
-        collected.frames.putAssumeCapacity(address, {});
-    }
-
-    /// The evm hook recording frame addresses; attach it for the traced transaction.
-    pub fn tracer(collected: *Collected) evm.evm.Tracer {
-        return .{ .context = collected, .enter = on_enter, .exit = on_exit, .log = on_log };
-    }
-
-    fn on_enter(context: *anyopaque, frame: evm.evm.TraceFrame) void {
-        const collected: *Collected = @ptrCast(@alignCast(context));
-        collected.note_frame(frame.from);
-        collected.note_frame(frame.to);
-    }
-
-    fn on_exit(_: *anyopaque, _: evm.evm.Outcome) void {}
-
-    fn on_log(_: *anyopaque, _: Address, _: []const [32]u8, _: []const u8) void {}
-
-    /// The `Executor.Inspect` hook (debug_traceCall).
+    /// The `Executor.Inspect` hooks (debug_traceCall): the snapshot after the overrides,
+    /// the collection after the call.
     pub fn inspect(collected: *Collected) @import("../node/root.zig").executor.Executor.Inspect {
-        return .{ .context = collected, .run = run_inspect };
+        return .{ .context = collected, .begin = begin_inspect, .run = run_inspect };
+    }
+
+    fn begin_inspect(context: *anyopaque, state: *const State) void {
+        const collected: *Collected = @ptrCast(@alignCast(context));
+        collected.take_snapshot(state);
     }
 
     fn run_inspect(context: *anyopaque, state: *State) void {
@@ -265,11 +240,6 @@ pub const Collected = struct {
 };
 
 const State = evm.State;
-
-fn info_changed(pre: *const Info, post: *const Info) bool {
-    return pre.exists != post.exists or pre.balance != post.balance or
-        pre.nonce != post.nonce or !std.mem.eql(u8, &pre.code_hash, &post.code_hash);
-}
 
 fn address_less(_: void, a: AccountEntry, b: AccountEntry) bool {
     return std.mem.order(u8, &a.address, &b.address) == .lt;
@@ -292,19 +262,27 @@ fn sort(collected: *Collected) void {
 
 const Side = enum { pre, post };
 
+/// Which slots a side lists: every one read (default mode), or the changed ones with a
+/// non-zero value on that side (diff mode, alloy `remove_zero_storage_values`).
+fn slot_listed(slot: *const SlotEntry, side: Side, diff: bool) bool {
+    if (!diff) return true;
+    const value = if (side == .pre) slot.pre else slot.post;
+    return slot.pre != slot.post and value != 0;
+}
+
 fn write_slots(
     w: *json.Writer,
     slots: []const SlotEntry,
     side: Side,
-    changed_only: bool,
+    diff: bool,
 ) json.Writer.WriteError!void {
     var count: u32 = 0;
-    for (slots) |slot| count += @intFromBool(!changed_only or slot.pre != slot.post);
+    for (slots) |*slot| count += @intFromBool(slot_listed(slot, side, diff));
     if (count == 0) return;
     try w.key("storage");
     try w.begin_object();
-    for (slots) |slot| {
-        if (changed_only and slot.pre == slot.post) continue;
+    for (slots) |*slot| {
+        if (!slot_listed(slot, side, diff)) continue;
         var key_bytes: Hash = undefined;
         std.mem.writeInt(u256, &key_bytes, slot.slot, .big);
         var key_text: [66]u8 = undefined;
@@ -316,16 +294,17 @@ fn write_slots(
     try w.end_object();
 }
 
-/// Writes one account; in diff mode `post` writes only the fields that changed.
+/// Writes one account. A diff's `post` keeps only the fields that differ from `pre`
+/// (alloy `remove_matching_account_info`); a zero nonce and empty code are never written.
 fn write_account(
     w: *json.Writer,
     entry: *const AccountEntry,
     slots: []const SlotEntry,
     side: Side,
-    diff: bool,
+    config: Config,
 ) json.Writer.WriteError!void {
     const info = if (side == .pre) &entry.pre else &entry.post;
-    const only_changes = diff and side == .post;
+    const only_changes = config.diff and side == .post;
     var address_text: [42]u8 = undefined;
     try w.key(hex_into(&address_text, &entry.address));
     try w.begin_object();
@@ -337,13 +316,27 @@ fn write_account(
         try w.key("nonce");
         try w.integer(info.nonce);
     }
-    const code_changed = !std.mem.eql(u8, &entry.pre.code_hash, &entry.post.code_hash);
-    if (info.code.len > 0 and (!only_changes or code_changed)) {
+    if (config.code and info.code.len > 0 and (!only_changes or !same_code(entry))) {
         try w.key("code");
         try w.data(info.code);
     }
-    try write_slots(w, slots, side, diff);
+    if (config.storage) try write_slots(w, slots, side, config.diff);
     try w.end_object();
+}
+
+fn same_code(entry: *const AccountEntry) bool {
+    return std.mem.eql(u8, &entry.pre.code_hash, &entry.post.code_hash);
+}
+
+/// Whether a diff keeps the account (alloy `retain_changed`): its pre and post states
+/// differ, or it was destroyed (revm-inspectors never puts it in `post`).
+fn diff_keeps(entry: *const AccountEntry, slots: []const SlotEntry, config: Config) bool {
+    if (entry.destroyed) return true;
+    if (config.storage) {
+        for (slots) |slot| if (slot.pre != slot.post) return true;
+    }
+    if (config.code and !same_code(entry)) return true;
+    return entry.pre.balance != entry.post.balance or entry.pre.nonce != entry.post.nonce;
 }
 
 fn slots_of(collected: *const Collected, cursor: *u32, address: *const Address) []const SlotEntry {
@@ -357,32 +350,48 @@ fn slots_of(collected: *const Collected, cursor: *u32, address: *const Address) 
     return slots[start..cursor.*];
 }
 
-fn write_side(w: *json.Writer, collected: *const Collected, side: Side, diff: bool) !void {
+/// Whether `side` lists the account: the default mode skips accounts empty before the
+/// transaction; a diff's `pre` skips created accounts that were empty, its `post`
+/// destroyed ones.
+fn side_lists(
+    entry: *const AccountEntry,
+    slots: []const SlotEntry,
+    side: Side,
+    config: Config,
+) bool {
+    if (!config.diff) return !entry.pre.is_empty();
+    if (!diff_keeps(entry, slots, config)) return false;
+    return switch (side) {
+        .pre => !(entry.created and entry.pre.is_empty()),
+        .post => !entry.destroyed,
+    };
+}
+
+fn write_side(w: *json.Writer, collected: *const Collected, side: Side, config: Config) !void {
+    assert(config.diff or side == .pre);
     try w.begin_object();
     var cursor: u32 = 0;
     for (collected.accounts[0..collected.account_count]) |*entry| {
         const slots = slots_of(collected, &cursor, &entry.address);
-        if (diff) {
-            var slot_changed = false;
-            for (slots) |slot| slot_changed = slot_changed or slot.pre != slot.post;
-            if (!slot_changed and !info_changed(&entry.pre, &entry.post)) continue;
-            const exists = if (side == .pre) entry.pre.exists else entry.post.exists;
-            if (!exists) continue;
-        }
-        try write_account(w, entry, slots, side, diff);
+        if (!side_lists(entry, slots, side, config)) continue;
+        try write_account(w, entry, slots, side, config);
     }
     try w.end_object();
 }
 
 /// Writes the collected prestate (or `{pre, post}` in diff mode).
-pub fn write(w: *json.Writer, collected: *const Collected, diff: bool) json.Writer.WriteError!void {
+pub fn write(
+    w: *json.Writer,
+    collected: *const Collected,
+    config: Config,
+) json.Writer.WriteError!void {
     assert(!collected.full and !collected.failed);
-    if (!diff) return write_side(w, collected, .pre, false);
+    if (!config.diff) return write_side(w, collected, .pre, config);
     try w.begin_object();
     try w.key("pre");
-    try write_side(w, collected, .pre, true);
+    try write_side(w, collected, .pre, config);
     try w.key("post");
-    try write_side(w, collected, .post, true);
+    try write_side(w, collected, .post, config);
     try w.end_object();
 }
 
@@ -411,9 +420,14 @@ fn random_collection(seed: u64) !void {
             .nonce = prng.below(3),
             .code_hash = if (prng.chance(1, 2)) evm.primitives.keccak_empty else @splat(1),
             .code = if (prng.chance(1, 2)) &code else &.{},
-            .exists = prng.chance(3, 4),
         };
-        entry.* = .{ .address = @splat(@intCast(index)), .pre = info[0], .post = info[1] };
+        entry.* = .{
+            .address = @splat(@intCast(index)),
+            .pre = info[0],
+            .post = info[1],
+            .created = prng.chance(1, 4),
+            .destroyed = prng.chance(1, 4),
+        };
     }
     collected.slot_count = @intCast(prng.range(0, slots.len));
     for (slots[0..collected.slot_count], 0..) |*slot, index| slot.* = .{
@@ -423,11 +437,19 @@ fn random_collection(seed: u64) !void {
         .post = prng.below(3),
     };
     var out: [1 << 15]u8 = undefined;
-    for ([_]bool{ false, true }) |diff| {
+    for (0..8) |bits| {
+        const config: Config = .{
+            .diff = bits & 1 != 0,
+            .code = bits & 2 != 0,
+            .storage = bits & 4 != 0,
+        };
         var writer: std.Io.Writer = .fixed(&out);
         var w: json.Writer = .init(&writer);
-        try write(&w, &collected, diff);
-        try json.validate(writer.buffered());
+        try write(&w, &collected, config);
+        const text = writer.buffered();
+        try json.validate(text);
+        if (!config.code) try testing.expect(std.mem.indexOf(u8, text, "\"code\"") == null);
+        if (!config.storage) try testing.expect(std.mem.indexOf(u8, text, "storage") == null);
     }
 }
 
@@ -443,33 +465,83 @@ fn fuzz_collection(_: void, smith: *testing.Smith) anyerror!void {
     try random_collection(smith.value(u64));
 }
 
-test "prestate: diff mode keeps only changes in post" {
-    var accounts = [_]AccountEntry{.{
-        .address = @splat(5),
-        .pre = .{ .balance = 7, .nonce = 1, .exists = true },
-        .post = .{ .balance = 7, .nonce = 2, .exists = true },
-    }};
+fn word_text(comptime last: []const u8) []const u8 {
+    const zeros = "00000000000000000000000000000000000000000000000000000000000000";
+    comptime assert(zeros.len == 62);
+    return "\"0x" ++ zeros ++ last ++ "\"";
+}
+
+fn address_key(comptime byte: []const u8) []const u8 {
+    comptime var text: []const u8 = "\"0x";
+    inline for (0..20) |_| text = text ++ byte;
+    return text ++ "\"";
+}
+
+const address_5 = address_key("05");
+const address_6 = address_key("06");
+const address_7 = address_key("07");
+const address_8 = address_key("08");
+const word_0 = word_text("00");
+const word_1 = word_text("01");
+const word_2 = word_text("02");
+const word_3 = word_text("03");
+const word_4 = word_text("04");
+const word_9 = word_text("09");
+
+fn write_text(collected: *const Collected, config: Config, out: []u8) ![]const u8 {
+    var writer: std.Io.Writer = .fixed(out);
+    var w: json.Writer = .init(&writer);
+    try write(&w, collected, config);
+    return writer.buffered();
+}
+
+test "prestate: modes follow revm-inspectors' geth_prestate_traces" {
+    var accounts = [_]AccountEntry{
+        .{
+            .address = @splat(5),
+            .pre = .{ .balance = 7, .nonce = 1 },
+            .post = .{ .balance = 7, .nonce = 2 },
+        },
+        // Created on an empty address: only in a diff's post.
+        .{ .address = @splat(6), .pre = .{}, .post = .{ .nonce = 1 }, .created = true },
+        // Destroyed: only in a diff's pre.
+        .{ .address = @splat(7), .pre = .{ .balance = 5 }, .post = .{}, .destroyed = true },
+        // Read only: in the default mode alone.
+        .{ .address = @splat(8), .pre = .{ .balance = 3 }, .post = .{ .balance = 3 } },
+    };
     var slots = [_]SlotEntry{
         .{ .address = @splat(5), .slot = 1, .pre = 3, .post = 3 },
         .{ .address = @splat(5), .slot = 2, .pre = 0, .post = 9 },
+        .{ .address = @splat(5), .slot = 3, .pre = 4, .post = 0 },
     };
     const collected: Collected = .{
         .accounts = &accounts,
-        .account_count = 1,
+        .account_count = accounts.len,
         .slots = &slots,
-        .slot_count = 2,
+        .slot_count = slots.len,
         .bytes = &.{},
         .snapshot_space = &.{},
     };
     var out: [2048]u8 = undefined;
-    var writer: std.Io.Writer = .fixed(&out);
-    var w: json.Writer = .init(&writer);
-    try write(&w, &collected, true);
-    const text = writer.buffered();
-    const post = text[std.mem.indexOf(u8, text, "\"post\"").?..];
-    try testing.expect(std.mem.indexOf(u8, post, "balance") == null);
-    try testing.expect(std.mem.indexOf(u8, post, "\"nonce\":2") != null);
-    // Only the changed slot, in both sides.
-    try testing.expectEqual(@as(usize, 2), std.mem.count(u8, text, "0002\":"));
-    try testing.expect(std.mem.indexOf(u8, text, "0001\":") == null);
+    // A diff lists changed slots without their zero values, and post only what changed.
+    try testing.expectEqualStrings("{\"pre\":{" ++ address_5 ++
+        ":{\"balance\":\"0x7\",\"nonce\":1,\"storage\":{" ++ word_3 ++ ":" ++
+        word_4 ++ "}}," ++ address_7 ++ ":{\"balance\":\"0x5\"}}," ++
+        "\"post\":{" ++ address_5 ++ ":{\"nonce\":2,\"storage\":{" ++
+        word_2 ++ ":" ++ word_9 ++ "}}," ++ address_6 ++
+        ":{\"nonce\":1}}}", try write_text(&collected, .{ .diff = true }, &out));
+    // The default mode skips accounts empty before the transaction, keeps every slot read.
+    const full = "{" ++ address_5 ++ ":{\"balance\":\"0x7\",\"nonce\":1," ++
+        "\"storage\":{" ++ word_1 ++ ":" ++ word_3 ++ "," ++
+        word_2 ++ ":" ++ word_0 ++ "," ++ word_3 ++ ":" ++
+        word_4 ++ "}}," ++ address_7 ++ ":{\"balance\":\"0x5\"}," ++
+        address_8 ++ ":{\"balance\":\"0x3\"}}";
+    try testing.expectEqualStrings(full, try write_text(&collected, .{}, &out));
+    // disableStorage drops the slots; a diff without them keeps only info changes.
+    const bare = try write_text(&collected, .{ .storage = false }, &out);
+    try testing.expect(std.mem.indexOf(u8, bare, "storage") == null);
+    try testing.expectEqual(@as(usize, 3), std.mem.count(u8, bare, "balance"));
+    const bare_diff = try write_text(&collected, .{ .diff = true, .storage = false }, &out);
+    try testing.expect(std.mem.indexOf(u8, bare_diff, "storage") == null);
+    try testing.expect(std.mem.indexOf(u8, bare_diff, "\"nonce\":2") != null);
 }

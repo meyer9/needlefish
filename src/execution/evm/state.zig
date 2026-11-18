@@ -81,6 +81,12 @@ pub const Account = struct {
     warm_tx: u32 = 0,
     created_tx: u32 = 0,
     storage_epoch: u32 = 0,
+    /// The last transaction that loaded the account (not reverted, unlike `warm_tx`);
+    /// system reads such as the L1 fee parameters do not count. The accounts a
+    /// transaction loads are revm's post-transaction state (prestateTracer).
+    seen_tx: u32 = 0,
+    /// The transaction whose SELFDESTRUCT destroyed the account.
+    destroyed_tx: u32 = 0,
 
     /// Whether the account counts as "empty/non-existent" for the given fork:
     /// EIP-161 empty from Spurious Dragon, otherwise absent from the state.
@@ -538,8 +544,16 @@ pub const State = struct {
         return state.slot_list[0..state.slots.count()];
     }
 
-    /// The cached account, loading it from the database on first use. Does not warm.
+    /// The cached account, loading it from the database on first use, and marked as seen
+    /// by the current transaction. Does not warm.
     pub fn load(state: *State, address: Address) Error!*Account {
+        const account = try state.load_unseen(address);
+        account.seen_tx = state.tx_id;
+        return account;
+    }
+
+    /// `load` for system reads, which leave the account unseen by the transaction.
+    fn load_unseen(state: *State, address: Address) Error!*Account {
         if (state.accounts.getPtr(address)) |account| return account;
         if (state.accounts.count() >= state.limits.accounts_max) return error.StateFull;
         const info = try state.database.basic(address);
@@ -560,7 +574,17 @@ pub const State = struct {
 
     /// Load and warm an account (EIP-2929), reporting whether it was cold.
     pub fn access(state: *State, address: Address) Error!Access {
-        const account = try state.load(address);
+        return state.warm(try state.load(address));
+    }
+
+    /// Warm an EIP-2930 access list address without loading it for the transaction (revm
+    /// warms listed addresses; only a later use loads them).
+    pub fn warm_listed_account(state: *State, address: Address) Error!void {
+        _ = try state.warm(try state.load_unseen(address));
+    }
+
+    fn warm(state: *State, account: *Account) Error!Access {
+        const address = account.address;
         const is_cold = account.warm_tx != state.tx_id and !state.static_warm.contains(address);
         if (is_cold) {
             try state.record(.account_warmed, @intFromPtr(account), 0, 0);
@@ -773,10 +797,19 @@ pub const State = struct {
     }
 
     /// Present value of a slot without warming it, for system reads (OP L1Block fees).
+    /// The account stays unseen and the slot unstamped (`original_tx`), so neither counts
+    /// as read by the transaction; the value is the transaction's start value either way.
     pub fn storage_value(state: *State, address: Address, slot: u256) Error!u256 {
-        const account = try state.load(address);
+        const account = try state.load_unseen(address);
+        const key = StorageKey{ .address = address, .slot = slot };
+        if (state.slots.getPtr(key)) |cached| {
+            if (cached.epoch == account.storage_epoch) return cached.present;
+        }
         const cached = try state.slot_for(account, slot);
         assert(cached.epoch == account.storage_epoch);
+        assert(cached.original == cached.present);
+        // No transaction has id 0: the next read in the transaction stamps it.
+        cached.original_tx = 0;
         return cached.present;
     }
 
@@ -858,7 +891,10 @@ pub const State = struct {
     pub fn finalize_transaction(state: *State, comptime fork: Fork) void {
         for (state.journal[0..state.journal_len]) |entry| {
             switch (entry.kind) {
-                .self_destructed => state.destroy(account_at(entry)),
+                .self_destructed => {
+                    account_at(entry).destroyed_tx = state.tx_id;
+                    state.destroy(account_at(entry));
+                },
                 .account_touched => {
                     const account = account_at(entry);
                     account.touched = false;
