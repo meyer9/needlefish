@@ -279,9 +279,10 @@ fn validate_and_buy_gas(
         const delegated = fork.at_least(.prague) and bytecode.delegation_target(code) != null;
         if (!delegated) return .sender_has_code;
     }
-    if (sender.info.nonce == std.math.maxInt(u64)) return .nonce_overflow;
+    // A wrong nonce is reported before a sender's nonce of 2^64 - 1 (revm, Nethermind).
     if (tx.nonce < sender.info.nonce) return .nonce_too_low;
     if (tx.nonce > sender.info.nonce) return .nonce_too_high;
+    if (sender.info.nonce == std.math.maxInt(u64)) return .nonce_overflow;
     if (tx.disable_fee_charge) {
         if (tx.to != null) try evm.state.set_nonce(sender, sender.info.nonce + 1);
         try evm.state.touch(sender);

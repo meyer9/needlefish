@@ -708,6 +708,21 @@ test "eth: eth_simulateV1 call errors and validation" {
     try expect_failure(h, "eth_simulateV1", funded_nonce, "-38011", "nonce too high\"}");
 }
 
+test "eth: eth_simulateV1 from a sender at the maximum nonce" {
+    const h = try Harness.create();
+    defer h.destroy();
+    const max_sender = "{" ++ poor_sender ++
+        ":{\"nonce\":\"0xffffffffffffffff\",\"balance\":\"0xffffffffffffffffffff\"}}";
+    // With validation, a lower nonce is reported before the maximum one.
+    const blocks = "[{\"blockStateCalls\":[{\"stateOverrides\":" ++ max_sender ++
+        ",\"calls\":[{\"from\":" ++ poor_sender ++ ",\"maxFeePerGas\":\"0x10000000000\"";
+    const low = blocks ++ ",\"nonce\":\"0x28a\"}]}],\"validation\":true}]";
+    try expect_failure(h, "eth_simulateV1", low, "-38010", "nonce too low");
+    // Without validation, eth_simulateV1 refuses to bump the nonce (Nethermind).
+    const plain = blocks ++ "}]}]}]";
+    try expect_failure(h, "eth_simulateV1", plain, "-32603", "nonce has max value");
+}
+
 test "eth: eth_simulateV1 traceTransfers adds ERC-7528 transfer logs outside the bloom" {
     const h = try Harness.create();
     defer h.destroy();
