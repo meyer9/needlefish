@@ -708,6 +708,40 @@ test "eth: eth_simulateV1 call errors and validation" {
     try expect_failure(h, "eth_simulateV1", funded_nonce, "-38011", "nonce too high\"}");
 }
 
+test "eth: eth_simulateV1 traceTransfers adds ERC-7528 transfer logs outside the bloom" {
+    const h = try Harness.create();
+    defer h.destroy();
+    // The callee runs LOG0 (no data); the sender is funded by an override.
+    const request = "[{\"blockStateCalls\":[{\"stateOverrides\":{" ++ poor_sender ++
+        ":{\"balance\":\"0x10\"}," ++ override_target ++ ":{\"code\":\"0x60006000a000\"}}," ++
+        "\"calls\":[{\"from\":" ++ poor_sender ++ ",\"to\":" ++ override_target ++
+        ",\"value\":\"0x5\"}]}]";
+    const plain = try h.request("eth_simulateV1", request ++ "}]");
+    const bloom_at = std.mem.indexOf(u8, plain, "\"logsBloom\":").?;
+    var bloom: [600]u8 = undefined;
+    const plain_bloom = bloom[0..532];
+    @memcpy(plain_bloom, plain[bloom_at..][0..532]);
+    try testing.expectEqual(@as(usize, 1), count_of(plain, "\"logIndex\""));
+    const traced = try h.request("eth_simulateV1", request ++ ",\"traceTransfers\":true}]");
+    const transfer = "{\"address\":\"0xeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee\",\"topics\":[" ++
+        "\"0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef\"," ++
+        "\"0x000000000000000000000000000000000000000000000000000000000000dead\"," ++
+        "\"0x0000000000000000000000000000000000000000000000000000000000007777\"]," ++
+        "\"data\":\"0x" ++ zeros_62 ++ "05\"";
+    try expect_contains(traced, "\"logs\":[" ++ transfer);
+    try expect_contains(traced, "\"logIndex\":\"0x0\"");
+    try expect_contains(traced, "\"address\":" ++ override_target ++ ",\"topics\":[]");
+    try expect_contains(traced, "\"logIndex\":\"0x1\"");
+    // The block's bloom (and receipts) leave the synthetic log out.
+    try expect_contains(traced, plain_bloom);
+    // A reverted call logs no transfer.
+    const reverting = "[{\"blockStateCalls\":[{\"stateOverrides\":{" ++ poor_sender ++
+        ":{\"balance\":\"0x10\"}," ++ override_target ++ ":{\"code\":\"0x5f5ffd\"}}," ++
+        "\"calls\":[{\"from\":" ++ poor_sender ++ ",\"to\":" ++ override_target ++
+        ",\"value\":\"0x5\"}]}],\"traceTransfers\":true}]";
+    try expect_contains(try h.request("eth_simulateV1", reverting), "\"logs\":[]");
+}
+
 /// Reverts with `Error("nope")`: CODECOPY the 100 bytes after the 10-byte prefix, REVERT.
 const revert_nope_code = "0x6064600a5f39" ++ "60645ffd" ++ revert_nope_data[2..];
 const revert_nope_data = "0x08c379a0" ++ zeros_62 ++ "20" ++ zeros_62 ++ "04" ++

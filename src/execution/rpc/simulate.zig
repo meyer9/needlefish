@@ -11,8 +11,9 @@
 //! base/base assembles (`simulate_block.zig`: header, hash, transactions, withdrawals) plus
 //! `calls` (`returnData`, `logs`, `gasUsed`, `maxUsedGas`, `status`, `error` for a revert
 //! (code 3, reth's "execution reverted: <reason>", with data) or a halt (-32015, reth's halt
-//! text)); `returnFullTransactions` writes transaction objects. Not supported:
-//! `traceTransfers`, `movePrecompileToAddress`.
+//! text)); `returnFullTransactions` writes transaction objects; `traceTransfers` adds
+//! Nethermind's ERC-7528 transfer logs to the calls' logs (`simulate_transfers.zig`). Not
+//! supported: `movePrecompileToAddress`.
 
 const std = @import("std");
 const assert = std.debug.assert;
@@ -28,6 +29,7 @@ const call_fees = @import("call_fees.zig");
 const chainspec = @import("../chainspec/root.zig");
 const schedule_module = @import("simulate_schedule.zig");
 const assembly = @import("simulate_block.zig");
+const transfers_module = @import("simulate_transfers.zig");
 const primitives = @import("../../common/primitives/root.zig");
 
 const Api = eth.Api;
@@ -135,6 +137,8 @@ const Simulation = struct {
     /// What is left of the RPC gas cap, shared by every call of the request (reth
     /// `remaining_call_gas_limit`).
     gas_cap_remaining: u64 = eth.rpc_gas_cap,
+    /// `traceTransfers`: the running call's transfer logs.
+    transfers: ?*transfers_module.Transfers = null,
 };
 
 /// reth `EthSimulateError::GasLimitReached` (-38026, as `TooManyBlocks`).
@@ -155,14 +159,12 @@ fn simulate_v1(api: *Api, call: *Call) HandlerError!void {
     try call.params.finish();
     const blocks = (json.find_path(options, &.{"blockStateCalls"}) catch null) orelse
         return error.InvalidParams;
-    const count = try count_blocks(blocks);
-    if (count > blocks_max) {
-        return call.fail(schedule_module.code_too_many_blocks, "too many blocks");
-    }
-    if (count == 0) return call.fail(rpc.code.invalid_params, "calls are empty.");
+    try check_count(call, blocks);
     const scratch = try scratch_of(api, call, view);
-    // Calls take the first half of the scratch, the block being assembled the second.
-    const space = scratch[0 .. scratch.len / 2];
+    var transfers: transfers_module.Transfers = .{ .items = &.{} };
+    const traced: ?*transfers_module.Transfers =
+        if (try json_true(options, "traceTransfers")) &transfers else null;
+    const space = try call_space(call, scratch, traced);
     const header = eth.view_header(api, view);
     const denim = api.spec.upgrades[@backingInt(chainspec.Upgrade.denim)];
     const chain = api.chain;
@@ -180,12 +182,13 @@ fn simulate_v1(api: *Api, call: *Call) HandlerError!void {
         .api = api,
         .call = call,
         .space = space,
-        .block_space = scratch[space.len..],
+        .block_space = scratch[scratch.len / 2 ..],
         .full_transactions = try json_true(options, "returnFullTransactions"),
         .parent_beacon_block_root = header.parent_beacon_block_root,
         .validation = try json_true(options, "validation"),
         .extra_data = header.extra_data,
         .history = null,
+        .transfers = traced,
     };
     const database: ?evm.state.Database = switch (view) {
         .head => blk: {
@@ -220,6 +223,27 @@ fn simulate_v1(api: *Api, call: *Call) HandlerError!void {
     try run_blocks(&simulation, &schedule, &parent, blocks);
 }
 
+/// The calls' scratch: the first half (the block being assembled takes the second), less
+/// the `traceTransfers` buffer at its tail when `transfers` is given.
+fn call_space(
+    call: *Call,
+    scratch: []u8,
+    transfers: ?*transfers_module.Transfers,
+) HandlerError![]u8 {
+    const half = scratch.len / 2;
+    const traced = transfers orelse return scratch[0..half];
+    const Transfer = transfers_module.Transfer;
+    const items_max = transfers_module.items_max;
+    const transfer_bytes = items_max * @sizeOf(Transfer) + @alignOf(Transfer);
+    if (half < 2 * transfer_bytes) return call.fail(rpc.code.internal_error, "scratch too small");
+    var used: usize = 0;
+    const tail = scratch[half - transfer_bytes .. half];
+    // Proof: the tail holds `items_max` transfers past any alignment.
+    traced.items = @import("trace.zig").carve(Transfer, tail, &used, items_max).?;
+    assert(traced.items.len == items_max);
+    return scratch[0 .. half - transfer_bytes];
+}
+
 /// The scratch a simulation may use: all of it at the head, else what the proofs leave.
 fn scratch_of(api: *Api, call: *Call, view: state_view.View) HandlerError![]u8 {
     const scratch = switch (view) {
@@ -230,6 +254,15 @@ fn scratch_of(api: *Api, call: *Call, view: state_view.View) HandlerError![]u8 {
     };
     assert(scratch.len <= api.scratch.len);
     return scratch;
+}
+
+fn check_count(call: *Call, blocks: []const u8) HandlerError!void {
+    const count = try count_blocks(blocks);
+    if (count > blocks_max) {
+        return call.fail(schedule_module.code_too_many_blocks, "too many blocks");
+    }
+    if (count == 0) return call.fail(rpc.code.invalid_params, "calls are empty.");
+    assert(count > 0 and count <= blocks_max);
 }
 
 fn count_blocks(blocks: []const u8) HandlerError!u64 {
@@ -617,9 +650,17 @@ fn run_call(
         .tx_hash = try add_transaction(simulation, block, &message, raw, sender.nonce),
     };
     try add_da_footprint(simulation, env, block);
+    var hooks: evm.evm.Tracer = undefined;
+    if (simulation.transfers) |transfers| {
+        transfers.reset();
+        hooks = transfers.tracer();
+        executor.machine.tracer = &hooks;
+    }
     const result = executor.session_call(env, message) catch |err| {
+        executor.machine.tracer = null;
         return call.fail(rpc.code.internal_error, @errorName(err));
     };
+    executor.machine.tracer = null;
     const executed = switch (result) {
         .invalid => |reason| return fail_invalid(simulation, reason, &message, sender),
         .executed => |executed| executed,
@@ -652,10 +693,7 @@ fn write_call(
     try w.data(if (executed.status == .success) executed.output else &.{});
     try w.key("logs");
     try w.begin_array();
-    if (executed.status == .success) for (executed.logs) |item| {
-        try write_log(w, item, position, log_index.*);
-        log_index.* += 1;
-    };
+    if (executed.status == .success) try write_logs(simulation, executed.logs, position, log_index);
     try w.end_array();
     try w.key("gasUsed");
     try w.quantity(executed.gas_used);
@@ -846,6 +884,52 @@ fn write_error(
         try w.data(data);
     }
     try w.end_object();
+}
+
+/// The call's logs, with `traceTransfers`' transfer logs before the logs that follow them.
+fn write_logs(
+    simulation: *const Simulation,
+    logs: []const evm.state.Log,
+    position: Position,
+    log_index: *u64,
+) HandlerError!void {
+    const w = simulation.call.writer;
+    const empty: []const transfers_module.Transfer = &.{};
+    var transfers = empty;
+    if (simulation.transfers) |traced| {
+        if (traced.full) return simulation.call.fail(rpc.code.internal_error, "too many transfers");
+        assert(traced.depth == 0 and traced.logs == logs.len);
+        transfers = traced.items[0..traced.count];
+    }
+    var next: usize = 0;
+    for (0..logs.len + 1) |real| {
+        while (next < transfers.len and transfers[next].position <= real) : (next += 1) {
+            try write_transfer_log(w, &transfers[next], position, log_index.*);
+            log_index.* += 1;
+        }
+        if (real == logs.len) break;
+        try write_log(w, logs[real], position, log_index.*);
+        log_index.* += 1;
+    }
+    assert(next == transfers.len);
+}
+
+fn write_transfer_log(
+    w: *json.Writer,
+    transfer: *const transfers_module.Transfer,
+    position: Position,
+    index: u64,
+) HandlerError!void {
+    var data: [32]u8 = undefined;
+    std.mem.writeInt(u256, &data, transfer.value, .big);
+    const words = transfers_module.topics_of(transfer);
+    const log: evm.state.Log = .{
+        .address = transfers_module.eth_address,
+        .topics = .{ words[0], words[1], words[2], @splat(0) },
+        .topic_count = words.len,
+        .data = &data,
+    };
+    try write_log(w, log, position, index);
 }
 
 fn write_log(

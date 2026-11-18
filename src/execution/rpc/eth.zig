@@ -1678,6 +1678,7 @@ test {
     _ = @import("access_list.zig");
     _ = @import("simulate.zig");
     _ = @import("simulate_block.zig");
+    _ = @import("simulate_transfers.zig");
     _ = @import("eth_test.zig");
     _ = @import("send_sync.zig");
     _ = @import("debug_test.zig");
