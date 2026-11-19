@@ -201,9 +201,11 @@ test "transaction: vector zero-byte count matches the byte loop" {
     }
 }
 
+/// `min(fee cap, base fee + tip)`, the sum saturating as revm's `saturating_add` (an RPC base
+/// fee override can make it overflow; Nethermind then takes the fee cap, the same price).
 pub fn effective_gas_price(tx: *const TxEnv, base_fee: u256) u256 {
     const priority = tx.gas_priority_fee orelse return tx.gas_price;
-    return @min(tx.gas_price, base_fee + priority);
+    return @min(tx.gas_price, base_fee +| priority);
 }
 
 fn type_supported(comptime fork: Fork, tx_type: TxType) bool {

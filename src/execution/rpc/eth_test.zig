@@ -689,6 +689,14 @@ test "eth: eth_simulateV1 limits and rejections" {
     try expect_contains(wide_text, "\"baseFeePerGas\":\"0x9ed5eb1431d6880000\"");
     try expect_contains(wide_text, "\"returnData\":\"0x" ++ zeros_62[0..46] ++
         "9ed5eb1431d6880000\"");
+    // The largest base fee plus a tip saturates; the effective price is the fee cap (it
+    // overflowed and panicked before).
+    const word_max = "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff";
+    const huge = "[{\"blockStateCalls\":[{\"blockOverrides\":{\"baseFeePerGas\":\"0x" ++
+        word_max ++ "\"},\"calls\":[{\"to\":" ++ override_target ++
+        ",\"maxFeePerGas\":\"0x" ++ word_max ++ "\",\"maxPriorityFeePerGas\":\"0x" ++
+        word_max ++ "\"}]}]}]";
+    try expect_contains(try h.request("eth_simulateV1", huge), "\"status\":\"0x1\"");
     try expect_contains(try h.request("eth_simulateV1", "[{}]"), "invalid params");
     // A gas limit above the block's and the RPC gas cap is refused, not run (a looping call
     // without gas would otherwise spin for 2^64 gas).
