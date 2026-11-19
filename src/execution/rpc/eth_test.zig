@@ -2760,20 +2760,16 @@ test "eth: prestateTracer reports revm's loaded accounts as revm-inspectors does
     // Nethermind lists an account's code hash next to its code.
     try expect_contains(traced, "\"0x4200000000000000000000000000000000000015\":{" ++
         "\"balance\":\"0x1\",\"code\":\"0x00\",\"codeHash\":" ++ code_hash_00 ++ "}");
-    // A call charges no fee, yet credits the fee vaults; empty accounts are left out.
+    // A call charges no fee and credits no fee vault; as Nethermind, the coinbase is
+    // listed (credited nothing) and empty accounts are left out.
     const call = try h.request("debug_traceCall", "[{\"from\":" ++
         "\"0x7dc6c0165f09500b75146b66eec05a39dbbc40d2\",\"to\":" ++
         "\"0x00000000000000000000000000000000000000aa\"},\"latest\",{\"tracer\":" ++
         "\"prestateTracer\",\"tracerConfig\":{\"disableCode\":true}}]");
     try testing.expect(std.mem.startsWith(u8, call, "\"result\":{" ++
-        "\"0x4200000000000000000000000000000000000019\":{\"balance\":\"0x"));
-    // `disableCode` keeps the code hash.
-    try testing.expect(std.mem.endsWith(u8, call, ",\"codeHash\":" ++ code_hash_00 ++ "}," ++
-        "\"0x420000000000000000000000000000000000001a\":{\"balance\":\"0x1\"," ++
-        "\"codeHash\":" ++ code_hash_00 ++ "}," ++
-        "\"0x420000000000000000000000000000000000001b\":{\"balance\":\"0x1\"," ++
-        "\"codeHash\":" ++ code_hash_00 ++ "}}"));
-    try testing.expectEqual(@as(usize, 3), count_of(call, "balance"));
+        "\"0xfefefefefefefefefefefefefefefefefefefefe\":{\"balance\":\"0x"));
+    try testing.expect(std.mem.endsWith(u8, call, "\"}}"));
+    try testing.expectEqual(@as(usize, 1), count_of(call, "balance"));
     // An overridden account the call never loads is not reported; the sender, empty
     // before, is in a diff's pre, and the account it creates only in post.
     const created = try h.request("debug_traceCall", "[{\"from\":" ++

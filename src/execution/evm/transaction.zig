@@ -547,9 +547,9 @@ fn account_gas(
     return .{ .gas_used = gas_used, .refund = refund, .max_used = max_used };
 }
 
-/// Reimburse unused gas and pay the tip (unless fee charge is disabled); on the OP Stack
-/// also refund the unused operator fee and credit the base fee, L1 fee, and operator fee
-/// vaults (the base fee is not burned).
+/// Reimburse unused gas and pay the tip; on the OP Stack also refund the unused operator
+/// fee and credit the base fee, L1 fee, and operator fee vaults (the base fee is not
+/// burned). A call without fee charge pays nobody.
 fn pay_fees(
     comptime fork: Fork,
     evm: *Evm,
@@ -558,18 +558,21 @@ fn pay_fees(
     fees: ?*const op.Fees,
 ) evm_module.Error!void {
     assert(gas_used <= tx.gas_limit);
+    if (tx.disable_fee_charge) {
+        // Nethermind skips the OP rollup fees of an unvalidated call, collects no base fee
+        // at a zero price and credits the coinbase nothing, which still reads it: its
+        // prestateTracer lists the coinbase, not the fee vaults.
+        _ = try evm.state.load(evm.block.coinbase);
+        return;
+    }
     var operator_used: u256 = 0;
     if (fees) |f| operator_used = f.operator_used(evm.block.op.?.rules(), tx.envelope, gas_used);
-    // base/base `reward_beneficiary`: a call without fee charge (reth's eth_call) neither
-    // reimburses the caller nor pays the coinbase, but still credits the OP fee vaults.
-    if (!tx.disable_fee_charge) {
-        const price = effective_gas_price(tx, evm.block.base_fee);
-        var reimbursement = @as(u256, tx.gas_limit - gas_used) * price;
-        if (fees) |f| reimbursement += f.operator_charge - operator_used;
-        try credit(evm, tx.caller, reimbursement, false);
-        const tip_per_gas = if (fork.at_least(.london)) price - evm.block.base_fee else price;
-        try credit(evm, evm.block.coinbase, @as(u256, gas_used) * tip_per_gas, true);
-    }
+    const price = effective_gas_price(tx, evm.block.base_fee);
+    var reimbursement = @as(u256, tx.gas_limit - gas_used) * price;
+    if (fees) |f| reimbursement += f.operator_charge - operator_used;
+    try credit(evm, tx.caller, reimbursement, false);
+    const tip_per_gas = if (fork.at_least(.london)) price - evm.block.base_fee else price;
+    try credit(evm, evm.block.coinbase, @as(u256, gas_used) * tip_per_gas, true);
     const f = fees orelse return;
     try credit(evm, op.l1_fee_vault, f.l1, true);
     try credit(evm, op.base_fee_vault, evm.block.base_fee * gas_used, true);
