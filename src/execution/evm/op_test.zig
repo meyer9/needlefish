@@ -1430,6 +1430,8 @@ test "op: a deposit failing its transfer loads the callee's EIP-7702 delegate" {
     try testing.expectEqual(evm_module.Status.halt, executed.status);
     const tx_id = h.state.tx_id;
     try testing.expectEqual(tx_id, h.state.accounts.getPtr(target).?.seen_tx);
-    try testing.expectEqual(tx_id, h.state.accounts.getPtr(delegate).?.seen_tx);
+    // Loaded but not stamped as read: prestateTracer lists the callee's delegate from the
+    // pre-transaction state instead.
+    try testing.expect(h.state.accounts.getPtr(delegate).?.seen_tx != tx_id);
     try testing.expectEqual(@as(u256, 0), try h.storage(delegate, 0));
 }

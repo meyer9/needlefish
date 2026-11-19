@@ -94,6 +94,8 @@ pub const Collected = struct {
     /// The traced call's EIP-7702 authorizations (debug_traceCall), whose recoverable
     /// authorities are listed even when the authorization is invalid.
     authorities: []const evm.transaction.Authorization = &.{},
+    /// The traced call's callee (debug_traceCall), null for a creation.
+    callee: ?Address = null,
 
     /// Carves the collector out of `space` (left untouched until used); null when it is too
     /// small. An eighth each goes to accounts and slots, a quarter to the snapshot of the
@@ -216,6 +218,15 @@ pub const Collected = struct {
         }
     }
 
+    /// Lists the callee and its EIP-7702 delegate as they were before the transaction, as
+    /// Nethermind's tracer looks both up before the authorizations apply (the execution
+    /// leaves the delegate it runs unseen). Call after `collect`.
+    pub fn add_callee(collected: *Collected, state: *State, callee: Address) void {
+        const entry = collected.add_account(state, callee) orelse return;
+        const delegate = evm.bytecode.delegation_target(entry.pre.code) orelse return;
+        _ = collected.add_account(state, delegate);
+    }
+
     /// Lists an account the transaction may not have loaded, as Nethermind's tracer looks
     /// it up: an EIP-7702 authority with a valid signature whose authorization was invalid
     /// (another chain id, a nonce of 2^64 - 1), or the block's beneficiary (a deposit pays
@@ -301,6 +312,7 @@ pub const Collected = struct {
     fn run_inspect(context: *anyopaque, state: *State) void {
         const collected: *Collected = @ptrCast(@alignCast(context));
         collected.collect(state);
+        if (collected.callee) |callee| collected.add_callee(state, callee);
         for (collected.authorities) |authorization| {
             const authority = authorization.authority orelse continue;
             _ = collected.add_account(state, authority);

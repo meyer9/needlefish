@@ -1199,6 +1199,7 @@ fn trace_call_prestate(
         return call.fail(rpc.code.internal_error, "scratch too small");
     var request = request_in;
     collected.authorities = request.message.authorization_list orelse &.{};
+    collected.callee = request.message.to;
     request.message.inspect = collected.inspect();
     switch (try eth.simulate(api, call, request)) {
         .invalid => |reason| return eth.fail_invalid(call, reason),
@@ -1277,7 +1278,7 @@ fn run_prestate(
         try executor.apply(&building, raw);
         if (!traced) continue;
         collected.collect(executor.state);
-        add_authorities(collected, executor, raw);
+        add_lookups(collected, executor, raw);
         // Nethermind's tracer looks up the beneficiary for every transaction.
         _ = collected.add_account(executor.state, env.beneficiary);
         if (collected.full) return error.TraceFull;
@@ -1294,14 +1295,20 @@ fn run_prestate(
     if (only == null) try w.end_array();
 }
 
-/// Lists the recoverable authorities of a stored EIP-7702 transaction (Nethermind's
-/// prestateTracer lists them even when their authorization was invalid).
-fn add_authorities(
+/// Lists a stored transaction's callee with its pre-transaction EIP-7702 delegate, and the
+/// recoverable authorities of an EIP-7702 transaction (Nethermind's prestateTracer lists
+/// them even when their authorization was invalid).
+fn add_lookups(
     collected: *prestate.Collected,
     executor: *node.executor.Executor,
     raw: []const u8,
 ) void {
     const envelope = consensus.Envelope.decode(raw) catch unreachable; // Stored by the chain.
+    // An EIP-8130 transaction's calls live in its phases.
+    if (envelope != .eip8130) switch (envelope.kind()) {
+        .call => |to| collected.add_callee(executor.state, to.bytes),
+        .create => {},
+    };
     if (envelope != .eip7702) return;
     var authorizations = envelope.eip7702.tx.authorization_list.iterator();
     var count: u32 = 0;

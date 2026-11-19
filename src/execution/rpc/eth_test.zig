@@ -1862,6 +1862,19 @@ test "eth: prestateTracer keeps what a deposit loaded before running out of gas"
     try expect_contains(traced, inner_pre);
 }
 
+test "eth: prestateTracer lists the callee of a deposit that cannot pay its value" {
+    var store = try meter_history();
+    defer store.deinit(testing.allocator);
+    const h = try failing_deposit_harness(&store);
+    defer h.destroy();
+    var deposit = deposit_to(@splat(0x55), 100_000);
+    deposit.deposit.mint = 1;
+    deposit.deposit.value = 2;
+    const traced = try failed_deposit_prestate(h, deposit);
+    try expect_contains(traced, callee_pre);
+    try expect_contains(traced, delegate_pre);
+}
+
 test "eth: prestateTracer lists the callee of a deposit below its intrinsic gas" {
     var store = try meter_history();
     defer store.deinit(testing.allocator);
@@ -3042,6 +3055,46 @@ test "eth: prestateTracer lists an authority whose authorization is invalid" {
     });
     const traced = try h.request_runtime(request);
     try expect_contains(traced, "\"0x7e5f4552091a69125d5dfcb7b8c2659029395bdf\":{\"balance\"");
+}
+
+test "eth: prestateTracer lists the callee's delegate from before the authorizations" {
+    const h = try Harness.create();
+    defer h.destroy();
+    // Key 1's account is delegated to 0xd0.. and re-delegates to 0xd1.. in the call it
+    // receives. Nethermind's tracer looks up the delegate before the authorization applies;
+    // the call then runs 0xd1..'s (empty) code without listing it.
+    var authorization: consensus.tx_fields.Authorization = .{
+        .chain_id = 0,
+        .address = .{ .bytes = @splat(0xd1) },
+        .nonce = 0,
+        .y_parity = 0,
+        .r = 0,
+        .s = 0,
+    };
+    const signature = try consensus.signature.sign(fixture.key(1), authorization.signing_hash());
+    authorization.y_parity = @intFromBool(signature.y_parity);
+    authorization.r = signature.r;
+    authorization.s = signature.s;
+    const authority = "0x7e5f4552091a69125d5dfcb7b8c2659029395bdf";
+    const old = "d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0";
+    const new = "d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1";
+    var body: [1536]u8 = undefined;
+    const format = request_prefix_format ++ "debug_traceCall\",\"params\":[{{\"to\":\"" ++
+        authority ++ "\",\"authorizationList\":[{{\"chainId\":\"0x0\",\"address\":" ++
+        "\"0x{x}\",\"nonce\":\"0x0\",\"yParity\":\"0x{x}\",\"r\":\"0x{x}\",\"s\":\"0x{x}\"}}]}}," ++
+        "\"latest\",{{\"tracer\":\"prestateTracer\",\"stateOverrides\":{{\"" ++ authority ++
+        "\":{{\"code\":\"0xef0100" ++ old ++ "\"}},\"0x" ++ old ++ "\":{{\"balance\":\"0x1\"}}," ++
+        "\"0x" ++ new ++ "\":{{\"balance\":\"0x1\"}}}}}}]}}";
+    const request = try std.fmt.bufPrint(&body, format, .{
+        &authorization.address.bytes,
+        authorization.y_parity,
+        authorization.r,
+        authorization.s,
+    });
+    const traced = try h.request_runtime(request);
+    try expect_contains(traced, "\"" ++ authority ++ "\":{\"balance\"");
+    try expect_contains(traced, "\"0x" ++ old ++ "\":{\"balance\":\"0x1\"}");
+    try testing.expect(std.mem.indexOf(u8, traced, new) == null);
 }
 
 test "eth: prestateTracer lists an authority whose authorization nonce mismatches" {

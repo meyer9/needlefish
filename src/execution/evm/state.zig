@@ -613,6 +613,12 @@ pub const State = struct {
         return state.warm(try state.load(address));
     }
 
+    /// `access` leaving the account unseen (`seen_tx`, prestateTracer only) unless the
+    /// transaction already read it.
+    pub fn access_unseen(state: *State, address: Address) Error!Access {
+        return state.warm(try state.load_unseen(address));
+    }
+
     /// Warm an EIP-2930 access list address without reading it (revm warms listed
     /// addresses; only a later use loads them).
     pub fn warm_listed_account(state: *State, address: Address) Error!void {

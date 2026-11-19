@@ -324,14 +324,23 @@ pub const Evm = struct {
             evm.arena.release(0);
         }
         var step: Step = switch (message.kind) {
-            .call => try evm.traced_call(fork, .{
-                .kind = if (message.is_static) .staticcall else .call,
-                .target = message.target,
-                .code_address = try evm.resolve_code_address(fork, message.target),
-                .value = message.value,
-                .input = message.input,
-                .gas_limit = message.gas_limit,
-            }, null, message.caller),
+            .call => call: {
+                const code_address = try evm.resolve_code_address(fork, message.target);
+                // A delegate goes in loaded, so the frame does not stamp it as read.
+                const delegated = !std.mem.eql(u8, &code_address, &message.target);
+                break :call try evm.traced_call(fork, .{
+                    .kind = if (message.is_static) .staticcall else .call,
+                    .target = message.target,
+                    .code_address = code_address,
+                    .value = message.value,
+                    .input = message.input,
+                    .gas_limit = message.gas_limit,
+                    .code_account = if (delegated)
+                        (try evm.state.access_unseen(code_address)).account
+                    else
+                        null,
+                }, null, message.caller);
+            },
             .create => try evm.traced_create(fork, .{
                 .is_create2 = false,
                 .caller = message.caller,
@@ -426,13 +435,16 @@ pub const Evm = struct {
         return evm.start_create(fork, request, parent);
     }
 
-    /// EIP-7702: a top-level call to a delegated EOA runs the delegate's code.
+    /// EIP-7702: a top-level call to a delegated EOA runs the delegate's code. The delegate
+    /// is loaded and warmed but not stamped as read: Nethermind's prestateTracer looks up
+    /// the callee's delegate as it was before the authorizations applied (the collector
+    /// lists that one), not the one this resolves to.
     pub fn resolve_code_address(evm: *Evm, comptime fork: Fork, target: Address) Error!Address {
         if (!fork.at_least(.prague)) return target;
         const account = try evm.state.load(target);
         const code = try evm.state.code(account);
         const delegate = bytecode.delegation_target(code) orelse return target;
-        _ = try evm.state.access(delegate);
+        _ = try evm.state.access_unseen(delegate);
         return delegate;
     }
 
