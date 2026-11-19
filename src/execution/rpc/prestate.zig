@@ -133,9 +133,10 @@ pub const Collected = struct {
             collected.full = true;
             return;
         };
-        var accounts = state.accounts.iterator();
-        while (accounts.next()) |item| {
-            collected.snapshot.putAssumeCapacity(item.key_ptr.*, item.value_ptr.info);
+        // The insertion list, not the table: the table's capacity follows the gas limit
+        // (about a million entries), so iterating it per transaction stalls block traces.
+        for (state.touched_accounts()) |account| {
+            collected.snapshot.putAssumeCapacity(account.address, account.info);
         }
         assert(collected.snapshot.count() == count);
     }
@@ -185,9 +186,7 @@ pub const Collected = struct {
         collected.slot_count = 0;
         collected.bytes_used = 0;
         const tx_id = state.tx_id;
-        var accounts = state.accounts.iterator();
-        while (accounts.next()) |item| {
-            const account = item.value_ptr;
+        for (state.touched_accounts()) |account| {
             if (account.seen_tx != tx_id) continue;
             if (collected.account_count == collected.accounts.len) {
                 collected.full = true;
@@ -295,17 +294,16 @@ pub const Collected = struct {
     /// The slots the transaction read or wrote (stamped `original_tx`).
     fn collect_slots(collected: *Collected, state: *State) void {
         const tx_id = state.tx_id;
-        var slots = state.slots.iterator();
-        while (slots.next()) |item| {
-            const slot = item.value_ptr;
+        for (state.touched_slots()) |item| {
+            const slot = item.slot;
             if (slot.original_tx != tx_id) continue;
             if (collected.slot_count == collected.slots.len) {
                 collected.full = true;
                 return;
             }
             collected.slots[collected.slot_count] = .{
-                .address = item.key_ptr.address,
-                .slot = item.key_ptr.slot,
+                .address = item.key.address,
+                .slot = item.key.slot,
                 .pre = slot.original,
                 .post = slot.present,
             };
