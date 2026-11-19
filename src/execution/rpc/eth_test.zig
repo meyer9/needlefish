@@ -1375,6 +1375,20 @@ test "eth: request fields parse as base/base's serde types" {
         "eth_getBlockByNumber\",\"params\":[\"{s}\",false]}}";
     const by_hash = try std.fmt.bufPrint(&body, by_hash_format, .{&hash});
     try expect_contains(try h.request_runtime(by_hash), "\"number\":\"0x1\"");
+    // EIP-1898 objects as Nethermind's converter reads them: a null blockNumber is latest,
+    // a null blockHash is absent, other members are ignored.
+    const latest = try h.request("eth_getBlockReceipts", "[\"latest\"]");
+    var latest_copy: [4096]u8 = undefined;
+    const latest_text = latest_copy[0..latest.len];
+    @memcpy(latest_text, latest);
+    const null_number = "[{\"blockNumber\":null}]";
+    try testing.expectEqualStrings(latest_text, try h.request("eth_getBlockReceipts", null_number));
+    const numbered = "[{\"blockHash\":null,\"blockNumber\":\"0x1\",\"other\":1}]";
+    try expect_contains(try h.request("eth_getBlockByNumber", numbered[0 .. numbered.len - 1] ++
+        ",false]"), "\"number\":\"0x1\"");
+    try expect_contains(try h.request("eth_getBlockReceipts", "[{\"blockHash\":null}]"), "-32602");
+    const balance = "[\"0x7e5f4552091a69125d5dfcb7b8c2659029395bdf\",{\"blockNumber\":null}]";
+    try expect_contains(try h.request("eth_getBalance", balance), "\"result\":\"0x");
     // eth_call ignores movePrecompileToAddress (only eth_simulateV1 applies it).
     const moved = "[{},\"latest\",{\"0x0000000000000000000000000000000000000001\":" ++
         "{\"movePrecompileToAddress\":\"0x8fe1cc26a5cc6c3299bc42ffe394466911fc0dea\"}}]";

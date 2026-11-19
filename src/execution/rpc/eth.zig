@@ -302,7 +302,11 @@ fn fee_history(api: *Api, call: *Call) HandlerError!void {
     }
     var percentiles_buffer: [reward_percentiles_max]f64 = undefined;
     const percentiles = try parse_percentiles(call, percentiles_raw, &percentiles_buffer);
-    const newest = try resolve_number(api, call, newest_raw);
+    // Nethermind takes any block parameter here (a hash, an EIP-1898 object).
+    const newest_hash = try resolve_block(api, call, newest_raw);
+    const newest = (api.chain.header(newest_hash) orelse {
+        return call.fail(rpc.code.server_error, "block not found");
+    }).number;
     count = @min(count, newest + 1);
     const oldest = newest + 1 - count;
     if (oldest < api.chain.genesis_number) {
@@ -569,37 +573,30 @@ pub fn resolve_block(api: *Api, call: *Call, raw: []const u8) HandlerError!Hash 
     };
 }
 
-/// An EIP-1898 block object: `blockHash` (with an optional boolean `requireCanonical`) or
-/// `blockNumber`. Any other member is refused, as alloy's `BlockId` refuses unknown fields.
+/// An EIP-1898 block object, read as Nethermind's `BlockParameterConverter` does: `blockHash`
+/// (a null one counts as absent; `requireCanonical` must be a boolean) or `blockNumber`, any
+/// block parameter but an object (a null one is latest). Both, or neither, are refused;
+/// other members are ignored.
 fn resolve_block_object(api: *Api, call: *Call, raw: []const u8) HandlerError!Hash {
-    var scanner = json.Scanner.init(raw);
-    if ((try scanner_next(&scanner)).tag != .object_begin) return error.InvalidParams;
-    var hash: ?Hash = null;
-    var number: ?[]const u8 = null;
-    while (true) {
-        const name = try scanner_next(&scanner);
-        if (name.tag == .object_end) break;
-        if (name.tag != .string) return error.InvalidParams;
-        const value = try scanner_next(&scanner);
-        if (std.mem.eql(u8, name.bytes, "requireCanonical")) {
-            if (value.tag != .true and value.tag != .false) return error.InvalidParams;
-            continue;
-        }
-        if (value.tag != .string) return error.InvalidParams;
-        if (hash != null or number != null) return error.InvalidParams;
-        if (std.mem.eql(u8, name.bytes, "blockHash")) {
-            hash = json.parse_hash(value.bytes) catch return error.InvalidParams;
-        } else if (std.mem.eql(u8, name.bytes, "blockNumber")) {
-            number = value.bytes;
-        } else return error.InvalidParams;
+    assert(raw[0] == '{');
+    const canonical = json.find_path(raw, &.{"requireCanonical"}) catch
+        return error.InvalidParams;
+    if (canonical) |flag| {
+        const boolean = std.mem.eql(u8, flag, "true") or std.mem.eql(u8, flag, "false");
+        if (!boolean) return error.InvalidParams;
     }
-    if (number) |text| {
-        const resolved = try resolve_number_text(api, call, text);
-        return api.chain.store.canonical_hash(resolved) orelse {
-            return call.fail(rpc.code.server_error, "block not found");
-        };
+    const hash_raw = json.find_path(raw, &.{"blockHash"}) catch return error.InvalidParams;
+    const number_raw = json.find_path(raw, &.{"blockNumber"}) catch return error.InvalidParams;
+    const hash_given = hash_raw != null and !std.mem.eql(u8, hash_raw.?, "null");
+    if (hash_given and number_raw != null) return error.InvalidParams;
+    if (number_raw) |number| {
+        if (number.len == 0 or number[0] == '{') return error.InvalidParams;
+        return resolve_block(api, call, number);
     }
-    const found = hash orelse return error.InvalidParams;
+    if (!hash_given) return error.InvalidParams;
+    const text = hash_raw.?;
+    if (text.len < 2 or text[0] != '"') return error.InvalidParams;
+    const found = json.parse_hash(text[1 .. text.len - 1]) catch return error.InvalidParams;
     if (api.chain.store.ref(found) == null) {
         return call.fail(rpc.code.server_error, "block not found");
     }
