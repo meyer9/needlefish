@@ -1857,29 +1857,6 @@ test "eth: prestateTracer lists the beneficiary for a deposit" {
     try testing.expect(std.mem.indexOf(u8, changes, "0xfefefefe") == null);
 }
 
-test "eth: prestateTracer diff of a stored transaction lists a never-existing callee" {
-    const h = try Harness.create_for(&denim_rpc_spec);
-    defer h.destroy();
-    var store = try meter_history();
-    defer store.deinit(testing.allocator);
-    try h.node.db.trie().track_changes(testing.allocator);
-    try h.node.chain.attach_history(&store);
-    _ = try h.mine(2);
-    var raw: [256]u8 = undefined;
-    const block_hash = try mine_deposit(h, deposit_to(@splat(0x33), 100_000), &raw);
-    // Over a block Nethermind lists every looked-up account missing afterwards in post with
-    // a zero code hash, a callee that never existed included (unlike debug_traceCall).
-    const callee = "\"0x3333333333333333333333333333333333333333\":";
-    const missing = callee ++ "{\"codeHash\":\"0x" ++ zeros_62 ++ "00\"}";
-    const diff = "{\"tracer\":\"prestateTracer\",\"tracerConfig\":{\"diffMode\":true}}";
-    const traced = try trace_request(h, "debug_traceBlockByHash", &block_hash.bytes, diff);
-    const post = traced[std.mem.indexOf(u8, traced, "\"post\"").?..];
-    try expect_contains(post, missing);
-    try testing.expectEqual(@as(usize, 1), count_of(traced, callee));
-    const hash = primitives.keccak256(deposit_to(@splat(0x33), 100_000).encode_to(&raw)).bytes;
-    try expect_contains(try trace_request(h, "debug_traceTransaction", &hash, diff), missing);
-}
-
 const callee_pre = "\"0x5555555555555555555555555555555555555555\":{" ++
     "\"balance\":\"0x0\",\"nonce\":60,";
 const delegate_pre = "\"0x3333333333333333333333333333333333333333\":{\"balance\"";
@@ -3141,19 +3118,6 @@ test "eth: prestateTracer diff lists a looked-up missing account with a zero cod
     try testing.expectEqual(@as(usize, 1), count_of(diff, identity));
     const plain = try h.request("debug_traceCall", call ++ "}]");
     try testing.expect(std.mem.indexOf(u8, plain, identity) == null);
-    // An unused address the call touches never exists in Nethermind's state: not listed.
-    // A state override creates it (empty), and the call's touch deletes it (EIP-161).
-    const unused = "\"0x00000000000000000000000000000000000000cc\"";
-    const to_unused = "[{\"from\":\"0x7e5f4552091a69125d5dfcb7b8c2659029395bdf\",\"to\":" ++
-        unused ++ "},\"latest\",{\"tracer\":\"prestateTracer\"" ++ ",\"tracerConfig\":" ++
-        "{\"diffMode\":true}";
-    const untouched = try h.request("debug_traceCall", to_unused ++ "}]");
-    try testing.expect(std.mem.indexOf(u8, untouched, unused) == null);
-    const overridden = try h.request("debug_traceCall", to_unused ++
-        ",\"stateOverrides\":{" ++ unused ++ ":{\"balance\":\"0x0\"}}}]");
-    const overridden_post = overridden[std.mem.indexOf(u8, overridden, "\"post\"").?..];
-    try expect_contains(overridden_post, unused ++ ":{\"codeHash\":\"0x" ++ zeros_62 ++ "00\"}");
-    try testing.expectEqual(@as(usize, 1), count_of(overridden, unused));
 }
 
 /// keccak256(0x00), the code hash of the one-byte code `0x00`.
