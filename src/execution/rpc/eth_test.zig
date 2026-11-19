@@ -1711,28 +1711,10 @@ test "eth: Denim blocks, transactions and logs report millisecond timestamps" {
     try testing.expect(std.mem.indexOf(u8, genesis_block, "timestampMs") == null);
 }
 
-test "eth: prestateTracer lists the beneficiary for a deposit" {
-    const h = try Harness.create_for(&denim_rpc_spec);
-    defer h.destroy();
-    var store = try meter_history();
-    defer store.deinit(testing.allocator);
-    try h.node.db.trie().track_changes(testing.allocator);
-    try h.node.chain.attach_history(&store);
-    // The beneficiary is not empty; a deposit pays it nothing, yet Nethermind looks it up.
-    try h.node.db.put_account(@splat(0xfe), 1, 0, &.{});
-    _ = try h.mine(2);
-    const deposit: consensus.Envelope = .{ .deposit = .{
-        .source_hash = .{ .bytes = @splat(0x22) },
-        .from = .{ .bytes = @splat(0xd0) },
-        .to = .{ .call = .{ .bytes = @splat(0x33) } },
-        .mint = 0,
-        .value = 0,
-        .gas_limit = 100_000,
-        .is_system_transaction = false,
-        .input = &.{},
-    } };
-    var encoded: [256]u8 = undefined;
-    const forced = [1][]const u8{deposit.encode_to(&encoded)};
+/// Mines a block holding `deposit` alone on the harness head (timestamp 4, coinbase 0xfe..),
+/// then six more; returns the deposit's block hash.
+fn mine_deposit(h: *Harness, deposit: consensus.Envelope, raw: *[256]u8) !primitives.B256 {
+    const forced = [1][]const u8{deposit.encode_to(raw)};
     var attrs = fixture.attributes_l2(4, 0xfe);
     attrs.transactions = &forced;
     const node = h.node;
@@ -1743,17 +1725,108 @@ test "eth: prestateTracer lists the beneficiary for a deposit" {
     const built = try node.engine.get_payload(get_version, updated.payload_id.?);
     _ = try node.engine.forkchoice_updated(version, fixture.forkchoice(built.block_hash), null);
     _ = try h.mine(6);
+    return built.block_hash;
+}
+
+fn deposit_to(to: [20]u8, gas_limit: u64) consensus.Envelope {
+    return .{ .deposit = .{
+        .source_hash = .{ .bytes = @splat(0x22) },
+        .from = .{ .bytes = @splat(0xd0) },
+        .to = .{ .call = .{ .bytes = to } },
+        .mint = 0,
+        .value = 0,
+        .gas_limit = gas_limit,
+        .is_system_transaction = false,
+        .input = &.{},
+    } };
+}
+
+/// A harness on Denim with history for tracing; 0x55.. (nonce 60) is delegated to 0x33..,
+/// which CALLs 0x44.. (nonce 1, no code) and then loops until out of gas.
+fn failing_deposit_harness(store: *history_module.Store) !*Harness {
+    const h = try Harness.create_for(&denim_rpc_spec);
+    errdefer h.destroy();
+    try h.node.db.trie().track_changes(testing.allocator);
+    try h.node.chain.attach_history(store);
+    const callee_code = [_]u8{ 0x60, 0, 0x60, 0, 0x60, 0, 0x60, 0, 0x60, 0, 0x73 } ++
+        @as([20]u8, @splat(0x44)) ++ [_]u8{ 0x61, 0xff, 0xff, 0xf1, 0x50, 0x5b, 0x60, 0x24, 0x56 };
+    try h.node.db.put_account(@splat(0x33), 0, 1, &callee_code);
+    try h.node.db.put_account(@splat(0x44), 0, 1, &.{});
+    const delegation = [_]u8{ 0xef, 0x01, 0x00 } ++ @as([20]u8, @splat(0x33));
+    try h.node.db.put_account(@splat(0x55), 0, 60, &delegation);
+    _ = try h.mine(2);
+    return h;
+}
+
+/// Mines `deposit`, checks it failed with its whole gas limit and returns its prestate.
+fn failed_deposit_prestate(h: *Harness, deposit: consensus.Envelope) ![]const u8 {
+    var raw: [256]u8 = undefined;
+    _ = try mine_deposit(h, deposit, &raw);
+    const hash = primitives.keccak256(deposit.encode_to(&raw)).bytes;
+    const receipt_format = request_prefix_format ++
+        "eth_getTransactionReceipt\",\"params\":[\"0x{x}\"]}}";
+    var body: [256]u8 = undefined;
+    const receipt = try h.request_runtime(try std.fmt.bufPrint(&body, receipt_format, .{&hash}));
+    try expect_contains(receipt, "\"status\":\"0x0\"");
+    var gas_used: [32]u8 = undefined;
+    const gas_limit = deposit.deposit.gas_limit;
+    const gas_used_text = "\"gasUsed\":\"0x{x}\"";
+    try expect_contains(receipt, try std.fmt.bufPrint(&gas_used, gas_used_text, .{gas_limit}));
+    return trace_request(h, "debug_traceTransaction", &hash, "{\"tracer\":\"prestateTracer\"}");
+}
+
+test "eth: prestateTracer lists the beneficiary for a deposit" {
+    const h = try Harness.create_for(&denim_rpc_spec);
+    defer h.destroy();
+    var store = try meter_history();
+    defer store.deinit(testing.allocator);
+    try h.node.db.trie().track_changes(testing.allocator);
+    try h.node.chain.attach_history(&store);
+    // The beneficiary is not empty; a deposit pays it nothing, yet Nethermind looks it up.
+    try h.node.db.put_account(@splat(0xfe), 1, 0, &.{});
+    _ = try h.mine(2);
+    var raw: [256]u8 = undefined;
+    const block_hash = try mine_deposit(h, deposit_to(@splat(0x33), 100_000), &raw);
     const coinbase = "\"0xfefefefefefefefefefefefefefefefefefefefe\":{\"balance\":\"0x1\"}";
     const plain = "{\"tracer\":\"prestateTracer\"}";
-    const traced = try trace_request(h, "debug_traceBlockByHash", &built.block_hash.bytes, plain);
+    const traced = try trace_request(h, "debug_traceBlockByHash", &block_hash.bytes, plain);
     try testing.expectEqual(@as(usize, 1), count_of(traced, "\"txHash\""));
     try expect_contains(traced, coinbase);
-    const hash = primitives.keccak256(forced[0]).bytes;
+    const hash = primitives.keccak256(deposit_to(@splat(0x33), 100_000).encode_to(&raw)).bytes;
     try expect_contains(try trace_request(h, "debug_traceTransaction", &hash, plain), coinbase);
     // Unchanged, it is not in a diff.
     const diff = "{\"tracer\":\"prestateTracer\",\"tracerConfig\":{\"diffMode\":true}}";
     const changes = try trace_request(h, "debug_traceTransaction", &hash, diff);
     try testing.expect(std.mem.indexOf(u8, changes, "0xfefefefe") == null);
+}
+
+const callee_pre = "\"0x5555555555555555555555555555555555555555\":{" ++
+    "\"balance\":\"0x0\",\"nonce\":60,";
+const delegate_pre = "\"0x3333333333333333333333333333333333333333\":{\"balance\"";
+const inner_pre = "\"0x4444444444444444444444444444444444444444\":{" ++
+    "\"balance\":\"0x0\",\"nonce\":1}";
+
+test "eth: prestateTracer keeps what a deposit loaded before running out of gas" {
+    var store = try meter_history();
+    defer store.deinit(testing.allocator);
+    const h = try failing_deposit_harness(&store);
+    defer h.destroy();
+    const traced = try failed_deposit_prestate(h, deposit_to(@splat(0x55), 100_000));
+    try expect_contains(traced, callee_pre);
+    try expect_contains(traced, delegate_pre);
+    try expect_contains(traced, inner_pre);
+}
+
+test "eth: prestateTracer lists the callee of a deposit below its intrinsic gas" {
+    var store = try meter_history();
+    defer store.deinit(testing.allocator);
+    const h = try failing_deposit_harness(&store);
+    defer h.destroy();
+    // Nethermind looks up the callee and its delegate before any check; nothing runs.
+    const traced = try failed_deposit_prestate(h, deposit_to(@splat(0x55), 20_000));
+    try expect_contains(traced, callee_pre);
+    try expect_contains(traced, delegate_pre);
+    try testing.expect(std.mem.indexOf(u8, traced, "0x44444444") == null);
 }
 
 test "eth: pre-Denim blocks carry no millisecond timestamps" {
