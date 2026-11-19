@@ -180,6 +180,36 @@ test "op: L1 fee, base fee, and operator fee go to their vaults" {
     try testing.expectEqual(initial - spent, try balance(&h, sender_address));
 }
 
+test "op: a zero fee credit leaves its vault unseen by the transaction" {
+    var h: Harness = undefined;
+    try h.init(testing.allocator);
+    defer h.deinit(testing.allocator);
+    try put_l1_block(&h);
+    try h.database.put_storage(op_stack.l1_block_address, op_stack.slot_operator_fee, 0);
+    h.evm.block.op = .{ .upgrade = .isthmus };
+    h.evm.block.base_fee = 0;
+    h.evm.block.coinbase = coinbase;
+    try h.database.put_account(sender_address, 1_000_000_000_000, 0, &.{});
+    const envelope = [_]u8{ 0x02, 0xf8, 0x00, 0x11, 0x22, 0x00, 0x33, 0x44, 0x55, 0x00, 0x66 };
+    const tx = transaction.TxEnv{
+        .tx_type = .eip1559,
+        .caller = sender_address,
+        .gas_limit = 60_000,
+        .gas_price = 0,
+        .to = target,
+        .envelope = &envelope,
+    };
+    _ = (try transaction.transact(&h.evm, .prague, &tx)).executed;
+    // Nethermind's prestateTracer lists a fee vault only when the transaction credits it:
+    // the L1 fee vault is, the base fee and operator fee vaults (zero credits) are not. The
+    // state change is the same either way.
+    const tx_id = h.state.tx_id;
+    try testing.expect(h.state.accounts.get(op_stack.l1_fee_vault).?.seen_tx == tx_id);
+    try testing.expect(h.state.accounts.get(op_stack.base_fee_vault).?.seen_tx != tx_id);
+    try testing.expect(h.state.accounts.get(op_stack.operator_fee_vault).?.seen_tx != tx_id);
+    try testing.expectEqual(@as(u256, 0), try balance(&h, op_stack.base_fee_vault));
+}
+
 test "op: L1 and operator fees count toward the balance check" {
     var h: Harness = undefined;
     try h.init(testing.allocator);

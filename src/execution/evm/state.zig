@@ -614,8 +614,9 @@ pub const State = struct {
         return account;
     }
 
-    /// `load` for system reads, which leave the account unseen by the transaction.
-    fn load_unseen(state: *State, address: Address) Error!*Account {
+    /// `load` for system reads, which leave the account unseen by the transaction (an
+    /// account the transaction already read stays seen).
+    pub fn load_unseen(state: *State, address: Address) Error!*Account {
         if (state.accounts.getPtr(address)) |account| return account;
         if (state.accounts.count() >= state.limits.accounts_max) return error.StateFull;
         const info = try state.database.basic(address);

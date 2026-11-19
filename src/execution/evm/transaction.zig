@@ -612,15 +612,28 @@ fn pay_fees(
     const tip_per_gas = if (fork.at_least(.london)) price - evm.block.base_fee else price;
     try credit(evm, evm.block.coinbase, @as(u256, gas_used) * tip_per_gas, true);
     const f = fees orelse return;
-    try credit(evm, op.l1_fee_vault, f.l1, true);
-    try credit(evm, op.base_fee_vault, evm.block.base_fee * gas_used, true);
-    try credit(evm, op.operator_fee_vault, operator_used, true);
+    try credit_vault(evm, op.l1_fee_vault, f.l1);
+    try credit_vault(evm, op.base_fee_vault, evm.block.base_fee * gas_used);
+    try credit_vault(evm, op.operator_fee_vault, operator_used);
 }
 
 fn credit(evm: *Evm, address: Address, amount: u256, touch: bool) evm_module.Error!void {
     const account = try evm.state.load(address);
     try evm.state.set_balance(account, account.info.balance + amount);
     if (touch) try evm.state.touch(account);
+}
+
+/// Credits an OP fee vault. A zero credit leaves the vault unseen by the transaction (the
+/// state change is the same): Nethermind's prestateTracer lists a vault only when the
+/// transaction credits it something (or its execution read it).
+fn credit_vault(evm: *Evm, address: Address, amount: u256) evm_module.Error!void {
+    const account = if (amount == 0)
+        try evm.state.load_unseen(address)
+    else
+        try evm.state.load(address);
+    assert(std.mem.eql(u8, &account.address, &address));
+    try evm.state.set_balance(account, account.info.balance + amount);
+    try evm.state.touch(account);
 }
 
 fn finish(
