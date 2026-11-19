@@ -817,6 +817,10 @@ fn trace_raw_block(api: *Api, call: *Call) HandlerError!void {
     try call.params.finish();
     const block = consensus.block.Block.decode(raw) catch
         return call.fail(rpc.code.invalid_params, "invalid block RLP");
+    // Nethermind refuses a genesis block given as RLP, whatever its number.
+    if (block.header.number == api.chain.genesis_number) {
+        return call.fail(rpc.code.server_error, "genesis is not traceable");
+    }
     if (api.chain.header(block.header.parent_hash.bytes) == null) {
         return call.fail(rpc.code.server_error, "parent block not found");
     }
@@ -835,6 +839,15 @@ fn trace(api: *Api, call: *Call, hash: Hash, only: ?u32, options: Options) Handl
     try trace_block(api, call, &stored.header, stored.transactions, only, options, 0);
 }
 
+/// Nethermind refuses block 0, but replays a later genesis on the empty pre-genesis state:
+/// it has no transactions, so it has no traces.
+fn trace_genesis(call: *Call, header: *const consensus.Header, only: ?u32) HandlerError!void {
+    if (header.number == 0) return call.fail(rpc.code.server_error, "genesis is not traceable");
+    assert(only == null);
+    try call.writer.begin_array();
+    try call.writer.end_array();
+}
+
 /// Re-executes a block (`header` and its transactions, which may live in the first
 /// `reserved` scratch bytes) on its parent's state and writes the traces.
 fn trace_block(
@@ -847,9 +860,7 @@ fn trace_block(
     reserved: usize,
 ) HandlerError!void {
     const chain = api.chain;
-    if (header.number <= chain.genesis_number) {
-        return call.fail(rpc.code.invalid_params, "genesis has no parent");
-    }
+    if (header.number <= chain.genesis_number) return trace_genesis(call, header, only);
     var list = transactions_in;
     var count: u32 = 0;
     while (!list.is_empty()) : (count += 1) {

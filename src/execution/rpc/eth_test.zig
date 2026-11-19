@@ -39,9 +39,14 @@ const Harness = struct {
     }
 
     fn create_for(spec: *const chainspec.ChainSpec) !*Harness {
+        return create_numbered(spec, 0);
+    }
+
+    /// A harness whose genesis block has `genesis_number`.
+    fn create_numbered(spec: *const chainspec.ChainSpec, genesis_number: u64) !*Harness {
         const harness = try testing.allocator.create(Harness);
         errdefer testing.allocator.destroy(harness);
-        harness.node = try fixture.Node.create_for(spec);
+        harness.node = try fixture.Node.create_numbered(spec, null, genesis_number);
         harness.api = .{
             .spec = spec,
             .chain = &harness.node.chain,
@@ -1494,6 +1499,34 @@ test "eth: block parameters and indexes read as Nethermind's converters" {
     // debug_traceBlockByNumber has no pending block.
     const pending = try h.request("debug_traceBlockByNumber", "[\"pending\"]");
     try expect_contains(pending, "{\"code\":-32000,\"message\":\"pending block is not available\"");
+}
+
+test "eth: debug_traceBlock of genesis follows Nethermind" {
+    // Block 0 is not traceable.
+    const zero = try Harness.create();
+    defer zero.destroy();
+    const refused = "{\"code\":-32000,\"message\":\"genesis is not traceable\"";
+    try expect_contains(try zero.request("debug_traceBlockByNumber", "[\"earliest\"]"), refused);
+    // A later genesis has no transactions, so it has no traces, whatever the tracer.
+    const h = try Harness.create_numbered(fixture.spec, 30_008_523);
+    defer h.destroy();
+    _ = try h.mine(1);
+    const empty = "\"result\":[]";
+    const limited = "[\"earliest\",{\"limit\":512}]";
+    try expect_contains(try h.request("debug_traceBlockByNumber", limited), empty);
+    const call_tracer = "[\"earliest\",{\"tracer\":\"callTracer\"}]";
+    try expect_contains(try h.request("debug_traceBlockByNumber", call_tracer), empty);
+    const genesis = &h.node.chain.genesis_hash;
+    const plain = "{\"tracer\":\"prestateTracer\"}";
+    try expect_contains(try trace_request(h, "debug_traceBlockByHash", genesis, plain), empty);
+    // Its RLP is refused.
+    var buffer: [4096]u8 = undefined;
+    const raw_genesis = try h.request("debug_getRawBlock", "[\"earliest\"]");
+    const raw = try result_data(raw_genesis, &buffer);
+    var body: [4096]u8 = undefined;
+    const format = request_prefix_format ++ "debug_traceBlock\",\"params\":[\"0x{x}\"]}}";
+    const traced_raw = try h.request_runtime(try std.fmt.bufPrint(&body, format, .{raw}));
+    try expect_contains(traced_raw, refused);
 }
 
 test "eth: call requests read as Nethermind's transaction converters" {
