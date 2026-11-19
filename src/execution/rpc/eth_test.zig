@@ -598,7 +598,9 @@ test "eth: eth_simulateV1 carries state across calls and blocks with overrides" 
         "0000000000000000000000000000000b\"");
     try testing.expectEqual(@as(usize, 2), count_of(text, "\"returnData\":\"" ++ word ++ "1\""));
     try expect_contains(text, "\"logIndex\":\"0x1\"");
-    try expect_contains(text, "\"error\":{\"code\":3,\"message\":\"execution reverted\"}");
+    // A revert without data still reports it, as Nethermind: "0x".
+    try expect_contains(text, "\"error\":{\"code\":3,\"message\":\"execution reverted\"," ++
+        "\"data\":\"0x\"}");
     try expect_contains(text, "\"number\":\"0x2\"");
     try expect_contains(text, "\"timestamp\":\"0x1000\"");
     // base/base's default: the chain's schedule, here two seconds after the override.

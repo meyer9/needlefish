@@ -10,10 +10,10 @@
 //! `validation`), with the block's remaining gas by default. Each block is the full block
 //! base/base assembles (`simulate_block.zig`: header, hash, transactions, withdrawals) plus
 //! `calls` (`returnData`, `logs`, `gasUsed`, `maxUsedGas`, `status`, `error` for a revert
-//! (code 3, reth's "execution reverted: <reason>", with data) or a halt (-32015, reth's halt
-//! text)); `returnFullTransactions` writes transaction objects; `traceTransfers` adds
-//! Nethermind's ERC-7528 transfer logs to the calls' logs (`simulate_transfers.zig`). Not
-//! supported: `movePrecompileToAddress`.
+//! (code 3, reth's "execution reverted: <reason>", with data, "0x" when empty) or a halt
+//! (-32015, reth's halt text)); `returnFullTransactions` writes transaction objects;
+//! `traceTransfers` adds Nethermind's ERC-7528 transfer logs to the calls' logs
+//! (`simulate_transfers.zig`). Not supported: `movePrecompileToAddress`.
 
 const std = @import("std");
 const assert = std.debug.assert;
@@ -771,7 +771,7 @@ fn write_call(
         },
         .halt => {
             const failure = call_error.halt(space, executed.exit, message.gas.?);
-            try write_error(w, code_vm_error, failure.message, &.{});
+            try write_error(w, code_vm_error, failure.message, null);
         },
     }
     try w.end_object();
@@ -928,7 +928,7 @@ fn write_error(
     w: *json.Writer,
     code: i32,
     message: []const u8,
-    data: []const u8,
+    data: ?[]const u8,
 ) HandlerError!void {
     try w.key("error");
     try w.begin_object();
@@ -936,9 +936,11 @@ fn write_error(
     try w.integer(code);
     try w.key("message");
     try w.string(message);
-    if (data.len > 0) {
+    // As Nethermind's SimulateTxTracer: a revert carries its data, "0x" when empty; a halt
+    // none.
+    if (data) |bytes| {
         try w.key("data");
-        try w.data(data);
+        try w.data(bytes);
     }
     try w.end_object();
 }
