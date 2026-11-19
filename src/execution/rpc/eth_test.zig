@@ -708,12 +708,23 @@ test "eth: eth_simulateV1 call errors and validation" {
     try expect_failure(h, "eth_simulateV1", funded_nonce, "-38011", "nonce too high\"}");
 }
 
-test "eth: eth_simulateV1 from a sender at the maximum nonce" {
+test "eth: a sender at the maximum nonce" {
     const h = try Harness.create();
     defer h.destroy();
     const max_sender = "{" ++ poor_sender ++
         ":{\"nonce\":\"0xffffffffffffffff\",\"balance\":\"0xffffffffffffffffffff\"}}";
-    // With validation, a lower nonce is reported before the maximum one.
+    // As Nethermind (and geth), an RPC call checks no nonce: the sender still runs.
+    // A creation too: the nonce wraps to zero.
+    const create = "[{\"from\":" ++ poor_sender ++ "},\"latest\"," ++ max_sender ++ "]";
+    try expect_contains(try h.request("eth_call", create), "\"result\":\"0x\"");
+    const sent = "[{\"from\":" ++ poor_sender ++ ",\"to\":" ++ address_target ++ "},\"latest\",";
+    const call = sent ++ max_sender ++ "]";
+    try expect_contains(try h.request("eth_call", call), "\"result\":\"0x\"");
+    try expect_contains(try h.request("eth_estimateGas", call), "\"result\":\"0x5208\"");
+    try expect_contains(try h.request("eth_createAccessList", call), "\"gasUsed\":\"0x5208\"");
+    const traced = sent ++ "{\"tracer\":\"callTracer\",\"stateOverrides\":" ++ max_sender ++ "}]";
+    try expect_contains(try h.request("debug_traceCall", traced), "\"gasUsed\":\"0x5208\"");
+    // eth_simulateV1 with validation reports a lower nonce before the maximum one.
     const blocks = "[{\"blockStateCalls\":[{\"stateOverrides\":" ++ max_sender ++
         ",\"calls\":[{\"from\":" ++ poor_sender ++ ",\"maxFeePerGas\":\"0x10000000000\"";
     const low = blocks ++ ",\"nonce\":\"0x28a\"}]}],\"validation\":true}]";

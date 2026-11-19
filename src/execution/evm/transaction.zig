@@ -80,6 +80,9 @@ pub const TxEnv = struct {
     /// `disable_fee_charge`, which reth sets for calls). A balance short of `value` halts
     /// the call (`out_of_funds`) as revm's first frame does.
     disable_fee_charge: bool = false,
+    /// An unvalidated RPC call other than eth_simulateV1's: a sender at nonce 2^64 - 1 still
+    /// runs, its nonce wrapping to zero (Nethermind, like geth, checks no nonce for a call).
+    wrap_max_nonce: bool = false,
     /// An RPC call: no EIP-7825 per-transaction gas cap (reth lifts it for calls).
     disable_tx_gas_cap: bool = false,
     /// An RPC call: its gas may exceed the block's (revm `disable_block_gas_limit`, which
@@ -282,9 +285,11 @@ fn validate_and_buy_gas(
     // A wrong nonce is reported before a sender's nonce of 2^64 - 1 (revm, Nethermind).
     if (tx.nonce < sender.info.nonce) return .nonce_too_low;
     if (tx.nonce > sender.info.nonce) return .nonce_too_high;
-    if (sender.info.nonce == std.math.maxInt(u64)) return .nonce_overflow;
+    assert(!tx.wrap_max_nonce or tx.disable_fee_charge);
+    const nonce_max = sender.info.nonce == std.math.maxInt(u64);
+    if (nonce_max and !tx.wrap_max_nonce) return .nonce_overflow;
     if (tx.disable_fee_charge) {
-        if (tx.to != null) try evm.state.set_nonce(sender, sender.info.nonce + 1);
+        if (tx.to != null) try evm.state.set_nonce(sender, sender.info.nonce +% 1);
         try evm.state.touch(sender);
         return null;
     }
@@ -411,6 +416,7 @@ pub fn transact_fork(comptime fork: Fork, evm: *Evm, tx: *const TxEnv) evm_modul
         .origin = tx.caller,
         .gas_price = effective_gas_price(tx, evm.block.base_fee),
         .blob_hashes = tx.blob_hashes,
+        .wrap_max_nonce = tx.wrap_max_nonce,
     };
     try warm_addresses(fork, evm, tx);
     var authorization_refund: u64 = 0;

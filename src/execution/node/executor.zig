@@ -897,6 +897,7 @@ pub const Executor = struct {
                 executor.machine.block.blob_base_fee,
             .skip_sender_code_check = true,
             .disable_fee_charge = true,
+            .wrap_max_nonce = true,
             .disable_tx_gas_cap = true,
             .disable_block_gas_limit = true,
         };

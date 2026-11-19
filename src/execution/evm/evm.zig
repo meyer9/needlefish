@@ -635,9 +635,13 @@ pub const Evm = struct {
         if (depth > evm.config.depth_max) return failed(request.gas_limit, .revert);
         const caller = try evm.state.load(request.caller);
         if (caller.info.balance < request.value) return failed(request.gas_limit, .revert);
-        if (caller.info.nonce == std.math.maxInt(u64)) return failed(request.gas_limit, .revert);
-        const nonce = caller.info.nonce;
-        try evm.state.set_nonce(caller, nonce + 1);
+        const nonce_max = caller.info.nonce == std.math.maxInt(u64);
+        // An unvalidated RPC call wraps the nonce, and Nethermind then derives the address
+        // from the wrapped nonce (`GetRecipient`: zero stays zero).
+        const wrap = nonce_max and depth == 0 and evm.tx.wrap_max_nonce;
+        if (nonce_max and !wrap) return failed(request.gas_limit, .revert);
+        const nonce = if (wrap) 0 else caller.info.nonce;
+        try evm.state.set_nonce(caller, if (wrap) 0 else nonce + 1);
         const address = if (request.is_create2)
             create2_address(request.caller, request.salt, request.init_code)
         else
