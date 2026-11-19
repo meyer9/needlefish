@@ -2771,13 +2771,13 @@ test "eth: prestateTracer reports revm's loaded accounts as revm-inspectors does
     try testing.expect(std.mem.endsWith(u8, call, "\"}}"));
     try testing.expectEqual(@as(usize, 1), count_of(call, "balance"));
     // An overridden account the call never loads is not reported; the sender, empty
-    // before, is in a diff's pre, and the account it creates only in post.
+    // before, is left out of a diff's pre (Nethermind), and both it and the account it
+    // creates are in post.
     const created = try h.request("debug_traceCall", "[{\"from\":" ++
         "\"0x7dc6c0165f09500b75146b66eec05a39dbbc40d2\"},\"latest\",{\"stateOverrides\":" ++
         "{\"0x5b76c950a887b42e74fdde348bf928517f41cf70\":{\"code\":\"0x\"}},\"tracer\":" ++
         "\"prestateTracer\",\"tracerConfig\":{\"diffMode\":true}}]");
-    try testing.expectEqualStrings("\"result\":{\"pre\":{" ++
-        "\"0x7dc6c0165f09500b75146b66eec05a39dbbc40d2\":{\"balance\":\"0x0\"}},\"post\":{" ++
+    try testing.expectEqualStrings("\"result\":{\"pre\":{},\"post\":{" ++
         "\"0x5c7d5a7b707d05be9a3f8f28eb3099ed20e22f9f\":{\"nonce\":1}," ++
         "\"0x7dc6c0165f09500b75146b66eec05a39dbbc40d2\":{\"nonce\":1}}}", created);
 }

@@ -14,7 +14,8 @@
 //! Output is sorted by address (and slot). The default mode reports each account that was
 //! not empty before the transaction, with every slot read; diff mode follows
 //! `geth_prestate_diff_traces`: only changed accounts and changed non-zero slots, `pre`
-//! without created accounts, `post` without destroyed ones and with only changed fields.
+//! without accounts empty before (Nethermind), `post` without destroyed ones and with only
+//! changed fields.
 //! As Nethermind's tracer, an account also gets its `codeHash`, and every EIP-7702 authority
 //! with a valid signature is looked up, its authorization valid or not.
 
@@ -408,8 +409,8 @@ fn slots_of(collected: *const Collected, cursor: *u32, address: *const Address) 
 }
 
 /// Whether `side` lists the account: the default mode skips accounts empty before the
-/// transaction; a diff's `pre` skips created accounts that were empty, its `post`
-/// destroyed ones.
+/// transaction; so does a diff's `pre` (Nethermind), unless the account was not created
+/// and has slots to list there; a diff's `post` skips destroyed accounts.
 fn side_lists(
     entry: *const AccountEntry,
     slots: []const SlotEntry,
@@ -419,9 +420,16 @@ fn side_lists(
     if (!config.diff) return !entry.pre.is_empty();
     if (!diff_keeps(entry, slots, config)) return false;
     return switch (side) {
-        .pre => !(entry.created and entry.pre.is_empty()),
+        .pre => !entry.pre.is_empty() or (!entry.created and pre_slots_listed(slots, config)),
         .post => !entry.destroyed,
     };
+}
+
+fn pre_slots_listed(slots: []const SlotEntry, config: Config) bool {
+    assert(config.diff);
+    if (!config.storage) return false;
+    for (slots) |*slot| if (slot_listed(slot, .pre, true)) return true;
+    return false;
 }
 
 fn write_side(w: *json.Writer, collected: *const Collected, side: Side, config: Config) !void {
@@ -534,6 +542,7 @@ fn address_key(comptime byte: []const u8) []const u8 {
     return text ++ "\"";
 }
 
+const address_4 = address_key("04");
 const address_5 = address_key("05");
 const address_6 = address_key("06");
 const address_7 = address_key("07");
@@ -554,6 +563,8 @@ fn write_text(collected: *const Collected, config: Config, out: []u8) ![]const u
 
 test "prestate: modes follow revm-inspectors' geth_prestate_traces" {
     var accounts = [_]AccountEntry{
+        // Empty before, not created (a sender): only in a diff's post (Nethermind).
+        .{ .address = @splat(4), .pre = .{}, .post = .{ .nonce = 1 } },
         .{
             .address = @splat(5),
             .pre = .{ .balance = 7, .nonce = 1 },
@@ -584,7 +595,8 @@ test "prestate: modes follow revm-inspectors' geth_prestate_traces" {
     try testing.expectEqualStrings("{\"pre\":{" ++ address_5 ++
         ":{\"balance\":\"0x7\",\"nonce\":1,\"storage\":{" ++ word_3 ++ ":" ++
         word_4 ++ "}}," ++ address_7 ++ ":{\"balance\":\"0x5\"}}," ++
-        "\"post\":{" ++ address_5 ++ ":{\"nonce\":2,\"storage\":{" ++
+        "\"post\":{" ++ address_4 ++ ":{\"nonce\":1}," ++
+        address_5 ++ ":{\"nonce\":2,\"storage\":{" ++
         word_2 ++ ":" ++ word_9 ++ "}}," ++ address_6 ++
         ":{\"nonce\":1}}}", try write_text(&collected, .{ .diff = true }, &out));
     // The default mode skips accounts empty before the transaction, keeps every slot read.
