@@ -38,7 +38,9 @@ fn counted(frame: *const Frame) bool {
         .call, .callcode, .delegatecall, .staticcall => true,
         .create, .create2, .selfdestruct => false,
     };
-    return call and frame.input.len >= 4 and !frame.precompile;
+    // A deposit rejected before any frame entered none: no selector is counted.
+    const entered = frame.exit != .deposit_system_tx and frame.exit != .deposit_intrinsic_gas;
+    return call and entered and frame.input.len >= 4 and !frame.precompile;
 }
 
 fn decimal_less(a: usize, b: usize) bool {
@@ -271,6 +273,8 @@ pub fn parity_error(frame: *const Frame) ?[]const u8 {
         .create_collision => "Contract address collision",
         .precompile_failure => "Built-in failed",
         .out_of_funds => "Insufficient balance for transfer",
+        .deposit_system_tx => "failed deposit: system deposit after Regolith",
+        .deposit_intrinsic_gas => "failed deposit: intrinsic gas too low",
         .call, .create, .fatal => "internal error",
     };
 }

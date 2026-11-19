@@ -467,10 +467,12 @@ fn transact_deposit(comptime fork: Fork, evm: *Evm, tx: *const TxEnv) evm_module
     // base/base `validate_env` rejects a system deposit since Regolith, and `catch_error`
     // turns that transaction error into a failed deposit like any other.
     if (context.rules().at_least(.regolith) and tx.is_system_transaction) {
+        trace_failed_deposit(fork, evm, tx, tx.gas_limit, .deposit_system_tx);
         return .{ .executed = try fail_deposit(fork, evm, tx, .revert) };
     }
     const intrinsic = intrinsic_gas(fork, tx);
     if (intrinsic.gas > tx.gas_limit or intrinsic.floor > tx.gas_limit) {
+        trace_failed_deposit(fork, evm, tx, tx.gas_limit, .deposit_intrinsic_gas);
         return .{ .executed = try fail_deposit(fork, evm, tx, .out_of_gas) };
     }
     const sender = try evm.state.load(tx.caller);
@@ -482,14 +484,7 @@ fn transact_deposit(comptime fork: Fork, evm: *Evm, tx: *const TxEnv) evm_module
         // revm's first frame loads the callee (and its EIP-7702 delegate) before the transfer
         // fails, and the failed deposit keeps them loaded.
         if (tx.to) |to| _ = try evm.resolve_code_address(fork, to);
-        evm.trace_unfunded(fork, .{
-            .kind = if (tx.to == null) .create else .call,
-            .caller = tx.caller,
-            .target = tx.to orelse primitives.address_zero,
-            .value = tx.value,
-            .input = tx.data,
-            .gas_limit = tx.gas_limit - intrinsic.gas,
-        }, sender.info.nonce);
+        trace_failed_deposit(fork, evm, tx, tx.gas_limit - intrinsic.gas, .out_of_funds);
         return .{ .executed = try fail_deposit(fork, evm, tx, .revert) };
     }
     if (tx.to != null) try evm.state.set_nonce(sender, sender.info.nonce +| 1);
@@ -502,6 +497,27 @@ fn transact_deposit(comptime fork: Fork, evm: *Evm, tx: *const TxEnv) evm_module
     }
     const accounted = account_gas(fork, tx, outcome, intrinsic, 0);
     return .{ .executed = finish(fork, evm, outcome, accounted) };
+}
+
+/// Gives the tracer a failed deposit's top frame (tracer-only: reads no state; a created
+/// address uses the nonce `deposit_env` already loaded).
+fn trace_failed_deposit(
+    comptime fork: Fork,
+    evm: *Evm,
+    tx: *const TxEnv,
+    gas_limit: u64,
+    exit: evm_module.Exit,
+) void {
+    assert(tx.tx_type == .deposit);
+    if (evm.tracer == null) return;
+    evm.trace_failed_top(fork, .{
+        .kind = if (tx.to == null) .create else .call,
+        .caller = tx.caller,
+        .target = tx.to orelse primitives.address_zero,
+        .value = tx.value,
+        .input = tx.data,
+        .gas_limit = gas_limit,
+    }, tx.nonce, exit);
 }
 
 fn fail_deposit(

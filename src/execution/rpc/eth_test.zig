@@ -1909,17 +1909,46 @@ test "eth: callTracer gives a failed deposit revm-inspectors' top frame" {
     try expect_contains(selectors, "\"result\":{\"0x824bb845-2\":1}");
 }
 
-test "eth: callTracer gives a deposit below its intrinsic gas alloy's default frame" {
+test "eth: callTracer gives a deposit rejected before any frame a frame from the tx" {
     var store = try meter_history();
     defer store.deinit(testing.allocator);
     const h = try failing_deposit_harness(&store);
     defer h.destroy();
-    // Nothing runs, so revm-inspectors has no frame and writes `CallFrame::default()`.
+    // A system deposit after Regolith enters no frame: geth's (and Nethermind's) frame is
+    // built from the transaction, and no selector is counted.
+    var deposit = deposit_to(@splat(0x55), 100_000);
+    deposit.deposit.is_system_transaction = true;
+    deposit.deposit.input = &.{ 0x82, 0x4b, 0xb8, 0x45, 0x01, 0x02 };
     const call_tracer = "{\"tracer\":\"callTracer\"}";
-    const empty = try failed_deposit_trace(h, deposit_to(@splat(0x55), 20_000), call_tracer);
-    try expect_contains(empty, "\"result\":{\"type\":\"\",\"from\":\"0x" ++
-        "0000000000000000000000000000000000000000\",\"gas\":\"0x0\",\"gasUsed\":\"0x0\"," ++
-        "\"input\":\"0x\"}");
+    const system = try failed_deposit_trace(h, deposit, call_tracer);
+    try expect_contains(system, "\"result\":{\"type\":\"CALL\",\"from\":\"0x" ++
+        "d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0\",\"to\":\"0x" ++
+        "5555555555555555555555555555555555555555\",\"value\":\"0x0\",\"gas\":\"0x186a0\"," ++
+        "\"gasUsed\":\"0x186a0\",\"input\":\"0x824bb8450102\",\"error\":" ++
+        "\"failed deposit: system deposit after Regolith\"}");
+    var raw: [256]u8 = undefined;
+    const hash = primitives.keccak256(deposit.encode_to(&raw)).bytes;
+    const four_byte = "{\"tracer\":\"4byteTracer\"}";
+    const selectors = try trace_request(h, "debug_traceTransaction", &hash, four_byte);
+    try expect_contains(selectors, "\"result\":{}");
+    const flat = "{\"tracer\":\"flatCallTracer\"}";
+    const flat_traces = try trace_request(h, "debug_traceTransaction", &hash, flat);
+    try expect_contains(flat_traces, "\"error\":\"failed deposit: system deposit after Regolith\"");
+    try testing.expectEqual(@as(usize, 1), count_of(flat_traces, "\"traceAddress\""));
+}
+
+test "eth: callTracer gives a deposit below its intrinsic gas a frame from the tx" {
+    var store = try meter_history();
+    defer store.deinit(testing.allocator);
+    const h = try failing_deposit_harness(&store);
+    defer h.destroy();
+    const call_tracer = "{\"tracer\":\"callTracer\"}";
+    const low = try failed_deposit_trace(h, deposit_to(@splat(0x55), 20_000), call_tracer);
+    try expect_contains(low, "\"result\":{\"type\":\"CALL\",\"from\":\"0x" ++
+        "d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0\",\"to\":\"0x" ++
+        "5555555555555555555555555555555555555555\",\"value\":\"0x0\",\"gas\":\"0x4e20\"," ++
+        "\"gasUsed\":\"0x4e20\",\"input\":\"0x\",\"error\":" ++
+        "\"failed deposit: intrinsic gas too low\"}");
 }
 
 test "eth: prestateTracer lists the callee of a deposit below its intrinsic gas" {

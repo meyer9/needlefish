@@ -52,6 +52,10 @@ pub const Exit = enum(u8) {
     /// The caller of an unvalidated RPC call cannot pay its `value` (revm `OutOfFunds`; a
     /// transaction's first frame only, see `TxEnv.disable_fee_charge`).
     out_of_funds,
+    /// A deposit rejected before any frame (a system deposit after Regolith, gas below
+    /// intrinsic). Never an EVM outcome: only the synthetic top frame a tracer is given.
+    deposit_system_tx,
+    deposit_intrinsic_gas,
     call,
     create,
     fatal,
@@ -435,10 +439,17 @@ pub const Evm = struct {
         return evm.start_create(fork, request, parent);
     }
 
-    /// Reports a top-level frame whose value transfer fails before it runs (a deposit whose
-    /// sender cannot pay `value`): revm's first frame starts, so its tracer sees the frame,
-    /// which ends with OutOfFunds and all its gas left. `nonce` names a created address.
-    pub fn trace_unfunded(evm: *Evm, comptime fork: Fork, message: Message, nonce: u64) void {
+    /// Reports a failed deposit's top-level frame to the tracer, ending with `exit` and all
+    /// its gas left: one whose value transfer fails (revm's first frame starts, then ends
+    /// with OutOfFunds), or one rejected before any frame (a frame built from the
+    /// transaction, as geth and Nethermind report it). `nonce` names a created address.
+    pub fn trace_failed_top(
+        evm: *Evm,
+        comptime fork: Fork,
+        message: Message,
+        nonce: u64,
+        exit: Exit,
+    ) void {
         const tracer = evm.tracer orelse return;
         const is_create = message.kind == .create;
         tracer.enter(tracer.context, .{
@@ -455,7 +466,7 @@ pub const Evm = struct {
         });
         tracer.exit(tracer.context, .{
             .status = .halt,
-            .exit = .out_of_funds,
+            .exit = exit,
             .gas_remaining = message.gas_limit,
             .gas_refund = 0,
             .output = &.{},

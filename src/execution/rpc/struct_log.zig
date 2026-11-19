@@ -450,6 +450,8 @@ fn step_result(opcode: u8, gas_before: u64, gas_after: u64, end: evm.evm.StepEnd
         .precompile_failure,
         .precompile_out_of_gas,
         .out_of_funds,
+        .deposit_system_tx,
+        .deposit_intrinsic_gas,
         .fatal,
         => .{ .cost = spent, .error_text = null },
     };

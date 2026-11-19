@@ -173,6 +173,7 @@ pub fn halt(buffer: []u8, exit: Exit, gas_limit: u64) Failure {
         .create_collision => "CreateCollision",
         .precompile_failure => "PrecompileError",
         .out_of_funds => "OutOfFunds",
+        .deposit_system_tx, .deposit_intrinsic_gas => "FailedDeposit",
         .stop, .return_, .self_destruct, .revert, .call, .create, .fatal => unreachable,
     };
     const message = std.fmt.bufPrint(buffer, "EVM error: {s}", .{name}) catch unreachable;

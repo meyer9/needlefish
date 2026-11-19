@@ -261,6 +261,8 @@ pub fn error_text(exit: evm.evm.Exit) ?[]const u8 {
         .create_collision => "contract address collision",
         .precompile_failure, .precompile_out_of_gas => "precompile failed",
         .out_of_funds => "insufficient balance for transfer",
+        .deposit_system_tx => "failed deposit: system deposit after Regolith",
+        .deposit_intrinsic_gas => "failed deposit: intrinsic gas too low",
         .call, .create, .fatal => "internal error",
     };
 }
