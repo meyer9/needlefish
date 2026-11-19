@@ -621,6 +621,8 @@ test "diff trie: seeded fuzz, the primary against hash-builder and every variant
         try testing.expectEqual(fuzz.preimages, variants.contains("node-address"));
         try testing.expect(variants.contains("hash-builder"));
         try testing.expect(variants.contains("disk-small"));
+        try testing.expect(variants.contains("disk-small-reopen"));
+        try testing.expect(variants.contains("disk-deep"));
     }
 }
 
@@ -635,13 +637,18 @@ const HashedWrites = @import("../../execution/db/root.zig").overlay.HashedWrites
 
 const small_keys = 384;
 const small_slots = 24;
+/// Keys of the restart test: enough distinct records that disk-deep's level 1 (about 2k
+/// accounts, 1.5k slots) overflows into level 2.
+const restart_keys = 4096;
 const small_blocks = 30;
 const small_writes = 300;
 
 const SmallRun = struct {
     prng: Prng,
     model: trie_model.Model,
-    keys: [small_keys]Hash = undefined,
+    /// The first `keys_used` are written.
+    keys: [restart_keys]Hash = undefined,
+    keys_used: u32 = small_keys,
     slots: [small_slots]Hash = undefined,
     ops: [small_writes]trie_request.Op = undefined,
 
@@ -649,7 +656,7 @@ const SmallRun = struct {
     fn block(run: *SmallRun) !HashedWrites {
         var touched: trie_model.Touched = .{};
         for (&run.ops, 0..) |*op, index| {
-            const key = run.keys[run.prng.below(small_keys)];
+            const key = run.keys[run.prng.below(run.keys_used)];
             const exists = run.model.find(&key) != null;
             const choice = run.prng.below(100);
             op.* = .{ .kind = .account, .key = key };
@@ -765,4 +772,90 @@ fn expect_small_persisted(small: *trie_node.Node) !void {
     try testing.expect(small.db.checkpoints_completed >= 5);
     try testing.expect(small.db.disk.?.record_cache.stats.evictions > 0);
     try testing.expect(trees.cache.stats.evictions > 0);
+}
+
+// disk-small-reopen and disk-deep against the primary and hash-builder, node by node: the
+// same blocks, a restart after every block (clean, then a crash, alternately) with native
+// unwinds across them, and disk-deep's blocks split into blocks of 8 + 8 writes.
+
+test "diff trie: disk-small-reopen restarts and replays, disk-deep merges into level 2" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const dir = try std.fmt.allocPrint(arena, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    var paths: [3][]const u8 = undefined;
+    for (&paths, [_][]const u8{ "primary", "reopen", "deep" }) |*path, name| {
+        path.* = try std.fmt.allocPrint(arena, "{s}/{s}.db", .{ dir, name });
+    }
+    const primary = try trie_node.Node.create(testing.allocator, .disk, paths[0]);
+    defer primary.destroy();
+    var reopen: ?*trie_node.Node =
+        try trie_node.Node.create(testing.allocator, .disk_small, paths[1]);
+    defer if (reopen) |node| node.destroy();
+    const deep = try trie_node.Node.create(testing.allocator, .disk_deep, paths[2]);
+    defer deep.destroy();
+    var run: SmallRun = .{
+        .prng = Prng.init(0x5e57_0000 + build_options.fuzz_seed),
+        .model = .{ .arena = arena },
+        .keys_used = restart_keys,
+    };
+    for (&run.keys) |*key| run.prng.fill(key);
+    for (&run.slots) |*slot| run.prng.fill(slot);
+    var writes: [small_blocks]HashedWrites = undefined;
+    var roots: [small_blocks + 1]Hash = undefined;
+    roots[0] = trie.empty_root;
+    for (0..small_blocks) |index| {
+        writes[index] = try run.block();
+        roots[index + 1] = try run.model.state_root();
+        try small_commit(.{ primary, reopen.? }, writes[index], roots[index + 1]);
+        try deep.commit_split(writes[index]);
+        try testing.expectEqualSlices(u8, &roots[index + 1], &deep.state_root());
+        const node = reopen.?;
+        reopen = null;
+        reopen = try node.reopen(if (index % 2 == 1) @intCast(index % 8) else null);
+        try testing.expectEqualSlices(u8, &roots[index + 1], &reopen.?.state_root());
+        if (index % 7 == 6) {
+            // Two blocks back natively on a reopened database, then the same two again.
+            for ([2]*trie_node.Node{ primary, reopen.? }) |unwound| {
+                try testing.expect(try unwound.unwind_to(index - 1));
+                try testing.expectEqualSlices(u8, &roots[index - 1], &unwound.state_root());
+            }
+            try small_commit(.{ primary, reopen.? }, writes[index - 1], roots[index]);
+            try small_commit(.{ primary, reopen.? }, writes[index], roots[index + 1]);
+        }
+        for (0..4) |_| {
+            const key = run.keys[run.prng.below(restart_keys)];
+            try expect_same_disk_proofs(primary, reopen.?, key);
+            try expect_same_disk_proofs(primary, deep, key);
+        }
+    }
+    try expect_restarted(reopen.?);
+    try expect_deep(deep);
+}
+
+/// Every block restarted the database, half of them as crashes; every open loaded a
+/// checkpoint, and crashes replayed the journal after it.
+fn expect_restarted(node: *trie_node.Node) !void {
+    const stats = node.stats;
+    try testing.expectEqual(@as(u64, small_blocks / 2), stats.reopens_clean);
+    try testing.expectEqual(@as(u64, small_blocks / 2), stats.reopens_crash);
+    try testing.expectEqual(@as(u64, small_blocks), stats.checkpoint_loads);
+    try testing.expect(stats.crashes_mid_checkpoint >= small_blocks / 4);
+    try testing.expect(stats.crash_replays >= small_blocks / 4);
+    try testing.expect(stats.entries_replayed >= stats.crash_replays);
+}
+
+/// disk-deep merged into level 2 of the account and storage trees (tables live there), and
+/// its chain evicted on every insert past three blocks.
+fn expect_deep(deep: *trie_node.Node) !void {
+    const trees = &deep.db.flat.?;
+    inline for (.{ "accounts", "storage" }) |name| {
+        const tree = &@field(trees, name);
+        try testing.expect(tree.stats.merges_into[2] > 0);
+        try testing.expect(tree.level_count[2] > 0);
+    }
+    try testing.expect(deep.stats.commits > 10 * small_blocks);
+    try testing.expectEqual(@as(u32, 3), deep.db.chain.block_count());
 }

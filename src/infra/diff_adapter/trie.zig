@@ -12,12 +12,16 @@
 //! ops as one block.
 //!
 //! `variants` (`trie_variants.zig`): `sparse`, `state-trie`, `hash-builder` (the model's
-//! whole state through `HashBuilder`), `disk-small` (the primary's path over a third
+//! whole state through `HashBuilder`), `disk-small` (the primary's path over another
 //! database at `trie_node.config_disk_small`: memtables flush and checkpoints run every
-//! block, tables merge every few; its own native unwinds), and on requests whose every key
-//! carries its preimages, `node-address`: the durable node's in-memory state keyed by address
-//! (`Overlay`, `execute_and_commit`, `proof_at`) in another database in `trie.dir`. A
-//! variant that fails reports the error on that block and every later one.
+//! block, tables merge every few; its own native unwinds), `disk-small-reopen` (the same
+//! over another database, restarted after every block, cleanly and as a crash in turn, and
+//! read after the restart), `disk-deep` (the primary's path over `config_disk_deep`, each
+//! block committed as blocks of 8 + 8 writes, so the flat trees merge into level 2; unwinds
+//! as revert and ops), and on requests whose every key carries its preimages, `node-address`:
+//! the durable node's in-memory state keyed by address (`Overlay`, `execute_and_commit`,
+//! `proof_at`) in another database in `trie.dir`. A variant that fails reports the error on
+//! that block and every later one.
 
 const std = @import("std");
 const assert = std.debug.assert;
@@ -67,9 +71,38 @@ const variant_names = [_][]const u8{
     "state-trie",
     "hash-builder",
     "disk-small",
+    "disk-small-reopen",
+    "disk-deep",
     "node-address",
 };
-const VariantId = enum(u8) { sparse, state_trie, hash_builder, disk_small, node_address };
+const VariantId = enum(u8) {
+    sparse,
+    state_trie,
+    hash_builder,
+    disk_small,
+    disk_small_reopen,
+    disk_deep,
+    node_address,
+};
+
+/// The variants over another disk-mode database in `trie.dir`, each the primary's path.
+const DiskSpec = struct { id: VariantId, mode: trie_node.Mode, file: []const u8 };
+const disk_specs = [_]DiskSpec{
+    .{ .id = .disk_small, .mode = .disk_small, .file = "disk-small.db" },
+    .{ .id = .disk_small_reopen, .mode = .disk_small, .file = "disk-small-reopen.db" },
+    .{ .id = .disk_deep, .mode = .disk_deep, .file = "disk-deep.db" },
+};
+const db_files = [_][]const u8{ "primary.db", "node-address.db" } ++ blk: {
+    var files: [disk_specs.len][]const u8 = undefined;
+    for (disk_specs, &files) |spec, *file| file.* = spec.file;
+    break :blk files;
+};
+
+const Disk = struct {
+    node: ?*Node = null,
+    /// Request height -> the database height holding that state.
+    heights: [trie_node.blocks_max + 1]u64 = undefined,
+};
 
 /// One request's run: the databases, the variants and the model.
 const Run = struct {
@@ -83,8 +116,7 @@ const Run = struct {
     primary_heights: [trie_node.blocks_max + 1]u64 = undefined,
     address_node: ?*Node = null,
     address_heights: [trie_node.blocks_max + 1]u64 = undefined,
-    small_node: ?*Node = null,
-    small_heights: [trie_node.blocks_max + 1]u64 = undefined,
+    disks: [disk_specs.len]Disk = @splat(.{}),
     sparse: ?*trie_variants.Sparse = null,
     state_trie: ?trie_variants.StateTrieVariant = null,
     /// The first error of each variant (later blocks repeat it).
@@ -105,7 +137,6 @@ pub fn run(
     defer remove_dir(io, case.dir);
     const primary_path = try std.fs.path.join(arena, &.{ case.dir, "primary.db" });
     const address_path = try std.fs.path.join(arena, &.{ case.dir, "node-address.db" });
-    const small_path = try std.fs.path.join(arena, &.{ case.dir, "disk-small.db" });
     var state: Run = .{
         .arena = arena,
         .allocator = allocator,
@@ -116,9 +147,9 @@ pub fn run(
     defer state.primary.destroy();
     state.primary_heights[0] = 0;
     state.address_heights[0] = 0;
-    state.small_heights[0] = 0;
+    for (&state.disks) |*disk| disk.heights[0] = 0;
     for (&state.variants) |*blocks| blocks.* = try arena.alloc(BlockResult, case.blocks.len);
-    start_variants(&state, small_path, address_path);
+    try start_variants(&state, address_path);
     defer stop_variants(&state);
     const blocks = try arena.alloc(BlockResult, case.blocks.len);
     for (case.blocks, blocks, 0..) |*block, *result, index| {
@@ -133,7 +164,7 @@ pub fn run(
     return .{ .blocks = blocks, .variants = variants.items };
 }
 
-fn start_variants(state: *Run, small_path: []const u8, address_path: []const u8) void {
+fn start_variants(state: *Run, address_path: []const u8) error{OutOfMemory}!void {
     const allocator = state.allocator;
     state.sparse = trie_variants.Sparse.create(allocator) catch |err| blk: {
         state.failed[@backingInt(VariantId.sparse)] = @errorName(err);
@@ -143,10 +174,13 @@ fn start_variants(state: *Run, small_path: []const u8, address_path: []const u8)
         state.failed[@backingInt(VariantId.state_trie)] = @errorName(err);
         break :blk null;
     };
-    state.small_node = Node.create(allocator, .disk_small, small_path) catch |err| blk: {
-        state.failed[@backingInt(VariantId.disk_small)] = @errorName(err);
-        break :blk null;
-    };
+    for (disk_specs, &state.disks) |spec, *disk| {
+        const path = try std.fs.path.join(state.arena, &.{ state.case.dir, spec.file });
+        disk.node = Node.create(allocator, spec.mode, path) catch |err| blk: {
+            state.failed[@backingInt(spec.id)] = @errorName(err);
+            break :blk null;
+        };
+    }
     if (!state.case.preimages) return;
     state.address_node = Node.create(allocator, .memory, address_path) catch |err| blk: {
         state.failed[@backingInt(VariantId.node_address)] = @errorName(err);
@@ -156,7 +190,7 @@ fn start_variants(state: *Run, small_path: []const u8, address_path: []const u8)
 
 fn stop_variants(state: *Run) void {
     if (state.address_node) |node| node.destroy();
-    if (state.small_node) |node| node.destroy();
+    for (&state.disks) |*disk| if (disk.node) |node| node.destroy();
     if (state.state_trie) |*variant| variant.deinit(state.allocator);
     if (state.sparse) |sparse| sparse.destroy(state.allocator);
 }
@@ -165,9 +199,8 @@ fn stop_variants(state: *Run) void {
 /// was empty or absent before the request).
 fn remove_dir(io: std.Io, dir: []const u8) void {
     const cwd = std.Io.Dir.cwd();
-    var names_buffer: [3][std.fs.max_path_bytes]u8 = undefined;
-    const names = [_][]const u8{ "primary.db", "disk-small.db", "node-address.db" };
-    for (names, &names_buffer) |name, *buffer| {
+    var names_buffer: [db_files.len][std.fs.max_path_bytes]u8 = undefined;
+    for (db_files, &names_buffer) |name, *buffer| {
         const path = std.fmt.bufPrint(buffer, "{s}/{s}", .{ dir, name }) catch continue;
         cwd.deleteFile(io, path) catch {};
     }
@@ -310,7 +343,12 @@ fn run_variants(
             .sparse => sparse_block(state, parent, named, writes.native),
             .state_trie => state_trie_block(state, block, named),
             .hash_builder => hash_builder_block(state, named),
-            .disk_small => small_block(state, block, parent, named, writes),
+            .disk_small, .disk_small_reopen, .disk_deep => disk_block(state, id, block, .{
+                .index = index,
+                .parent = parent,
+                .named = named,
+                .writes = writes,
+            }),
             .node_address => address_block(state, block, parent, named),
         };
         results[index] = outcome catch |err| {
@@ -327,23 +365,38 @@ fn run_variants(
 /// revert, then the ops).
 const BlockWrites = struct { native: db.overlay.HashedWrites, all: db.overlay.HashedWrites };
 
-/// `disk-small`: the primary's path over the small database; its own unwind decision (it
-/// may retain fewer blocks).
-fn small_block(
-    state: *Run,
-    block: *const Block,
+const DiskBlock = struct {
+    index: usize,
     parent: u64,
     named: []const Hash,
     writes: BlockWrites,
-) anyerror!BlockResult {
-    const node = state.small_node orelse return error.Unavailable;
-    const native = try node.unwind_to(state.small_heights[@intCast(parent)]);
-    try node.commit_hashed(if (native) writes.native else writes.all);
-    state.small_heights[@intCast(parent + 1)] = node.height;
+};
+
+/// `disk-small`, `disk-small-reopen` and `disk-deep`: the primary's path over another
+/// database, with its own unwind decision (it may retain fewer blocks, or none to unwind
+/// to). `disk-deep` commits the block as several (`Node.commit_split`); `disk-small-reopen`
+/// restarts the database after the block, clean after even blocks and as a crash (part way
+/// into a checkpoint) after odd ones, and answers from the reopened database.
+fn disk_block(state: *Run, id: VariantId, block: *const Block, at: DiskBlock) anyerror!BlockResult {
+    const disk = for (disk_specs, &state.disks) |spec, *disk| {
+        if (spec.id == id) break disk;
+    } else unreachable; // `run_variants` passes disk variants only.
+    var node = disk.node orelse return error.Unavailable;
+    const native = try node.unwind_to(disk.heights[@intCast(at.parent)]);
+    const writes = if (native) at.writes.native else at.writes.all;
+    if (node.mode == .disk_deep) try node.commit_split(writes) else try node.commit_hashed(writes);
+    disk.heights[@intCast(at.parent + 1)] = node.height;
+    if (id == .disk_small_reopen) {
+        disk.node = null; // Gone even when the reopen fails.
+        // A crash lands at a different point of the checkpoint it asks for each time.
+        const crash_ticks: ?u32 = if (at.index % 2 == 1) @intCast(at.index % 8) else null;
+        node = try node.reopen(crash_ticks);
+        disk.node = node;
+    }
     return .{
         .number = 0,
         .state_root = node.state_root(),
-        .storage_roots = try node_storage_roots(state, node, named),
+        .storage_roots = try node_storage_roots(state, node, at.named),
         .proofs = try node_proofs(state, node, block),
     };
 }
