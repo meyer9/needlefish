@@ -467,12 +467,10 @@ fn transact_deposit(comptime fork: Fork, evm: *Evm, tx: *const TxEnv) evm_module
     // base/base `validate_env` rejects a system deposit since Regolith, and `catch_error`
     // turns that transaction error into a failed deposit like any other.
     if (context.rules().at_least(.regolith) and tx.is_system_transaction) {
-        try load_recipient(fork, evm, tx);
         return .{ .executed = try fail_deposit(fork, evm, tx, .revert) };
     }
     const intrinsic = intrinsic_gas(fork, tx);
     if (intrinsic.gas > tx.gas_limit or intrinsic.floor > tx.gas_limit) {
-        try load_recipient(fork, evm, tx);
         return .{ .executed = try fail_deposit(fork, evm, tx, .out_of_gas) };
     }
     const sender = try evm.state.load(tx.caller);
@@ -481,8 +479,9 @@ fn transact_deposit(comptime fork: Fork, evm: *Evm, tx: *const TxEnv) evm_module
     // reports as a halt, so the deposit fails and consumes its whole gas limit (base/base
     // `catch_error`). A nested call's failed transfer only fails that frame.
     if (sender.info.balance < tx.value) {
-        // revm loads the callee (and its EIP-7702 delegate) before the transfer fails.
-        try load_recipient(fork, evm, tx);
+        // revm's first frame loads the callee (and its EIP-7702 delegate) before the transfer
+        // fails, and the failed deposit keeps them loaded.
+        if (tx.to) |to| _ = try evm.resolve_code_address(fork, to);
         return .{ .executed = try fail_deposit(fork, evm, tx, .revert) };
     }
     if (tx.to != null) try evm.state.set_nonce(sender, sender.info.nonce +| 1);
@@ -495,14 +494,6 @@ fn transact_deposit(comptime fork: Fork, evm: *Evm, tx: *const TxEnv) evm_module
     }
     const accounted = account_gas(fork, tx, outcome, intrinsic, 0);
     return .{ .executed = finish(fork, evm, outcome, accounted) };
-}
-
-/// Loads a failing deposit's callee and its EIP-7702 delegate, which the failed deposit
-/// keeps loaded: Nethermind's prestateTracer looks both up before the deposit runs, so it
-/// lists them whichever check fails.
-fn load_recipient(comptime fork: Fork, evm: *Evm, tx: *const TxEnv) evm_module.Error!void {
-    assert(tx.tx_type == .deposit);
-    if (tx.to) |to| _ = try evm.resolve_code_address(fork, to);
 }
 
 fn fail_deposit(
