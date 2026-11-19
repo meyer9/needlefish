@@ -174,7 +174,7 @@ pub fn transaction(
 ) WriteError!void {
     const envelope = Envelope.decode(raw) catch return w.null_value();
     const sender = envelope.recover_sender(recoverer) orelse primitives.Address.zero;
-    try transaction_object(w, envelope, raw, sender, inclusion);
+    try transaction_object(w, envelope, raw, sender, inclusion, .signed);
 }
 
 /// An eth_simulateV1 transaction object: its signature is zero, so the request's `from` is
@@ -183,13 +183,28 @@ pub fn simulated_transaction(
     w: *Writer,
     raw: []const u8,
     sender: primitives.Address,
+    chain_id: u64,
     inclusion: Inclusion,
 ) WriteError!void {
+    if (raw[0] >= 0xc0) {
+        // An unsigned legacy transaction (`consensus.tx.encode_unsigned_legacy`): Nethermind
+        // writes v, r and s zero and the transaction's chain id.
+        var tx = consensus.tx.decode_unsigned_legacy(raw) catch unreachable; // Proof: built.
+        tx.chain_id = chain_id;
+        const unsigned: Envelope = .{ .legacy = .{
+            .tx = tx,
+            .signature = .{ .y_parity = false, .r = 0, .s = 0 },
+        } };
+        return transaction_object(w, unsigned, raw, sender, inclusion, .unsigned);
+    }
     // Proof: the simulation encoded `raw` from a transaction it built.
     const envelope = Envelope.decode(raw) catch unreachable;
     assert(envelope != .deposit);
-    try transaction_object(w, envelope, raw, sender, inclusion);
+    try transaction_object(w, envelope, raw, sender, inclusion, .signed);
 }
+
+/// Whether a legacy transaction's `v` follows its signature or is zero (unsigned).
+const Signing = enum { signed, unsigned };
 
 fn transaction_object(
     w: *Writer,
@@ -197,6 +212,7 @@ fn transaction_object(
     raw: []const u8,
     sender: primitives.Address,
     inclusion: ?Inclusion,
+    signing: Signing,
 ) WriteError!void {
     try w.begin_object();
     try field_data(w, "hash", &primitives.keccak256(raw).bytes);
@@ -221,7 +237,7 @@ fn transaction_object(
     try inclusion_fields(w, inclusion);
     if (inclusion) |at| if (at.timestamp) |time| try field_quantity(w, "blockTimestamp", time);
     if (inclusion) |at| if (at.timestamp_ms) |ms| try field_quantity(w, "blockTimestampMs", ms);
-    try signature_fields(w, envelope);
+    try signature_fields(w, envelope, signing);
     if (envelope == .deposit) {
         try deposit_fields(w, envelope.deposit);
         if (deposit_receipt_fields) |fields| if (fields.version) |version| {
@@ -323,11 +339,13 @@ fn inclusion_fields(w: *Writer, inclusion: ?Inclusion) WriteError!void {
     try field_quantity(w, keys[2], at.index);
 }
 
-fn signature_fields(w: *Writer, envelope: Envelope) WriteError!void {
+fn signature_fields(w: *Writer, envelope: Envelope, signing: Signing) WriteError!void {
     const sig = envelope.signature() orelse return;
     const parity: u64 = @intFromBool(sig.y_parity);
     if (envelope == .legacy) {
-        const v = if (envelope.chain_id()) |id| 35 + 2 * id + parity else 27 + parity;
+        const v = if (signing == .unsigned)
+            0
+        else if (envelope.chain_id()) |id| 35 + 2 * id + parity else 27 + parity;
         try field_quantity(w, "v", v);
     } else {
         try field_quantity(w, "v", parity);

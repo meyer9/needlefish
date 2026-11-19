@@ -897,7 +897,8 @@ test "eth: eth_simulateV1 blocks are base/base's sealed blocks" {
         try testing.expectEqualSlices(u8, &shown, &(try header_of_block(object)).hash().bytes);
     }
     // A zero state and withdrawals root (no state provider), the transaction with its
-    // `from` and a zero signature (an EIP-155 legacy one: gasPrice was given).
+    // `from` and a zero signature (a legacy one, gasPrice given, unsigned as geth builds it:
+    // v zero, no EIP-155 v).
     const zero_hash = "\"0x" ++ zeros_62 ++ "00\"";
     try testing.expectEqual(@as(usize, 3), count_of(text, "\"stateRoot\":" ++ zero_hash));
     try testing.expectEqual(@as(usize, 3), count_of(text, "\"withdrawalsRoot\":" ++ zero_hash));
@@ -905,6 +906,8 @@ test "eth: eth_simulateV1 blocks are base/base's sealed blocks" {
     try expect_contains(text, "\"type\":\"0x0\",\"from\":" ++ address_one);
     try expect_contains(text, "\"type\":\"0x2\",\"from\":\"0x" ++ zeros_62[0..40] ++ "\"");
     try expect_contains(text, "\"r\":\"0x0\",\"s\":\"0x0\"");
+    try expect_contains(text, "\"v\":\"0x0\",\"r\":\"0x0\",\"s\":\"0x0\"");
+    try testing.expectEqual(@as(usize, 0), count_of(text, "\"v\":\"0x2"));
     try expect_contains(text, "\"difficulty\":\"0x7\"");
     // The empty block has the empty transactions and receipts roots.
     const empty = "\"0x56e81f171bcc55a6ff8345e692c0f86e5b48e01b996cadc001622fb5e363b421\"";

@@ -100,7 +100,9 @@ pub const Block = struct {
         return block.arena.allocator().alloc(u8, size) catch error.ScratchFull;
     }
 
-    /// Encodes `request` with a zero signature; returns its hash.
+    /// Encodes `request` with a zero signature; returns its hash. A legacy transaction is
+    /// unsigned as geth builds it (`ToTransaction`): v, r and s zero, no EIP-155 v
+    /// (Nethermind: no signature, `LegacyTransactionForRpc` v 0).
     pub fn add_transaction(
         block: *Block,
         request: *const TxRequest,
@@ -109,8 +111,11 @@ pub const Block = struct {
         assert(block.count == block.receipt_count);
         assert(block.count < calls_max);
         const envelope = try block.envelope_of(request);
-        const raw = envelope.encode_to(try block.alloc(envelope.encoded_length()));
-        assert(raw.len == envelope.encoded_length());
+        const raw = if (envelope == .legacy) legacy: {
+            const tx = envelope.legacy.tx;
+            const length = consensus.tx.unsigned_legacy_length(tx);
+            break :legacy consensus.tx.encode_unsigned_legacy(tx, try block.alloc(length));
+        } else envelope.encode_to(try block.alloc(envelope.encoded_length()));
         block.transactions[block.count] = raw;
         block.senders[block.count] = sender;
         block.count += 1;
@@ -305,6 +310,7 @@ pub const Block = struct {
         sealed: *const Header,
         hash: B256,
         full: bool,
+        chain_id: u64,
     ) json.Writer.WriteError!void {
         assert(block.count == block.receipt_count);
         try format.header_fields(w, sealed, hash.bytes, block.size_bytes(sealed));
@@ -318,7 +324,7 @@ pub const Block = struct {
                 try w.data(&primitives.keccak256(raw).bytes);
                 continue;
             }
-            try format.simulated_transaction(w, raw, block.senders[index], .{
+            try format.simulated_transaction(w, raw, block.senders[index], chain_id, .{
                 .block_hash = hash.bytes,
                 .block_number = sealed.number,
                 .index = @intCast(index),

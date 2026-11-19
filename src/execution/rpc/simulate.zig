@@ -436,7 +436,7 @@ fn simulate_block(
     });
     const hash = sealed.hash();
     _ = assembly.patch_block_hashes(w.out.buffer[calls_start..calls_end], hash);
-    try block.write(w, &sealed, hash, simulation.full_transactions);
+    try block.write(w, &sealed, hash, simulation.full_transactions, simulation.api.spec.chain_id);
     try w.end_object();
     return .{
         .env = env,
