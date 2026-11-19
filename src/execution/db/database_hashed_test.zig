@@ -287,3 +287,164 @@ test "database hashed changesets: disk mode commits, unwinds and replays them li
         };
     }
 }
+
+// Leaves at depth 64: keys that share 63 nibbles hang under a branch at depth 63 with an
+// empty path. A walk that starts fresh (after a reopen here; in a long-lived node whenever
+// the memo is not carried) knows such a leaf only by its locator and rebuilds it from the
+// flat trees (`DiskState.resolve_leaf`), as it does every other leaf.
+
+const trie = @import("../trie/root.zig");
+
+fn hash_hex(comptime text: *const [64]u8) Hash {
+    var out: Hash = undefined;
+    _ = std.fmt.hexToBytes(&out, text) catch unreachable; // A constant of 64 hex digits.
+    return out;
+}
+
+/// Commits `accounts` and `slots` (sorted hashed writes) as block `id` on the head.
+fn commit_writes(
+    node: *Node,
+    changeset: *changeset_module.Changeset,
+    buffer: []u8,
+    id: u32,
+    accounts: []const AccountWrite,
+    slots: []const SlotWrite,
+) !void {
+    var header: [8]u8 = undefined;
+    std.mem.writeInt(u64, &header, id, .big);
+    var block_input: database.BlockInput = .{
+        .hash = disk_test.hash_of(id),
+        .parent_hash = node.db.head_info.hash,
+        .number = node.db.head_info.number + 1,
+        .timestamp = id,
+        .header = &header,
+        .body = "",
+        .receipts = "",
+        .transaction_hashes = &.{},
+        .changeset = "",
+    };
+    const db = &node.db;
+    const reader: Reader = .{ .state = &db.state };
+    const writes: overlay_module.HashedWrites = .{ .accounts = accounts, .slots = slots };
+    try overlay_module.build_hashed_changeset(reader, writes, changeset);
+    try db.state.apply(changeset);
+    block_input.changeset = changeset.encode(buffer);
+    _ = try db.commit_applied(&block_input);
+    try settle(node);
+}
+
+/// A checkpoint, a clean stop, and an open: the next walk starts fresh.
+fn restart(node: *Node) !void {
+    try node.checkpoint();
+    try settle(node);
+    try node.reopen();
+}
+
+/// The proofs of `key` (and `slot`) verify against the head's root and name `word`.
+fn expect_proof(node: *Node, key: *const Hash, slot: *const Hash, word: u256) !void {
+    const account_proof = try testing.allocator.create(trie.StateTrie.AccountProof);
+    defer testing.allocator.destroy(account_proof);
+    const storage_proofs = try testing.allocator.alloc(trie.StateTrie.StorageProof, 1);
+    defer testing.allocator.free(storage_proofs);
+    var values: [1]u256 = undefined;
+    const slots = [1]Hash{slot.*};
+    const account = try node.db.proof_hashed(key, &slots, account_proof, storage_proofs, &values);
+    try testing.expectEqual(word, values[0]);
+    var nodes: [trie.sparse.depth_max][]const u8 = undefined;
+    for (0..account_proof.count) |index| nodes[index] = account_proof.node_at(@intCast(index));
+    const root = node.db.head_info.state_root;
+    const leaf = try trie.verify_proof(root, key, nodes[0..account_proof.count]);
+    try testing.expect(leaf != null and account != null);
+    const proof = &storage_proofs[0];
+    for (0..proof.count) |index| nodes[index] = proof.node_at(@intCast(index));
+    const value = try trie.verify_proof(account.?.storage_root, slot, nodes[0..proof.count]);
+    try testing.expectEqual(word == 0, value == null);
+}
+
+test "database hashed changesets: leaves at depth 64 resolve on a fresh walk" {
+    const size = disk_test.config_disk.engine.size_bytes();
+    var sim = try SimStorage.init(testing.allocator, .{ .size_bytes = size, .seed = 64 });
+    defer sim.deinit(testing.allocator);
+    const node = try testing.allocator.create(Node);
+    defer testing.allocator.destroy(node);
+    try node.init(&sim, disk_test.config_disk);
+    defer node.deinit();
+    var changeset = try changeset_module.Changeset.init(
+        testing.allocator,
+        disk_test.config_disk.changeset,
+    );
+    defer changeset.deinit(testing.allocator);
+    const body_max = disk_test.config_disk.engine.entry_body_size_max;
+    const buffer = try testing.allocator.alloc(u8, body_max);
+    defer testing.allocator.free(buffer);
+    try node.format(0x6464);
+    var genesis_header: [8]u8 = @splat(0);
+    var genesis: database.BlockInput = .{
+        .hash = disk_test.hash_of(0),
+        .parent_hash = @splat(0),
+        .number = 0,
+        .timestamp = 0,
+        .header = &genesis_header,
+        .body = "",
+        .receipts = "",
+        .transaction_hashes = &.{},
+        .changeset = "",
+    };
+    _ = try node.commit_retry(&genesis);
+    try depth_64_slots(node, &changeset, buffer);
+    try depth_64_accounts(node, &changeset, buffer);
+}
+
+/// Two slots of one account share 63 nibbles; the account's storage is wiped after a
+/// restart (the diff fuzzer's first reproducer). Roots from an independent trie.
+fn depth_64_slots(node: *Node, changeset: *changeset_module.Changeset, buffer: []u8) !void {
+    const key = hash_hex("e8bd19873fbc3a087e3e7b365421ce329b1b9ff3e75238ff4eda892208adcb21");
+    const slot_a = hash_hex("7dce463b4b242275b93f9c283881774d280e3abf2ceec46c50fa7d9831a81354");
+    const slot_b = hash_hex("7dce463b4b242275b93f9c283881774d280e3abf2ceec46c50fa7d9831a8135b");
+    const info: AccountInfo = .{ .nonce = 1 };
+    const word_b = std.math.maxInt(u256);
+    try commit_writes(node, changeset, buffer, 1, &.{.{ .key = key, .info = info }}, &.{
+        .{ .key = key, .slot = slot_a, .value = 0xe8 },
+        .{ .key = key, .slot = slot_b, .value = word_b },
+    });
+    const root_set = hash_hex("2259d05c5a525272f2eb2a8ad2621e99f04177f0279ba129ea393019fcaed18e");
+    try testing.expectEqualSlices(u8, &root_set, &node.db.head_info.state_root);
+    try restart(node);
+    try expect_proof(node, &key, &slot_b, word_b);
+    try restart(node);
+    try commit_writes(node, changeset, buffer, 2, &.{.{ .key = key, .info = info }}, &.{
+        .{ .key = key, .slot = slot_a, .value = 0 },
+        .{ .key = key, .slot = slot_b, .value = 0 },
+    });
+    const root_wiped = hash_hex("c16f0092ffc700391c95efda61c6a0064352dfb1e565d9f3a2e9dc2de7cd8d07");
+    try testing.expectEqualSlices(u8, &root_wiped, &node.db.head_info.state_root);
+    // Gone for the next part: an account without storage may be deleted.
+    try commit_writes(node, changeset, buffer, 3, &.{.{ .key = key, .info = null }}, &.{});
+}
+
+/// Accounts 0xff..f7 and 0xff..ff share 63 nibbles; one gains a slot after a restart (the
+/// second reproducer). Roots from an independent trie.
+fn depth_64_accounts(node: *Node, changeset: *changeset_module.Changeset, buffer: []u8) !void {
+    var key_a: Hash = @splat(0xff);
+    key_a[31] = 0xf7;
+    const key_b: Hash = @splat(0xff);
+    const slot_x = hash_hex("0098746e65b7d65b10d81764d12b462608c9726c3adf22bfbff14f6c8d370a36");
+    const slot_y = hash_hex("0001ea76e6c723f45ebe843f7164a3705a1eeea12a006473fe31c738a5f09043");
+    const info: AccountInfo = .{ .nonce = 1 };
+    try commit_writes(node, changeset, buffer, 4, &.{
+        .{ .key = key_a, .info = info },
+        .{ .key = key_b, .info = info },
+    }, &.{.{ .key = key_b, .slot = slot_x, .value = 0x12 }});
+    const root_two = hash_hex("51ce7f71637a095fdf7771c271c99b8e4fd476befd786c445316adc6c798461d");
+    try testing.expectEqualSlices(u8, &root_two, &node.db.head_info.state_root);
+    try restart(node);
+    try expect_proof(node, &key_a, &slot_x, 0);
+    try restart(node);
+    try commit_writes(node, changeset, buffer, 5, &.{.{ .key = key_b, .info = info }}, &.{
+        .{ .key = key_b, .slot = slot_y, .value = 0x7621 },
+    });
+    const root_grown = hash_hex("26667428c38ef4606f6f8d879fdc841a7194461ed02bff6b195647e7c9ccdf17");
+    try testing.expectEqualSlices(u8, &root_grown, &node.db.head_info.state_root);
+    try restart(node);
+    try expect_proof(node, &key_b, &slot_y, 0x7621);
+}

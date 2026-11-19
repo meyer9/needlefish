@@ -859,3 +859,176 @@ fn expect_deep(deep: *trie_node.Node) !void {
     try testing.expect(deep.stats.commits > 10 * small_blocks);
     try testing.expectEqual(@as(u32, 3), deep.db.chain.block_count());
 }
+
+// Keys sharing long prefixes: leaves at depth 62 to 64 under branches at depth 61 to 63,
+// read and written by walks that start fresh (disk-small-reopen restarts after every block).
+// The two requests are the diff fuzzer's reproducers; roots from an independent trie.
+
+const repro_key = "0xe8bd19873fbc3a087e3e7b365421ce329b1b9ff3e75238ff4eda892208adcb21";
+const repro_slot_prefix = "0x7dce463b4b242275b93f9c283881774d280e3abf2ceec46c50fa7d9831a8135";
+const repro_one = "{\"number\":\"0x1\",\"ops\":[" ++
+    "{\"op\":\"account\",\"key\":\"" ++ repro_key ++
+    "\",\"nonce\":\"0x1\",\"balance\":\"0x0\",\"codeHash\":\"" ++ empty_code ++ "\"}," ++
+    "{\"op\":\"storage\",\"key\":\"" ++ repro_key ++ "\",\"slot\":\"" ++ repro_slot_prefix ++
+    "4\",\"value\":\"0x" ++ repeat("00", 31) ++ "e8\"}," ++
+    "{\"op\":\"storage\",\"key\":\"" ++ repro_key ++ "\",\"slot\":\"" ++ repro_slot_prefix ++
+    "b\",\"value\":\"0x" ++ repeat("ff", 32) ++ "\"}],\"proofs\":[]}," ++
+    "{\"number\":\"0x2\",\"ops\":[{\"op\":\"wipe\",\"key\":\"" ++ repro_key ++
+    "\"}],\"proofs\":[]}";
+
+const repro_a = "0x" ++ repeat("ff", 31) ++ "f7";
+const repro_b = "0x" ++ repeat("ff", 32);
+fn repro_account(comptime key: []const u8) []const u8 {
+    return "{\"op\":\"account\",\"key\":\"" ++ key ++
+        "\",\"nonce\":\"0x1\",\"balance\":\"0x0\",\"codeHash\":\"" ++ empty_code ++ "\"}";
+}
+fn repro_storage(
+    comptime key: []const u8,
+    comptime slot: []const u8,
+    comptime word: []const u8,
+) []const u8 {
+    return "{\"op\":\"storage\",\"key\":\"" ++ key ++ "\",\"slot\":\"0x" ++ slot ++
+        "\",\"value\":\"0x" ++ word ++ "\"}";
+}
+const repro_two = "{\"number\":\"0x1\",\"ops\":[],\"proofs\":[]}," ++
+    "{\"number\":\"0x2\",\"ops\":[],\"proofs\":[]}," ++
+    "{\"number\":\"0x3\",\"ops\":[" ++ repro_account(repro_a) ++ "," ++ repro_storage(
+    repro_a,
+    "0090200000064bb05bb32ceece7b385104493cecb993d1632fa3080bbe2cd3bd",
+    repeat("00", 32),
+) ++ "," ++ repro_account(repro_b) ++ "," ++ repro_storage(
+    repro_b,
+    "0098746e65b7d65b10d81764d12b462608c9726c3adf22bfbff14f6c8d370a36",
+    repeat("00", 31) ++ "12",
+) ++ "],\"proofs\":[]}," ++
+    "{\"number\":\"0x4\",\"ops\":[" ++ repro_storage(
+    repro_b,
+    "0001ea76e6c723f45ebe843f7164a3705a1eeea12a006473fe31c738a5f09043",
+    repeat("00", 30) ++ "7621",
+) ++ "],\"proofs\":[]}," ++
+    "{\"number\":\"0x5\",\"ops\":[],\"proofs\":[]}";
+
+test "diff trie: the fuzzer's depth-64 reproducers agree everywhere" {
+    const harness = try Harness.create();
+    defer harness.destroy();
+    try expect_roots(try harness.request(repro_one), &.{
+        "0x2259d05c5a525272f2eb2a8ad2621e99f04177f0279ba129ea393019fcaed18e",
+        "0xc16f0092ffc700391c95efda61c6a0064352dfb1e565d9f3a2e9dc2de7cd8d07",
+    });
+    try expect_roots(try harness.request(repro_two), &.{
+        empty_root,
+        empty_root,
+        "0x51ce7f71637a095fdf7771c271c99b8e4fd476befd786c445316adc6c798461d",
+        "0x26667428c38ef4606f6f8d879fdc841a7194461ed02bff6b195647e7c9ccdf17",
+        "0x26667428c38ef4606f6f8d879fdc841a7194461ed02bff6b195647e7c9ccdf17",
+    });
+}
+
+/// Writes `key` with its last `64 - shared` nibbles changed from `base`'s from nibble
+/// `shared` on (so the two share exactly `shared` nibbles).
+fn diverge(base: Hash, shared: u32, salt: u8) Hash {
+    var key = base;
+    const index = shared / 2;
+    const flip: u8 = if (shared % 2 == 0) 0x10 * ((salt % 15) + 1) else (salt % 15) + 1;
+    key[index] ^= flip;
+    return key;
+}
+
+/// Blocks over two accounts and two slots each sharing `shared` nibbles: create with large
+/// words (hashed leaves) and a small one (embedded), update, wipe, delete and recreate, an
+/// unwind with its revert; every key and slot proven after every block.
+fn shared_prefix_blocks(w: *std.Io.Writer, shared: u32) !void {
+    const base = keccak256(&.{@as(u8, @intCast(shared))});
+    const keys = [2]Hash{ base, diverge(base, shared, 3) };
+    const slot_base = keccak256(&.{ @as(u8, @intCast(shared)), 1 });
+    const slots = [2]Hash{ slot_base, diverge(slot_base, shared, 7) };
+    const big = "0x" ++ repeat("ff", 32);
+    const small = "0x" ++ repeat("00", 31) ++ "05";
+    const steps = [_]struct { ops: []const u8, unwind: u32 = 0, revert: []const u8 = "" }{
+        .{ .ops = "AaAbSaaBSabBSbaBSbbS" },
+        .{ .ops = "SaaZSbbB" },
+        .{ .ops = "Wa" },
+        .{ .ops = "DbAbSbaB" },
+        // Back to the second block's state, then other writes.
+        .{ .ops = "SabSSbaZ", .unwind = 2, .revert = "SabBSbbB" },
+    };
+    for (steps, 1..) |step, index| {
+        if (index > 1) try w.writeAll(",");
+        try w.print("{{\"number\":\"0x{x}\",\"unwind\":{d}", .{ index - step.unwind, step.unwind });
+        if (step.unwind > 0) {
+            try w.writeAll(",\"revert\":[");
+            try shared_ops(w, step.revert, &keys, &slots, big, small);
+            try w.writeAll("]");
+        }
+        try w.writeAll(",\"ops\":[");
+        try shared_ops(w, step.ops, &keys, &slots, big, small);
+        try w.writeAll("],\"proofs\":[");
+        for (keys, 0..) |key, key_index| {
+            if (key_index > 0) try w.writeAll(",");
+            try w.print("{{\"key\":\"0x{x}\",\"slots\":[\"0x{x}\",\"0x{x}\"]}}", .{
+                &key, &slots[0], &slots[1],
+            });
+        }
+        try w.writeAll("]}");
+    }
+}
+
+/// Ops from a script: `A<k>` account, `S<k><s><word>` storage (`B` big, `S` small, `Z`
+/// zero), `W<k>` wipe, `D<k>` delete; `k` and `s` are `a` or `b`.
+fn shared_ops(
+    w: *std.Io.Writer,
+    script: []const u8,
+    keys: *const [2]Hash,
+    slots: *const [2]Hash,
+    big: []const u8,
+    small: []const u8,
+) !void {
+    var index: usize = 0;
+    var first = true;
+    while (index < script.len) {
+        if (!first) try w.writeAll(",");
+        first = false;
+        const key = &keys[script[index + 1] - 'a'];
+        switch (script[index]) {
+            'A' => {
+                try w.print("{{\"op\":\"account\",\"key\":\"0x{x}\",\"nonce\":\"0x1\"," ++
+                    "\"balance\":\"0x7\",\"codeHash\":\"{s}\"}}", .{ key, empty_code });
+                index += 2;
+            },
+            'S' => {
+                const slot = &slots[script[index + 2] - 'a'];
+                const word = switch (script[index + 3]) {
+                    'B' => big,
+                    'S' => small,
+                    else => "0x" ++ repeat("00", 32),
+                };
+                try w.print("{{\"op\":\"storage\",\"key\":\"0x{x}\",\"slot\":\"0x{x}\"," ++
+                    "\"value\":\"{s}\"}}", .{ key, slot, word });
+                index += 4;
+            },
+            'W', 'D' => {
+                const name = if (script[index] == 'W') "wipe" else "delete";
+                try w.print("{{\"op\":\"{s}\",\"key\":\"0x{x}\"}}", .{ name, key });
+                index += 2;
+            },
+            else => unreachable, // The scripts above use these letters only.
+        }
+    }
+}
+
+test "diff trie: keys sharing 60 to 63 nibbles agree everywhere, across restarts" {
+    const harness = try Harness.create();
+    defer harness.destroy();
+    var blocks: std.Io.Writer.Allocating = .init(testing.allocator);
+    defer blocks.deinit();
+    for ([_]u32{ 60, 61, 62, 63 }) |shared| {
+        blocks.clearRetainingCapacity();
+        try shared_prefix_blocks(&blocks.writer, shared);
+        const response = try harness.request(blocks.written());
+        expect_variants_agree(response) catch |err| {
+            std.debug.print("diff trie: shared prefix of {d} nibbles\n", .{shared});
+            return err;
+        };
+        try testing.expect(field(response, "variants").object.contains("disk-small-reopen"));
+    }
+}

@@ -1173,7 +1173,9 @@ pub fn DiskStateType(comptime FlatTrees: type) type {
             depth: u8,
             want: *const Hash,
         ) ?[]const u8 {
-            assert(depth < 64);
+            // Depth 64: the child of a branch at depth 63 (keys sharing 63 nibbles), a leaf
+            // with an empty path.
+            assert(depth <= 64);
             self.stats.leaves_resolved += 1;
             var value_buffer: [state_trie.account_rlp_bytes_max]u8 = undefined;
             var value: []const u8 = undefined;
