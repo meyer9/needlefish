@@ -324,6 +324,24 @@ test "eth: block transaction counts, by-index lookups, uncles, sha3, txpool_stat
     try expect_contains(tx, "\"blockNumber\":\"0x1\"");
     const past_end = try h.request("eth_getTransactionByBlockNumberAndIndex", "[\"0x1\",\"0x1\"]");
     try testing.expectEqualStrings("\"result\":null", past_end);
+    // An unknown block is refused (Nethermind's OP module), whatever the index; the raw
+    // form and the uncle answer null.
+    const unknown = "[\"0x93fbe6f24bf0038f8fafa5fef96df0ec11c066fdf976ecdc649a1aa820365100\",";
+    inline for (.{ "\"0x0\"]", "\"0xffffffffffffffffffffffffffffffd7\"]" }) |index| {
+        const params = unknown ++ index;
+        const method = "eth_getTransactionByBlockHashAndIndex";
+        try expect_failure(h, method, params, "-32000", "header not found");
+        inline for (.{
+            "eth_getRawTransactionByBlockHashAndIndex",
+            "eth_getUncleByBlockHashAndIndex",
+        }) |null_method| {
+            const answer = try h.request(null_method, params);
+            try testing.expectEqualStrings("\"result\":null", answer);
+        }
+    }
+    const beyond = "[\"0x9\",\"0x0\"]";
+    const method = "eth_getTransactionByBlockNumberAndIndex";
+    try expect_failure(h, method, beyond, "-32000", "header not found");
     var request_buffer: [256]u8 = undefined;
     const by_hash = try std.fmt.bufPrint(
         &request_buffer,

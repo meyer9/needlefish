@@ -106,8 +106,10 @@ fn write_transaction_at(api: *Api, call: *Call, hash: ?Hash, form: Form) Handler
     // Nethermind's index is a `UInt256`: one of 2^64 or more is past the end (null).
     const index_wide = try call.params.quantity(u256);
     try call.params.finish();
-    const found = hash orelse return call.writer.null_value();
-    const record = api.chain.record(found) orelse return call.writer.null_value();
+    // Nethermind's OP module (`GetTransactionByBlockAndIndex`) refuses an unknown block
+    // whatever the index; the raw forms answer null (the base module).
+    const found = hash orelse return missing_block(call, form);
+    const record = api.chain.record(found) orelse return missing_block(call, form);
     if (index_wide >= transaction_count(record)) return call.writer.null_value();
     const index: u64 = @intCast(index_wide);
     var transactions = record.transactions;
@@ -123,6 +125,12 @@ fn write_transaction_at(api: *Api, call: *Call, hash: ?Hash, form: Form) Handler
         .timestamp = record.header.timestamp,
         .deposit = format.deposit_receipt(record, @intCast(index)),
     }, api.chain.executor.recoverer);
+}
+
+fn missing_block(call: *Call, form: Form) HandlerError!void {
+    if (form == .raw) return call.writer.null_value();
+    assert(form == .object);
+    return call.fail(rpc.code.server_error, "header not found");
 }
 
 fn transaction_by_hash_index(api: *Api, call: *Call) HandlerError!void {
