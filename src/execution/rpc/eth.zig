@@ -1527,6 +1527,11 @@ pub const Filter = struct {
     /// `toBlock` was a concrete number (not omitted or a tag): a polled filter stops there.
     to_given: bool = false,
     block_hash: ?Hash = null,
+    /// `fromBlock` and `toBlock` named the same block by hash: that block alone, canonical or
+    /// not (Nethermind's `LogFinder`).
+    range_block: ?Hash = null,
+    /// `fromBlock` or `toBlock` named an unknown block hash.
+    missing_block: bool = false,
     addresses: [16][20]u8 = undefined,
     address_count: u32 = 0,
     /// Per position: allowed topics (empty = any).
@@ -1578,6 +1583,8 @@ pub fn parse_filter(api: *Api, raw: []const u8) HandlerError!Filter {
     if ((try scanner_next(&scanner)).tag != .object_begin) return error.InvalidParams;
     // alloy's `Filter`: null reads as absent, and a block hash excludes a range.
     var range_given = false;
+    // The hashes `toBlock` (0) and `fromBlock` (1) named, if any.
+    var bound_hashes: [2]?Hash = .{ null, null };
     while (true) {
         const name = try scanner_next(&scanner);
         if (name.tag == .object_end) break;
@@ -1589,9 +1596,11 @@ pub fn parse_filter(api: *Api, raw: []const u8) HandlerError!Filter {
         if (std.mem.eql(u8, name.bytes, "fromBlock") or std.mem.eql(u8, name.bytes, "toBlock")) {
             if (value.tag != .string) return error.InvalidParams;
             range_given = true;
-            const number = try number_of_tag(api, value.bytes);
-            if (name.bytes[0] == 'f') filter.from = number else filter.to = number;
-            if (name.bytes[0] == 't') filter.to_given = std.mem.startsWith(u8, value.bytes, "0x");
+            const from = name.bytes[0] == 'f';
+            const bound = &bound_hashes[@intFromBool(from)];
+            const number = try filter_bound(api, &filter, value.bytes, bound);
+            if (from) filter.from = number else filter.to = number;
+            if (!from) filter.to_given = std.mem.startsWith(u8, value.bytes, "0x");
         } else if (std.mem.eql(u8, name.bytes, "blockHash")) {
             filter.block_hash = json.parse_hash(value.bytes) catch return error.InvalidParams;
         } else if (std.mem.eql(u8, name.bytes, "address")) {
@@ -1609,7 +1618,23 @@ pub fn parse_filter(api: *Api, raw: []const u8) HandlerError!Filter {
         } else scanner.skip(value) catch return error.InvalidParams;
     }
     if (range_given and filter.block_hash != null) return error.InvalidParams;
+    if (bound_hashes[0]) |to_hash| if (bound_hashes[1]) |from_hash| {
+        if (std.mem.eql(u8, &to_hash, &from_hash)) filter.range_block = to_hash;
+    };
     return filter;
+}
+
+/// A `fromBlock` or `toBlock`: a tag, a number, or (Nethermind) a 32-byte block hash, read as
+/// that block's number; `hash` keeps the hash.
+fn filter_bound(api: *Api, filter: *Filter, text: []const u8, hash: *?Hash) HandlerError!u64 {
+    if (text.len != 2 + 64) return number_of_tag(api, text);
+    const named = json.parse_hash(text) catch return error.InvalidParams;
+    hash.* = named;
+    const header = api.chain.header(named) orelse {
+        filter.missing_block = true;
+        return 0;
+    };
+    return header.number;
 }
 
 fn parse_addresses(scanner: *json.Scanner, first: json.Token, out: *[16][20]u8) HandlerError!u32 {
@@ -1631,7 +1656,9 @@ fn parse_addresses(scanner: *json.Scanner, first: json.Token, out: *[16][20]u8) 
 fn get_logs(api: *Api, call: *Call) HandlerError!void {
     const filter = try parse_filter(api, try call.params.raw());
     try call.params.finish();
-    if (filter.block_hash == null) {
+    if (filter.missing_block) return call.fail(rpc.code.server_error, "block not found");
+    const single = filter.block_hash orelse filter.range_block;
+    if (single == null) {
         // reth's checks and texts, in its order.
         const head = head_header(api).number;
         var text: [128]u8 = undefined;
@@ -1650,7 +1677,7 @@ fn get_logs(api: *Api, call: *Call) HandlerError!void {
     }
     try call.writer.begin_array();
     var written: u32 = 0;
-    if (filter.block_hash) |hash| {
+    if (single) |hash| {
         try block_logs(api, call, hash, &filter, &written);
     } else {
         var number = filter.from;

@@ -122,6 +122,7 @@ fn new_filter(api: *Api, call: *Call) HandlerError!void {
     const filters = try table(api, call);
     const criteria = try eth.parse_filter(api, try call.params.raw());
     try call.params.finish();
+    if (criteria.missing_block) return call.fail(rpc.code.server_error, "block not found");
     try call.writer.quantity(filters.install(.logs, head_number(api), criteria));
 }
 

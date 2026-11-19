@@ -1389,6 +1389,16 @@ test "eth: request fields parse as base/base's serde types" {
     try expect_contains(try h.request("eth_getBlockReceipts", "[{\"blockHash\":null}]"), "-32602");
     const balance = "[\"0x7e5f4552091a69125d5dfcb7b8c2659029395bdf\",{\"blockNumber\":null}]";
     try expect_contains(try h.request("eth_getBalance", balance), "\"result\":\"0x");
+    // eth_getLogs bounds may be block hashes (Nethermind), mixed with tags or numbers.
+    const hashes_format = request_prefix_format ++ "eth_getLogs\",\"params\":[{{" ++
+        "\"fromBlock\":\"{s}\",\"toBlock\":\"{s}\"}}]}}";
+    const hashes = try std.fmt.bufPrint(&body, hashes_format, .{ &hash, &hash });
+    try expect_contains(try h.request_runtime(hashes), "\"result\":[");
+    const mixed = try std.fmt.bufPrint(&body, hashes_format, .{ "0x0", &hash });
+    try expect_contains(try h.request_runtime(mixed), "\"result\":[");
+    const unknown = "0x" ++ @as([64]u8, @splat('e'));
+    const missing = try std.fmt.bufPrint(&body, hashes_format, .{ unknown, unknown });
+    try expect_contains(try h.request_runtime(missing), "block not found");
     // eth_call ignores movePrecompileToAddress (only eth_simulateV1 applies it).
     const moved = "[{},\"latest\",{\"0x0000000000000000000000000000000000000001\":" ++
         "{\"movePrecompileToAddress\":\"0x8fe1cc26a5cc6c3299bc42ffe394466911fc0dea\"}}]";
