@@ -82,7 +82,7 @@ pub const Schedule = struct {
         overrides: ?[]const u8,
     ) HandlerError!Planned {
         assert(buffer.len >= 128);
-        const number_raw = try member(overrides, &.{ "number", "blockNumber" });
+        const number_raw = try member(overrides, "number");
         const target = if (number_raw) |raw|
             saturate_u64(try quantity(u256, raw))
         else
@@ -102,7 +102,7 @@ pub const Schedule = struct {
         }
         schedule.prev_number = target;
         const prev = schedule.prev_timestamp;
-        const time_raw = try member(overrides, &.{ "time", "timestamp" });
+        const time_raw = try member(overrides, "time");
         const timestamp = if (time_raw) |raw| blk: {
             const timestamp = try quantity(u64, raw);
             // Nethermind (`SimulateTxExecutor.Execute`) refuses an overridden time that
@@ -138,14 +138,13 @@ fn fail(
     return call.fail(code, message);
 }
 
-/// The first non-null member `names` of the object `raw` (null `raw`: none).
-fn member(raw: ?[]const u8, names: []const []const u8) HandlerError!?[]const u8 {
+/// The member `name` of the object `raw` (null `raw`: none), matched as Nethermind does
+/// (ASCII case-insensitively, the last one); null when missing or null.
+fn member(raw: ?[]const u8, name: []const u8) HandlerError!?[]const u8 {
     const object = raw orelse return null;
-    for (names) |name| {
-        const value = json.find_path(object, &.{name}) catch return error.InvalidParams;
-        if (value) |text| if (!std.mem.eql(u8, text, "null")) return text;
-    }
-    return null;
+    const value = json.find_member_ignore_case(object, name) catch return error.InvalidParams;
+    const text = value orelse return null;
+    return if (std.mem.eql(u8, text, "null")) null else text;
 }
 
 fn quantity(comptime T: type, raw: []const u8) HandlerError!T {

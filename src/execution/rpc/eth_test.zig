@@ -713,6 +713,31 @@ test "eth: eth_simulateV1 limits and rejections" {
     try expect_failure(h, "eth_simulateV1", chain, "-32000", "invalid chain ID");
 }
 
+test "eth: eth_simulateV1 refuses an unknown override key" {
+    const h = try Harness.create();
+    defer h.destroy();
+    // Nethermind reads override keys strictly and case-insensitively: an alias such as
+    // `baseFee` names no field, in any block, before the block parameter is read.
+    const prefix = "[{\"blockStateCalls\":[{},{\"blockOverrides\":";
+    const tail = "}]},\"bad\"]";
+    const unknown = prefix ++ "{\"baseFee\":\"0x8\"}" ++ tail;
+    try expect_failure(h, "eth_simulateV1", unknown, "-32602", "invalid argument 0");
+    const twice = prefix ++ "{\"gasLimit\":\"0x8\",\"GasLimit\":\"0x8\"}" ++ tail;
+    try expect_failure(h, "eth_simulateV1", twice, "-32602", "invalid argument 0");
+    const account = "[{\"blockStateCalls\":[{\"stateOverrides\":{" ++ override_target ++
+        ":{\"storage\":{}}}}]}]";
+    try expect_failure(h, "eth_simulateV1", account, "-32602", "invalid argument 0");
+    // Any case names the field, and the same spelling twice is one key.
+    const cased = "[{\"blockStateCalls\":[{\"blockOverrides\":{\"BASEFEEPERGAS\":\"0x7\"," ++
+        "\"Time\":\"0x7fffffff\",\"Time\":\"0x7fffffff\"},\"stateOverrides\":{" ++
+        override_target ++ ":{\"Code\":\"0x485f5260205ff3\"}},\"calls\":[{\"to\":" ++
+        override_target ++ "}]}]}]";
+    const text = try h.request("eth_simulateV1", cased);
+    try expect_contains(text, "\"baseFeePerGas\":\"0x7\"");
+    try expect_contains(text, "\"timestamp\":\"0x7fffffff\"");
+    try expect_contains(text, "\"returnData\":\"0x" ++ zeros_62 ++ "07\"");
+}
+
 test "eth: eth_simulateV1 Denim default timestamps repeat at 2^64 - 1" {
     const h = try Harness.create_for(&denim_rpc_spec);
     defer h.destroy();
@@ -922,7 +947,7 @@ test "eth: eth_simulateV1 blocks are base/base's sealed blocks" {
     // A counter call (one log), then slot 0 cleared from 1 (a refund), then an empty block.
     const clearer_at = "\"0x0000000000000000000000000000000000000057\"";
     const params = "[{\"returnFullTransactions\":true,\"blockStateCalls\":[" ++
-        "{\"blockOverrides\":{\"difficulty\":\"0x7\"},\"stateOverrides\":{" ++ counter_at ++
+        "{\"stateOverrides\":{" ++ counter_at ++
         ":{\"code\":\"" ++ counter_hex ++ "\"}},\"calls\":[{\"from\":" ++ address_one ++
         ",\"to\":" ++ counter_at ++ ",\"gasPrice\":\"0x0\"}]}," ++
         "{\"stateOverrides\":{" ++ clearer_at ++ ":{\"code\":\"0x5f5f5500\",\"state\":{\"0x" ++
@@ -959,7 +984,7 @@ test "eth: eth_simulateV1 blocks are base/base's sealed blocks" {
     try expect_contains(text, "\"r\":\"0x0\",\"s\":\"0x0\"");
     try expect_contains(text, "\"v\":\"0x0\",\"r\":\"0x0\",\"s\":\"0x0\"");
     try testing.expectEqual(@as(usize, 0), count_of(text, "\"v\":\"0x2"));
-    try expect_contains(text, "\"difficulty\":\"0x7\"");
+    try testing.expectEqual(@as(usize, 3), count_of(text, "\"difficulty\":\"0x0\""));
     // The empty block has the empty transactions and receipts roots.
     const empty = "\"0x56e81f171bcc55a6ff8345e692c0f86e5b48e01b996cadc001622fb5e363b421\"";
     try expect_contains(text, "\"transactionsRoot\":" ++ empty ++ ",\"receiptsRoot\":" ++ empty);

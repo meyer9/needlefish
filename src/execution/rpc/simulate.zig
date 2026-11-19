@@ -2,9 +2,10 @@
 //! simulated blocks each with optional `blockOverrides`, `stateOverrides` and `calls`, on
 //! top of a base block, carrying state across calls and blocks. Nothing is committed.
 //!
-//! Supported: the block overrides of `apply_block_overrides` (all of alloy's but `blockHash`;
-//! overridden numbers and times must increase; defaults are parent + 1 and parent time + 12,
-//! saturating; the base fee is zero unless overridden);
+//! Supported: the block overrides of `apply_block_overrides` (Nethermind's `BlockOverride`
+//! fields, any case; an unknown key is refused; overridden numbers and times must
+//! increase; defaults are parent + 1 and parent time + 12, saturating; the base fee is
+//! zero unless overridden);
 //! state overrides `balance`, `nonce`, `code`, `state` (replaces all storage) and
 //! `stateDiff`. Calls run fee-free (gas price and base fee zero, as without
 //! `validation`), with the block's remaining gas by default. Each block is the full block
@@ -155,10 +156,11 @@ const Parent = struct {
 
 fn simulate_v1(api: *Api, call: *Call) HandlerError!void {
     const options = try call.params.raw();
-    const view = try state_view.resolve(api, call, try call.params.optional_raw());
-    try call.params.finish();
     const blocks = (json.find_path(options, &.{"blockStateCalls"}) catch null) orelse
         return error.InvalidParams;
+    try check_override_keys(call, blocks);
+    const view = try state_view.resolve(api, call, try call.params.optional_raw());
+    try call.params.finish();
     try check_count(call, blocks);
     const scratch = try scratch_of(api, call, view);
     var transfers: transfers_module.Transfers = .{ .items = &.{} };
@@ -166,12 +168,11 @@ fn simulate_v1(api: *Api, call: *Call) HandlerError!void {
         if (try json_true(options, "traceTransfers")) &transfers else null;
     const space = try call_space(call, scratch, traced);
     const header = eth.view_header(api, view);
-    const denim = api.spec.upgrades[@backingInt(chainspec.Upgrade.denim)];
     const chain = api.chain;
     var schedule = schedule_module.Schedule.init(
         chain.genesis_number,
         chain.genesis_timestamp,
-        denim,
+        api.spec.upgrades[@backingInt(chainspec.Upgrade.denim)],
         header.number,
         header.timestamp,
     );
@@ -287,7 +288,7 @@ fn precheck_blocks(
     var list = try Elements.init(blocks);
     while (try list.next(blocks_max)) |block_raw| {
         if (try block_overrides(block_raw)) |raw| {
-            const gas_limit = json.find_path(raw, &.{"gasLimit"}) catch
+            const gas_limit = json.find_member_ignore_case(raw, "gasLimit") catch
                 return error.InvalidParams;
             if (gas_limit) |text| if (!std.mem.eql(u8, text, "null")) {
                 const limit = try quantity_of(u64, text);
@@ -465,9 +466,6 @@ fn simulate_block(
 ) HandlerError!Parent {
     const overrides = try block_overrides(raw);
     const env = try block_env(simulation, parent, overrides, planned);
-    // alloy-evm `apply_block_overrides` sets the block's difficulty (only the header shows
-    // it: post-merge DIFFICULTY reads prevRandao).
-    const difficulty = try difficulty_of(overrides);
     try apply_block_state_overrides(simulation, raw);
     var block = assembly.Block.init(simulation.block_space);
     const w = simulation.call.writer;
@@ -492,7 +490,7 @@ fn simulate_block(
             .spec = simulation.api.spec,
             .parent_hash = parent.hash,
             .env = &env,
-            .difficulty = difficulty,
+            .difficulty = 0,
             .extra_data = simulation.extra_data,
             .parent_beacon_block_root = simulation.parent_beacon_block_root,
         }),
@@ -508,14 +506,6 @@ fn simulate_block(
         .gas_used = block.gas_used,
         .blob_gas_used = block.da_footprint,
     };
-}
-
-fn difficulty_of(overrides: ?[]const u8) HandlerError!u256 {
-    const raw = overrides orelse return 0;
-    const value = json.find_path(raw, &.{"difficulty"}) catch return error.InvalidParams;
-    const text = value orelse return 0;
-    if (std.mem.eql(u8, text, "null")) return 0;
-    return quantity_of(u256, text);
 }
 
 fn apply_block_state_overrides(simulation: *Simulation, raw: []const u8) HandlerError!void {
@@ -540,50 +530,105 @@ fn apply_block_state_overrides(simulation: *Simulation, raw: []const u8) Handler
 /// member sets nothing).
 fn overridden(raw: []const u8, names: []const []const u8) HandlerError!bool {
     for (names) |name| {
-        const value = json.find_path(raw, &.{name}) catch return error.InvalidParams;
+        const value = json.find_member_ignore_case(raw, name) catch return error.InvalidParams;
         if (value != null and !std.mem.eql(u8, value.?, "null")) return true;
     }
     return false;
 }
 
-/// alloy-evm 0.39 `apply_block_overrides` over alloy's `BlockOverrides` fields and serde
-/// aliases. Unknown members are ignored, as serde ignores them. `difficulty` is read here
-/// and reaches only a simulated block's header (`difficulty_of`; post-merge DIFFICULTY
-/// reads prevRandao); `beaconRoot` never reaches a simulated header (base/base repeats the
-/// parent's); `blockHash` is not supported.
+/// Nethermind's `BlockOverride.ApplyOverrides` over its fields, matched ASCII
+/// case-insensitively (`PropertyNameCaseInsensitive`); other members are ignored here
+/// (eth_simulateV1 refuses them first, `check_override_keys`). `beaconRoot` never reaches a
+/// simulated header (base/base repeats the parent's); `withdrawals` are not applied.
 pub fn apply_block_overrides(call: *Call, env: *BlockEnv, raw: []const u8) HandlerError!void {
+    _ = call;
     var members = try Members.init(raw);
     while (try members.next(32)) |member| {
         if (std.mem.eql(u8, member.value, "null")) continue;
         const key = member.key;
-        if (is(key, "number") or is(key, "blockNumber")) {
+        if (is(key, "number")) {
             env.number = saturate(u64, try quantity_of(u256, member.value));
-        } else if (is(key, "difficulty")) {
-            _ = try quantity_of(u256, member.value);
-        } else if (is(key, "time") or is(key, "timestamp")) {
+        } else if (is(key, "time")) {
             env.timestamp = try quantity_of(u64, member.value);
         } else if (is(key, "gasLimit")) {
             env.gas_limit = try quantity_of(u64, member.value);
-        } else if (is(key, "coinbase") or is(key, "feeRecipient")) {
+        } else if (is(key, "feeRecipient") or is(key, "coinbase")) {
             env.beneficiary = try fixed_of(20, member.value);
-        } else if (is(key, "random") or is(key, "prevRandao")) {
+        } else if (is(key, "prevRandao")) {
             env.prev_randao = try fixed_of(32, member.value);
-        } else if (is(key, "baseFee") or is(key, "baseFeePerGas")) {
+        } else if (is(key, "baseFeePerGas")) {
             const base_fee = try quantity_of(u256, member.value);
             env.base_fee = saturate(u64, base_fee);
             env.base_fee_override = if (base_fee > env.base_fee) base_fee else null;
         } else if (is(key, "blobBaseFee")) {
             env.blob_base_fee = saturate(u128, try quantity_of(u256, member.value));
-        } else if (is(key, "beaconRoot") or is(key, "parentBeaconBlockRoot")) {
+        } else if (is(key, "beaconRoot")) {
             env.parent_beacon_block_root = try fixed_of(32, member.value);
-        } else if (is(key, "blockHash")) {
-            return call.fail(rpc.code.invalid_params, "unsupported block override");
         }
     }
 }
 
 fn is(key: []const u8, name: []const u8) bool {
-    return std.mem.eql(u8, key, name);
+    return std.ascii.eqlIgnoreCase(key, name);
+}
+
+/// The fields of Nethermind's `BlockOverride` (`OverrideFields.Of<BlockOverride>`).
+const block_override_fields = [_][]const u8{
+    "number",   "prevRandao",    "time",        "gasLimit",    "feeRecipient",
+    "coinbase", "baseFeePerGas", "blobBaseFee", "withdrawals", "beaconRoot",
+};
+
+/// The fields of Nethermind's `AccountOverride` (`AccountOverrideConverter`).
+const account_override_fields = [_][]const u8{
+    "nonce", "balance", "code", "movePrecompileToAddress", "state", "stateDiff",
+};
+
+/// Nethermind's `OverrideFields.Match` over the override object `raw`: every key names a
+/// field ASCII case-insensitively, and no field is named by two spellings (the same
+/// spelling twice is one key given twice). Not an object: nothing to check here.
+fn override_keys_valid(raw: []const u8, fields: []const []const u8) HandlerError!bool {
+    assert(fields.len <= 16);
+    if (raw.len == 0 or raw[0] != '{') return true;
+    var spellings: [16]?[]const u8 = @splat(null);
+    var members = try Members.init(raw);
+    while (try members.next(64)) |member| {
+        const index = for (fields, 0..) |field, index| {
+            if (is(member.key, field)) break index;
+        } else return false;
+        if (spellings[index]) |spelling| {
+            if (!std.mem.eql(u8, spelling, member.key)) return false;
+        }
+        spellings[index] = member.key;
+    }
+    return true;
+}
+
+/// Nethermind's `BlockStateCallConverter` and `AccountOverrideConverter` refuse an unknown
+/// block or account override key while reading the payload (argument 0), before the block
+/// parameter is read and anything runs.
+fn check_override_keys(call: *Call, blocks: []const u8) HandlerError!void {
+    var list = try Elements.init(blocks);
+    // Every block is read, even past the limit `check_count` refuses next; each element
+    // takes at least one byte, so the request's length bounds the loop.
+    while (try list.next(std.math.maxInt(u32))) |block_raw| {
+        assert(list.count <= blocks.len);
+        var valid = true;
+        if (try block_overrides(block_raw)) |raw| {
+            valid = try override_keys_valid(raw, &block_override_fields);
+        }
+        const found = json.find_path(block_raw, &.{"stateOverrides"}) catch
+            return error.InvalidParams;
+        if (found) |accounts| if (valid and accounts.len > 0 and accounts[0] == '{') {
+            var members = try Members.init(accounts);
+            while (try members.next(overrides_max)) |entry| {
+                if (!try override_keys_valid(entry.value, &account_override_fields)) {
+                    valid = false;
+                    break;
+                }
+            }
+        };
+        if (!valid) return call.fail(rpc.code.invalid_params, "invalid argument 0");
+    }
 }
 
 fn saturate(comptime T: type, value: u256) T {
@@ -629,6 +674,9 @@ pub fn apply_state_overrides(state: *evm.State, space: []u8, raw: []const u8) Ov
         // address turns it into an ordinary account, whose code the EVM runs.
         state.make_ordinary(address);
         const account = try state.load(address);
+        if (!try override_keys_valid(entry.value, &account_override_fields)) {
+            return error.InvalidParams;
+        }
         var fields = try Members.init(entry.value);
         while (try fields.next(8)) |field| {
             if (std.mem.eql(u8, field.value, "null")) continue;
@@ -643,19 +691,19 @@ fn apply_account_field(
     space: []u8,
     field: Members.Member,
 ) OverrideError!void {
-    if (std.mem.eql(u8, field.key, "balance")) {
+    if (is(field.key, "balance")) {
         try state.set_balance(account, try quantity_of(u256, field.value));
-    } else if (std.mem.eql(u8, field.key, "nonce")) {
+    } else if (is(field.key, "nonce")) {
         try state.set_nonce(account, try quantity_of(u64, field.value));
-    } else if (std.mem.eql(u8, field.key, "code")) {
+    } else if (is(field.key, "code")) {
         try state.replace_code(account, try parse_code(try string_of(field.value), space));
-    } else if (std.mem.eql(u8, field.key, "state")) {
+    } else if (is(field.key, "state")) {
         // Fresh storage incarnation: database slots read as zero (never committed).
         account.storage_epoch += 1;
         try write_slots(state, account, field.value);
-    } else if (std.mem.eql(u8, field.key, "stateDiff")) {
+    } else if (is(field.key, "stateDiff")) {
         try write_slots(state, account, field.value);
-    } else if (std.mem.eql(u8, field.key, "movePrecompileToAddress")) {
+    } else if (is(field.key, "movePrecompileToAddress")) {
         // alloy's `AccountOverride` reads it, but only reth's eth_simulateV1 applies it
         // (`apply_precompile_overrides`); other calls ignore it. Not applied here yet.
         _ = json.parse_fixed(20, try string_of(field.value)) catch return error.InvalidParams;

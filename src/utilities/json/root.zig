@@ -701,6 +701,39 @@ pub fn find_path(input: []const u8, keys: []const []const u8) Error!?[]const u8 
     return input[start..scanner.index];
 }
 
+/// Returns the raw text of the last member of the object `input` whose key equals `wanted`
+/// ASCII case-insensitively (.NET's `PropertyNameCaseInsensitive`: a later member wins), or
+/// null if there is none or `input` is not an object. Keys containing escapes never match.
+pub fn find_member_ignore_case(input: []const u8, wanted: []const u8) Error!?[]const u8 {
+    var scanner = Scanner.init(input);
+    const container = try scanner.next();
+    if (container.tag != .object_begin) return null;
+    var found: ?[]const u8 = null;
+    // Each member consumes at least one byte, so input length bounds the loop.
+    var members: u32 = 0;
+    while (true) : (members += 1) {
+        assert(members <= input.len);
+        const key = try scanner.next();
+        if (key.tag == .object_end) return found;
+        assert(key.tag == .string and key.key);
+        scanner.skip_whitespace();
+        const start = scanner.index;
+        try scanner.skip(try scanner.next());
+        assert(scanner.index > start);
+        if (!key.escaped and std.ascii.eqlIgnoreCase(key.bytes, wanted)) {
+            found = std.mem.trim(u8, input[start..scanner.index], " \t\r\n:");
+        }
+    }
+}
+
+test "json: find_member_ignore_case takes the last member of any case" {
+    const object = "{\"gasLimit\":\"0x1\",\"other\":[1,{\"gaslimit\":3}],\"GASLIMIT\" : \"0x2\"}";
+    const found = (try find_member_ignore_case(object, "gasLimit")).?;
+    try std.testing.expectEqualStrings("\"0x2\"", found);
+    try std.testing.expect(try find_member_ignore_case(object, "gas") == null);
+    try std.testing.expect(try find_member_ignore_case("[1]", "gasLimit") == null);
+}
+
 /// Scans a whole document, returning an error if it is not well formed.
 pub fn validate(input: []const u8) Error!void {
     var scanner = Scanner.init(input);
