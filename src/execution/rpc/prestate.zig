@@ -18,7 +18,8 @@
 //! changed fields.
 //! As Nethermind's tracer, an account also gets its `codeHash`, every EIP-7702 authority
 //! with a valid signature is looked up, its authorization valid or not, and so is the
-//! block's beneficiary for every transaction (deposits included).
+//! block's beneficiary for every transaction (deposits included), and so is an account an
+//! instruction names but does not load because it fails first (`State.named`).
 
 const std = @import("std");
 const assert = std.debug.assert;
@@ -195,25 +196,46 @@ pub const Collected = struct {
         }
         collected.collect_slots(state);
         sort(collected);
+        collected.add_named(state);
+    }
+
+    /// Lists the accounts an instruction named but did not load because it failed first:
+    /// Nethermind's tracer looks up the address operand of BALANCE, EXTCODE*, SELFDESTRUCT
+    /// and the calls (and a call target's EIP-7702 delegate) before the instruction runs.
+    fn add_named(collected: *Collected, state: *State) void {
+        if (state.named_overflow) {
+            collected.full = true;
+            return;
+        }
+        for (state.named[0..state.named_count]) |named| {
+            const entry = collected.add_account(state, named.address) orelse return;
+            if (!named.call) continue;
+            const delegate = evm.bytecode.delegation_target(entry.pre.code) orelse continue;
+            _ = collected.add_account(state, delegate);
+        }
     }
 
     /// Lists an account the transaction may not have loaded, as Nethermind's tracer looks
     /// it up: an EIP-7702 authority with a valid signature whose authorization was invalid
     /// (another chain id, a nonce of 2^64 - 1), or the block's beneficiary (a deposit pays
     /// it nothing). Call after `collect`; keeps the address order.
-    pub fn add_account(collected: *Collected, state: *State, address: Address) void {
+    pub fn add_account(
+        collected: *Collected,
+        state: *State,
+        address: Address,
+    ) ?*const AccountEntry {
         const accounts = collected.accounts[0..collected.account_count];
         var position: usize = 0;
         while (position < accounts.len) : (position += 1) {
             switch (std.mem.order(u8, &accounts[position].address, &address)) {
                 .lt => continue,
-                .eq => return,
+                .eq => return &accounts[position],
                 .gt => break,
             }
         }
         if (collected.account_count == collected.accounts.len) {
             collected.full = true;
-            return;
+            return null;
         }
         const pre = collected.pre_of(state, address);
         const post = if (state.accounts.get(address)) |account|
@@ -229,6 +251,7 @@ pub const Collected = struct {
         collected.accounts[position] = .{ .address = address, .pre = pre, .post = post };
         collected.account_count += 1;
         assert(collected.account_count <= collected.accounts.len);
+        return &collected.accounts[position];
     }
 
     fn pre_of(collected: *Collected, state: *State, address: Address) Info {
@@ -279,7 +302,7 @@ pub const Collected = struct {
         collected.collect(state);
         for (collected.authorities) |authorization| {
             const authority = authorization.authority orelse continue;
-            collected.add_account(state, authority);
+            _ = collected.add_account(state, authority);
         }
     }
 };

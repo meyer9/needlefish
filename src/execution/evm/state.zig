@@ -364,6 +364,32 @@ pub const State = struct {
     /// Addresses warm in the current transaction without being loaded (precompiles and
     /// native singletons, EIP-2929); consulted only when an account's stamp is stale.
     static_warm: StaticWarm = .{},
+    /// Accounts an instruction of the current transaction named but did not load, because
+    /// it failed first (out of gas, a static violation). Nethermind's prestateTracer lists
+    /// them; execution never reads them.
+    named: [named_max]Named = undefined,
+    named_count: u32 = 0,
+    /// More than `named_max` were named: the list is incomplete.
+    named_overflow: bool = false,
+
+    pub const named_max = 1024;
+
+    pub const Named = struct {
+        address: Address,
+        /// A call target: Nethermind also looks up its EIP-7702 delegate.
+        call: bool,
+    };
+
+    /// Records an account the current instruction names but does not load.
+    pub fn note_named(state: *State, address: Address, call: bool) void {
+        if (state.named_count == named_max) {
+            state.named_overflow = true;
+            return;
+        }
+        state.named[state.named_count] = .{ .address = address, .call = call };
+        state.named_count += 1;
+        assert(state.named_count <= named_max);
+    }
 
     pub fn init(allocator: std.mem.Allocator, database: Database, limits: Limits) !State {
         var state = State{
@@ -425,6 +451,8 @@ pub const State = struct {
         assert(state.tx_id < std.math.maxInt(u32));
         state.tx_id += 1;
         state.static_warm = .{};
+        state.named_count = 0;
+        state.named_overflow = false;
         state.journal_len = 0;
         state.logs_len = 0;
         state.log_data_len = 0;

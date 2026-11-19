@@ -6,6 +6,7 @@ const std = @import("std");
 const testing = std.testing;
 const primitives = @import("../../common/primitives/root.zig");
 const consensus = @import("../../common/consensus/root.zig");
+const rlp = @import("../../common/rlp/root.zig");
 const txpool = @import("../txpool/root.zig");
 const json = @import("../../utilities/json/root.zig");
 const rpc = @import("../../utilities/rpc/root.zig");
@@ -2923,6 +2924,80 @@ test "eth: prestateTracer lists an authority whose authorization is invalid" {
     });
     const traced = try h.request_runtime(request);
     try expect_contains(traced, "\"0x7e5f4552091a69125d5dfcb7b8c2659029395bdf\":{\"balance\"");
+}
+
+test "eth: prestateTracer lists an authority whose authorization nonce mismatches" {
+    const h = try Harness.create();
+    defer h.destroy();
+    var store = try meter_history();
+    defer store.deinit(testing.allocator);
+    try h.node.db.trie().track_changes(testing.allocator);
+    try h.node.chain.attach_history(&store);
+    // Key 2's account, delegated already at nonce 74, signs for nonce 93 on this chain.
+    const designator = [_]u8{ 0xef, 0x01, 0x00 } ++ @as([19]u8, @splat(0)) ++ [_]u8{0x06};
+    try h.node.db.put_account(fixture.address_of(2).bytes, 1, 74, &designator);
+    _ = try h.mine(2);
+    var authorization: consensus.tx_fields.Authorization = .{
+        .chain_id = h.node.spec.chain_id,
+        .address = .{ .bytes = @as([19]u8, @splat(0)) ++ [_]u8{0x0c} },
+        .nonce = 93,
+        .y_parity = 0,
+        .r = 0,
+        .s = 0,
+    };
+    const signature = try consensus.signature.sign(fixture.key(2), authorization.signing_hash());
+    authorization.y_parity = @intFromBool(signature.y_parity);
+    authorization.r = signature.r;
+    authorization.s = signature.s;
+    var list_bytes: [256]u8 = undefined;
+    var encoder = rlp.Encoder.init(&list_bytes);
+    rlp.encode(&encoder, authorization);
+    const tx: consensus.Eip7702 = .{
+        .chain_id = h.node.spec.chain_id,
+        .nonce = 0,
+        .max_priority_fee_per_gas = 0,
+        .max_fee_per_gas = 10_000_000_000,
+        .gas_limit = 200_000,
+        .to = .{ .bytes = @as([19]u8, @splat(0)) ++ [_]u8{0xaa} },
+        .value = 0,
+        .input = &.{},
+        .access_list = .empty,
+        .authorization_list = .{ .payload = encoder.written(), .count = 1 },
+    };
+    const envelope = try consensus.tx.sign(tx, fixture.key(1));
+    var buffer: [512]u8 = undefined;
+    const raw = envelope.encode_to(&buffer);
+    try expect_contains(try send_raw(h, raw), "\"result\":\"0x");
+    _ = try h.mine(4);
+    const hash = primitives.keccak256(raw).bytes;
+    const plain = "{\"tracer\":\"prestateTracer\"}";
+    const traced = try trace_request(h, "debug_traceTransaction", &hash, plain);
+    var expected: [64]u8 = undefined;
+    const key = try std.fmt.bufPrint(&expected, "\"0x{x}\":{{\"balance\"", .{
+        &fixture.address_of(2).bytes,
+    });
+    try expect_contains(traced, key);
+}
+
+test "eth: prestateTracer lists an account an instruction names before running out of gas" {
+    const h = try Harness.create();
+    defer h.destroy();
+    const funded = "7e5f4552091a69125d5dfcb7b8c2659029395bdf";
+    // BALANCE of a cold account without gas for the cold access: never read, yet listed.
+    const balance_code = "0x73" ++ funded ++ "3100";
+    const request = "[{\"to\":" ++ override_target ++ ",\"gas\":\"0x5400\"},\"latest\"," ++
+        "{\"tracer\":\"prestateTracer\",\"stateOverrides\":{" ++ override_target ++
+        ":{\"code\":\"";
+    const balance = try h.request("debug_traceCall", request ++ balance_code ++ "\"}}}]");
+    try expect_contains(balance, "\"0x" ++ funded ++ "\":{\"balance\"");
+    // A CALL the frame cannot pay for names its target and the target's delegate.
+    const delegated = "0000000000000000000000000000000000000d1e";
+    const call_code = "0x60006000600060006000" ++ "73" ++ delegated ++ "61fffff100";
+    const with_delegate = request ++ call_code ++ "\"},\"0x" ++ delegated ++
+        "\":{\"code\":\"0xef0100" ++ funded ++ "\"}}}]";
+    const called = try h.request("debug_traceCall", with_delegate);
+    try expect_contains(called, "\"0x" ++ delegated ++ "\":{\"balance\"");
+    try expect_contains(called, "\"0x" ++ funded ++ "\":{\"balance\"");
 }
 
 const override_target = "\"0x0000000000000000000000000000000000007777\"";
