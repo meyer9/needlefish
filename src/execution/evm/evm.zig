@@ -693,6 +693,18 @@ pub const Evm = struct {
         } };
     }
 
+    /// A create that fails before deriving and loading its address (revm: depth, balance,
+    /// nonce). Only the prestate tracer learns the address (`State.note_unborn`); the
+    /// caller is the running frame's account, already cached, so nothing new is read.
+    fn unborn(evm: *Evm, request: CreateRequest) Error!Step {
+        const address = if (request.is_create2)
+            create2_address(request.caller, request.salt, request.init_code)
+        else
+            create_address(request.caller, (try evm.state.load(request.caller)).info.nonce);
+        evm.state.note_unborn(address);
+        return failed(request.gas_limit, .revert);
+    }
+
     fn start_create(
         evm: *Evm,
         comptime fork: Fork,
@@ -701,14 +713,14 @@ pub const Evm = struct {
     ) Error!Step {
         const depth: u16 = if (parent) |p| p.depth + 1 else 0;
         if (parent) |p| p.awaiting = .create;
-        if (depth > evm.config.depth_max) return failed(request.gas_limit, .revert);
+        if (depth > evm.config.depth_max) return evm.unborn(request);
         const caller = try evm.state.load(request.caller);
-        if (caller.info.balance < request.value) return failed(request.gas_limit, .revert);
+        if (caller.info.balance < request.value) return evm.unborn(request);
         const nonce_max = caller.info.nonce == std.math.maxInt(u64);
         // An unvalidated RPC call wraps the nonce, and Nethermind then derives the address
         // from the wrapped nonce (`GetRecipient`: zero stays zero).
         const wrap = nonce_max and depth == 0 and evm.tx.wrap_max_nonce;
-        if (nonce_max and !wrap) return failed(request.gas_limit, .revert);
+        if (nonce_max and !wrap) return evm.unborn(request);
         const nonce = if (wrap) 0 else caller.info.nonce;
         try evm.state.set_nonce(caller, if (wrap) 0 else nonce + 1);
         const address = if (request.is_create2)

@@ -373,8 +373,27 @@ pub const State = struct {
     /// fork's precompiles). Block execution never sets it; a session or reset clears it.
     ordinary: [ordinary_max]Address = undefined,
     ordinary_count: u32 = 0,
+    /// Addresses CREATE and CREATE2 of the current transaction paid for but never loaded,
+    /// failing first (depth, balance, nonce). geth's and Nethermind's prestateTracer look
+    /// the created address up once the instruction's gas is paid; execution never reads it.
+    unborn: [unborn_max]Address = undefined,
+    unborn_count: u32 = 0,
+    /// More than `unborn_max` were noted: the list is incomplete.
+    unborn_overflow: bool = false,
 
     pub const ordinary_max = 64;
+    pub const unborn_max = 1024;
+
+    /// Records the address of a create that failed before loading it (prestateTracer).
+    pub fn note_unborn(state: *State, address: Address) void {
+        if (state.unborn_count == unborn_max) {
+            state.unborn_overflow = true;
+            return;
+        }
+        state.unborn[state.unborn_count] = address;
+        state.unborn_count += 1;
+        assert(state.unborn_count <= unborn_max);
+    }
 
     /// Makes `address` an ordinary account for the EVM (an RPC state override names it).
     pub fn make_ordinary(state: *State, address: Address) void {
@@ -454,6 +473,8 @@ pub const State = struct {
         assert(state.tx_id < std.math.maxInt(u32));
         state.tx_id += 1;
         state.static_warm = .{};
+        state.unborn_count = 0;
+        state.unborn_overflow = false;
         state.journal_len = 0;
         state.logs_len = 0;
         state.log_data_len = 0;

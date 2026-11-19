@@ -3180,6 +3180,24 @@ test "eth: prestateTracer diff leaves out an account destroyed in a reverted fra
     try expect_contains(kept, child ++ "{\"codeHash\":\"0x" ++ zeros_62 ++ "00\"}");
 }
 
+test "eth: prestateTracer diff lists a create that fails before it runs" {
+    const h = try Harness.create();
+    defer h.destroy();
+    // 0x..c0de (no balance) creates with one wei: the create pays its gas, then cannot
+    // transfer the value, so the account never exists. As geth and Nethermind (the address
+    // is looked up once the instruction's gas is paid, and counted created), post lists it
+    // missing (a zero code hash) and pre leaves it out.
+    const request = "[{\"from\":\"0x7dc6c0165f09500b75146b66eec05a39dbbc40d2\",\"to\":" ++
+        "\"0x000000000000000000000000000000000000c0de\"},\"latest\",{\"stateOverrides\":{" ++
+        "\"0x000000000000000000000000000000000000c0de\":{\"code\":\"0x600060006001f000\"}}," ++
+        "\"tracer\":\"prestateTracer\",\"tracerConfig\":{\"diffMode\":true}}]";
+    const child = "\"0x8bbc3514477d75ec797bbe4e19d7961660bb849c\":";
+    const diff = try h.request("debug_traceCall", request);
+    const post = diff[std.mem.indexOf(u8, diff, "\"post\"").?..];
+    try testing.expect(std.mem.indexOf(u8, diff[0 .. diff.len - post.len], child) == null);
+    try expect_contains(post, child ++ "{\"codeHash\":\"0x" ++ zeros_62 ++ "00\"}");
+}
+
 test "eth: prestateTracer diff lists a looked-up missing account with a zero code hash" {
     const h = try Harness.create();
     defer h.destroy();

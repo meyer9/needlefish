@@ -208,6 +208,31 @@ pub const Collected = struct {
         }
         collected.collect_slots(state);
         sort(collected);
+        collected.add_unborn(state);
+    }
+
+    /// Lists the addresses of creates that paid their gas but failed before the address
+    /// was loaded (`State.note_unborn`): geth's and Nethermind's tracer look the created
+    /// address up and count it created, so a diff's post lists it missing.
+    fn add_unborn(collected: *Collected, state: *State) void {
+        if (state.unborn_overflow) {
+            collected.full = true;
+            return;
+        }
+        for (state.unborn[0..state.unborn_count]) |address| collected.add_created(state, address);
+    }
+
+    /// Lists the address a creation transaction from `sender` makes, at the sender's nonce
+    /// before the transaction, as created.
+    pub fn add_created_by(collected: *Collected, state: *State, sender: Address) void {
+        const nonce = collected.pre_of(state, sender).nonce;
+        collected.add_created(state, evm.evm.create_address(sender, nonce));
+    }
+
+    /// Lists `address` as created in the transaction (looked up if it was not loaded).
+    pub fn add_created(collected: *Collected, state: *State, address: Address) void {
+        const entry = collected.add_account(state, address) orelse return;
+        entry.created = true;
     }
 
     /// Lists the callee and its EIP-7702 delegate as they were before the transaction, as
@@ -227,7 +252,7 @@ pub const Collected = struct {
         collected: *Collected,
         state: *State,
         address: Address,
-    ) ?*const AccountEntry {
+    ) ?*AccountEntry {
         const accounts = collected.accounts[0..collected.account_count];
         var position: usize = 0;
         while (position < accounts.len) : (position += 1) {
