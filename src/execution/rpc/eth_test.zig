@@ -3298,6 +3298,29 @@ test "eth: prestateTracer leaves out a slot whose SSTORE runs out of gas" {
     try expect_contains(read_first, "\"storage\":{" ++ slot_bb ++ "}");
 }
 
+test "eth: a call naming a tip but no fee cap fails as in geth and Nethermind" {
+    const h = try Harness.create();
+    defer h.destroy();
+    // The missing fee cap stays zero (geth `CallDefaults`), below the tip.
+    const inner = "max priority fee per gas higher than max fee per gas: address " ++
+        "0x0000000000000000000000000000000000000000, maxPriorityFeePerGas: 1, maxFeePerGas: 0";
+    const tip_call = "{\"to\":" ++ override_target ++ ",\"maxPriorityFeePerGas\":\"0x1\"}";
+    const called = try h.request("eth_call", "[" ++ tip_call ++ ",\"latest\"]");
+    try testing.expectEqualStrings("\"error\":{\"code\":-32000,\"message\":\"err: " ++ inner ++
+        " (supplied gas 50000000)\"}", called);
+    const traced = try h.request("debug_traceCall", "[" ++ tip_call ++ ",\"latest\",{}]");
+    try testing.expectEqualStrings("\"error\":{\"code\":-32000,\"message\":\"tracing failed: " ++
+        inner ++ "\"}", traced);
+    const gas_given = "{\"gas\":\"0x7530\",\"maxPriorityFeePerGas\":\"0x1\"}";
+    const estimated = try h.request("eth_estimateGas", "[" ++ gas_given ++ "]");
+    const failed_with = "\"error\":{\"code\":-32000,\"message\":\"failed with 30000 gas: ";
+    try testing.expectEqualStrings(failed_with ++ inner ++ "\"}", estimated);
+    // A zero tip is not above the zero cap.
+    const zero_tip = "[{\"to\":" ++ override_target ++ ",\"maxPriorityFeePerGas\":\"0x0\"}]";
+    const unrefused = try h.request("eth_call", zero_tip);
+    try testing.expect(std.mem.indexOf(u8, unrefused, "maxPriorityFeePerGas") == null);
+}
+
 const override_target = "\"0x0000000000000000000000000000000000007777\"";
 
 test "eth: eth_call, eth_estimateGas and debug_traceCall apply state and block overrides" {

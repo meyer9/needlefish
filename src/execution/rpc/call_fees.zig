@@ -84,6 +84,16 @@ fn count_blob_hashes(scanner: *json.Scanner, first: json.Token) HandlerError!u32
     return error.InvalidParams;
 }
 
+/// The tip of a request that names one but no fee cap (nor a gas price). geth's
+/// `CallDefaults` (internal/ethapi/transaction_args.go) leaves the missing cap at zero once
+/// the block has a base fee, so `preCheck` fails with `ErrTipAboveFeeCap`; Nethermind does
+/// the same (`TransactionExtensions.cs:72`). reth instead prices it at base fee plus tip.
+pub fn tip_without_cap(fees: Fees) ?u256 {
+    if (fees.max_fee != null or fees.gas_price != null) return null;
+    const tip = fees.max_priority_fee orelse return null;
+    return if (tip == 0) null else tip;
+}
+
 /// `CallFees::ensure_fees` against `base_fee` (the block's, after block overrides).
 pub fn ensure(fees: Fees, base_fee: u64) Result {
     if (fees.blob_hashes) |count| if (count == 0) return missing_blob_hashes;

@@ -30,6 +30,7 @@ const rpc = @import("../../utilities/rpc/root.zig");
 const evm = @import("../evm/root.zig");
 const node = @import("../node/root.zig");
 const eth = @import("eth.zig");
+const call_fees = @import("call_fees.zig");
 const eth_proof = @import("eth_proof.zig");
 const prestate = @import("prestate.zig");
 const struct_log = @import("struct_log.zig");
@@ -731,6 +732,10 @@ fn trace_call(api: *Api, call: *Call) HandlerError!void {
     }
     // reth builds the tracer once the call's env is prepared (`prepare_call_env`).
     const options = try options_or_refuse(call, deferred);
+    if (call_fees.tip_without_cap(request.fees)) |tip| {
+        const gas = @min(request.message.gas orelse eth.rpc_gas_cap, eth.rpc_gas_cap);
+        return eth.fail_tip_above_cap(api, call, request.message.from, tip, .trace, gas);
+    }
     // The recorder sits between the request's scratch (call data, override code) and the
     // proof tail.
     const data_end = eth.scratch_used(api, &request);

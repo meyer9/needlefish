@@ -1371,6 +1371,35 @@ pub fn fail_invalid(call: *Call, reason: evm.transaction.Invalid) HandlerError {
     return call.fail(failure.code, failure.message);
 }
 
+/// How an endpoint wraps a transaction error (Nethermind `ErrorWrapper`, as geth).
+pub const Wrap = enum { call, estimate, trace };
+
+/// Fails a call that names a tip but no fee cap with geth's `ErrTipAboveFeeCap` (the cap
+/// stays zero, see `call_fees.tip_without_cap`), wrapped as `wrap` does with `gas`, the
+/// gas the call was given (estimate: its highest run). The text goes to the scratch.
+pub fn fail_tip_above_cap(
+    api: *Api,
+    call: *Call,
+    from: [20]u8,
+    tip: u256,
+    wrap: Wrap,
+    gas: u64,
+) HandlerError {
+    var inner_buffer: [256]u8 = undefined;
+    const address = primitives.checksum(.{ .bytes = from }, null);
+    const inner = std.fmt.bufPrint(&inner_buffer, "max priority fee per gas higher than max " ++
+        "fee per gas: address {s}, maxPriorityFeePerGas: {d}, maxFeePerGas: 0", .{
+        &address,
+        tip,
+    }) catch unreachable; // Proof: 120 bytes of text and a 78-digit u256.
+    const text = switch (wrap) {
+        .call => std.fmt.bufPrint(api.scratch, "err: {s} (supplied gas {d})", .{ inner, gas }),
+        .estimate => std.fmt.bufPrint(api.scratch, "failed with {d} gas: {s}", .{ gas, inner }),
+        .trace => std.fmt.bufPrint(api.scratch, "tracing failed: {s}", .{inner}),
+    } catch inner;
+    return call.fail(rpc.code.server_error, text);
+}
+
 /// Fails with reth's error for a call that reverted (code 3, the output as data) or halted
 /// with `gas_limit`. The text goes to the scratch, whose call data is done with.
 pub fn fail_executed(
@@ -1432,6 +1461,10 @@ fn eth_call(api: *Api, call: *Call) HandlerError!void {
     const block_overrides = try call.params.optional_raw();
     try call.params.finish();
     try set_overrides(api, call, &request, state_overrides, block_overrides);
+    if (call_fees.tip_without_cap(request.fees)) |tip| {
+        const gas = @min(request.message.gas orelse rpc_gas_cap, rpc_gas_cap);
+        return fail_tip_above_cap(api, call, request.message.from, tip, .call, gas);
+    }
     switch (try simulate(api, call, request)) {
         .invalid => |reason| return fail_invalid(call, reason),
         .executed => |executed| {

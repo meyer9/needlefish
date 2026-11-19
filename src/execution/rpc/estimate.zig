@@ -10,6 +10,7 @@ const assert = std.debug.assert;
 const rpc = @import("../../utilities/rpc/root.zig");
 const node = @import("../node/root.zig");
 const eth = @import("eth.zig");
+const call_fees = @import("call_fees.zig");
 const call_error = @import("call_error.zig");
 
 const Api = eth.Api;
@@ -50,6 +51,13 @@ const Estimate = struct {
 
 pub fn estimate(api: *Api, call: *Call, request: *const eth.CallRequest) HandlerError!u64 {
     const env = try eth.request_env(api, call, request);
+    // The block's limit, the EIP-7825 cap once active, and the RPC gas cap.
+    const gas_max = @min(api.chain.executor.default_call_gas(&env), eth.rpc_gas_cap);
+    if (call_fees.tip_without_cap(request.fees)) |tip| {
+        // geth `DoEstimateGas` fails the first (highest) run, "failed with N gas: ...".
+        const gas = @min(request.message.gas orelse gas_max, gas_max);
+        return eth.fail_tip_above_cap(api, call, request.message.from, tip, .estimate, gas);
+    }
     const prices = try eth.call_prices(call, request.fees, env.base_fee);
     var context: Estimate = .{
         .api = api,
@@ -67,8 +75,6 @@ pub fn estimate(api: *Api, call: *Call, request: *const eth.CallRequest) Handler
     context.message.gas_price = prices.gas_price;
     context.message.priority_fee = prices.priority_fee;
     context.message.keep_base_fee = true;
-    // The block's limit, the EIP-7825 cap once active, and the RPC gas cap.
-    const gas_max = @min(api.chain.executor.default_call_gas(&context.env), eth.rpc_gas_cap);
     var highest = @min(request.message.gas orelse gas_max, gas_max);
     // The highest run, capped at the allowance when priced (an insufficient-funds failure
     // fails here). reth runs the transfer shortcut first; runs are independent.
