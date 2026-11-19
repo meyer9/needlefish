@@ -3373,6 +3373,42 @@ test "eth: eth_call, eth_estimateGas and debug_traceCall apply state and block o
         "\"account 0x0000000000000000000000000000000000007777 has both 'state' and 'stateDiff'\"}");
 }
 
+test "eth: any state override of a precompile's address makes it an ordinary account" {
+    const h = try Harness.create();
+    defer h.destroy();
+    // geth's override `Apply` (and Nethermind's): the identity precompile echoes its input
+    // until an override names its address, then the account's code runs.
+    const identity = "\"0x0000000000000000000000000000000000000004\"";
+    const call = "[{\"to\":" ++ identity ++ ",\"input\":\"0x" ++ zeros_62 ++ "07\"},\"latest\"";
+    const word_7 = "\"result\":\"0x" ++ zeros_62 ++ "07\"";
+    const word_42 = "\"result\":\"0x" ++ zeros_62 ++ "2a\"";
+    try expect_contains(try h.request("eth_call", call ++ "]"), word_7);
+    const code_42 = "{" ++ identity ++ ":{\"code\":\"0x602a5f5260205ff3\"}}";
+    try expect_contains(try h.request("eth_call", call ++ "," ++ code_42 ++ "]"), word_42);
+    // Without code too: the account has none, so the call returns nothing.
+    const balance = "{" ++ identity ++ ":{\"balance\":\"0x1\"}}";
+    const none = try h.request("eth_call", call ++ "," ++ balance ++ "]");
+    try expect_contains(none, "\"result\":\"0x\"");
+    // A delegation designator as override code is followed.
+    const delegated = "{" ++ identity ++ ":{\"code\":\"0xef0100" ++
+        "0000000000000000000000000000000000007777\"}," ++ override_target ++
+        ":{\"code\":\"0x602a5f5260205ff3\"}}";
+    try expect_contains(try h.request("eth_call", call ++ "," ++ delegated ++ "]"), word_42);
+    const traced = try h.request("debug_traceCall", call ++
+        ",{\"tracer\":\"callTracer\",\"stateOverrides\":" ++ code_42 ++ "}]");
+    try expect_contains(traced, "\"output\":\"0x" ++ zeros_62 ++ "2a\"");
+    // Not carried into the next call.
+    try expect_contains(try h.request("eth_call", call ++ "]"), word_7);
+    // eth_simulateV1: only for the overriding block.
+    const simulated = "[{\"blockStateCalls\":[{\"stateOverrides\":" ++ code_42 ++
+        ",\"calls\":[{\"to\":" ++ identity ++ ",\"input\":\"0x" ++ zeros_62 ++ "07\"}]}," ++
+        "{\"calls\":[{\"to\":" ++ identity ++ ",\"input\":\"0x" ++ zeros_62 ++ "07\"}]}]}]";
+    const blocks = try h.request("eth_simulateV1", simulated);
+    const first = std.mem.indexOf(u8, blocks, "\"returnData\":\"0x" ++ zeros_62 ++ "2a\"").?;
+    const second = std.mem.indexOf(u8, blocks, "\"returnData\":\"0x" ++ zeros_62 ++ "07\"").?;
+    try testing.expect(first < second);
+}
+
 test "eth: eth_call, eth_estimateGas and eth_createAccessList report reth's call errors" {
     const h = try Harness.create();
     defer h.destroy();

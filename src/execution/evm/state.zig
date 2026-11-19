@@ -371,8 +371,33 @@ pub const State = struct {
     named_count: u32 = 0,
     /// More than `named_max` were named: the list is incomplete.
     named_overflow: bool = false,
+    /// Precompile and native-contract addresses an RPC state override made ordinary
+    /// accounts: geth's override `Apply` drops any overridden address from the call's
+    /// precompiles, so the EVM runs the account's code (they stay warm: EIP-2929 warms the
+    /// fork's precompiles). Block execution never sets it; a session or reset clears it.
+    ordinary: [ordinary_max]Address = undefined,
+    ordinary_count: u32 = 0,
 
     pub const named_max = 1024;
+
+    pub const ordinary_max = 64;
+
+    /// Makes `address` an ordinary account for the EVM (an RPC state override names it).
+    pub fn make_ordinary(state: *State, address: Address) void {
+        if (state.is_ordinary(address)) return;
+        assert(state.ordinary_count < ordinary_max);
+        state.ordinary[state.ordinary_count] = address;
+        state.ordinary_count += 1;
+        assert(state.is_ordinary(address));
+    }
+
+    pub fn is_ordinary(state: *const State, address: Address) bool {
+        assert(state.ordinary_count <= ordinary_max);
+        for (state.ordinary[0..state.ordinary_count]) |other| {
+            if (std.mem.eql(u8, &other, &address)) return true;
+        }
+        return false;
+    }
 
     pub const Named = struct {
         address: Address,
@@ -442,6 +467,7 @@ pub const State = struct {
         state.code_store_len = 0;
         state.tx_id = 1;
         state.static_warm = .{};
+        state.ordinary_count = 0;
         assert(state.accounts.count() == 0);
     }
 

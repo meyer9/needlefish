@@ -987,6 +987,7 @@ pub const Executor = struct {
         executor.state.accounts.clearRetainingCapacity();
         executor.state.slots.clearRetainingCapacity();
         executor.state.code_store_len = 0;
+        executor.state.ordinary_count = 0;
         executor.state.begin_transaction();
     }
 

@@ -396,8 +396,7 @@ pub const Evm = struct {
                 .gas = request.gas_limit,
                 .input = request.input,
                 .depth = if (parent) |p| p.depth + 1 else 0,
-                .precompile = precompiles.lookup(fork, evm.op_upgrade(), request.target) != null or
-                    native.lookup(evm.op_upgrade(), request.target) != null,
+                .precompile = evm.is_precompile(fork, request.target),
             });
         }
         return evm.start_call(fork, request, parent, caller_address);
@@ -439,6 +438,14 @@ pub const Evm = struct {
         return evm.start_create(fork, request, parent);
     }
 
+    /// Whether a call to `target` runs a precompile or native contract: not when an RPC
+    /// state override made the address an ordinary account.
+    fn is_precompile(evm: *const Evm, comptime fork: Fork, target: Address) bool {
+        if (evm.state.is_ordinary(target)) return false;
+        return precompiles.lookup(fork, evm.op_upgrade(), target) != null or
+            native.lookup(evm.op_upgrade(), target) != null;
+    }
+
     /// Reports a failed deposit's top-level frame to the tracer, ending with `exit` and all
     /// its gas left: one whose value transfer fails (revm's first frame starts, then ends
     /// with OutOfFunds), or one rejected before any frame (a frame built from the
@@ -460,9 +467,7 @@ pub const Evm = struct {
             .gas = message.gas_limit,
             .input = message.input,
             .depth = 0,
-            .precompile = !is_create and
-                (precompiles.lookup(fork, evm.op_upgrade(), message.target) != null or
-                    native.lookup(evm.op_upgrade(), message.target) != null),
+            .precompile = !is_create and evm.is_precompile(fork, message.target),
         });
         tracer.exit(tracer.context, .{
             .status = .halt,
@@ -532,13 +537,8 @@ pub const Evm = struct {
         }
         // EIP-7702: dispatch keys off the called address, never the delegate, so a delegation
         // to a precompile (or native contract) runs that account's empty code, as in revm.
-        if (precompiles.lookup(fork, evm.op_upgrade(), request.target)) |precompile| {
-            return evm.run_precompile(precompile, request, checkpoint);
-        }
-        if (native.lookup(evm.op_upgrade(), request.target)) |contract| {
-            const call = NativeCall{ .caller = caller, .value = value, .is_static = is_static };
-            return evm.run_native(contract, request, checkpoint, call);
-        }
+        const call = NativeCall{ .caller = caller, .value = value, .is_static = is_static };
+        if (try evm.run_builtin(fork, request, checkpoint, call)) |step| return step;
         const code_account = request.code_account orelse
             if (std.mem.eql(u8, &request.code_address, &address))
                 account
@@ -570,6 +570,25 @@ pub const Evm = struct {
             .checkpoint = checkpoint,
         }, parent);
         return .frame;
+    }
+
+    /// Runs the precompile or native contract at the called address, if any: none at an
+    /// address an RPC state override made ordinary, whose code runs (geth, Nethermind).
+    fn run_builtin(
+        evm: *Evm,
+        comptime fork: Fork,
+        request: CallRequest,
+        checkpoint: state_module.Checkpoint,
+        call: NativeCall,
+    ) Error!?Step {
+        if (evm.state.is_ordinary(request.target)) return null;
+        if (precompiles.lookup(fork, evm.op_upgrade(), request.target)) |precompile| {
+            return evm.run_precompile(precompile, request, checkpoint);
+        }
+        if (native.lookup(evm.op_upgrade(), request.target)) |contract| {
+            return try evm.run_native(contract, request, checkpoint, call);
+        }
+        return null;
     }
 
     /// The account whose storage the new frame owns: the parent's for CALLCODE and

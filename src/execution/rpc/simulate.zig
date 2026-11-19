@@ -458,6 +458,9 @@ fn apply_block_state_overrides(simulation: *Simulation, raw: []const u8) Handler
     const call = simulation.call;
     const space = simulation.space;
     const executor = simulation.api.chain.executor;
+    // As in geth, overridden precompiles last for their own block: the next block starts
+    // from the fork's precompiles (the overridden code stays in the state).
+    executor.state.ordinary_count = 0;
     const overrides = (json.find_path(raw, &.{"stateOverrides"}) catch
         return error.InvalidParams) orelse return;
     if (try both_state_and_diff(overrides)) |address| {
@@ -550,11 +553,15 @@ pub fn both_state_message(buffer: []u8, address: [20]u8) []const u8 {
 pub const OverrideError = HandlerError || evm.state.Error;
 
 pub fn apply_state_overrides(state: *evm.State, space: []u8, raw: []const u8) OverrideError!void {
+    comptime assert(overrides_max <= evm.State.ordinary_max);
     var accounts = try Members.init(raw);
     while (try accounts.next(overrides_max)) |entry| {
         const text = entry.key;
         if (text.len != 42) return error.InvalidParams;
         const address = json.parse_fixed(20, text) catch return error.InvalidParams;
+        // geth's `Apply` (and Nethermind's `UpdateCode`): any override of a precompile's
+        // address turns it into an ordinary account, whose code the EVM runs.
+        state.make_ordinary(address);
         const account = try state.load(address);
         var fields = try Members.init(entry.value);
         while (try fields.next(8)) |field| {
