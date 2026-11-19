@@ -3178,6 +3178,21 @@ test "eth: prestateTracer reports revm's loaded accounts as revm-inspectors does
         "\"0x7dc6c0165f09500b75146b66eec05a39dbbc40d2\":{\"nonce\":1}}}", created);
 }
 
+test "eth: a call object member of the wrong type is refused" {
+    const h = try Harness.create();
+    defer h.destroy();
+    // Nethermind types every `TransactionForRpc` member: a block tag is no nonce.
+    const tagged = "[{\"nonce\":\"finalized\",\"to\":" ++ address_target ++ "},\"latest\"]";
+    try expect_contains(try h.request("eth_estimateGas", tagged), "{\"code\":-32602");
+    try expect_contains(try h.request("eth_call", tagged), "{\"code\":-32602");
+    const bad_hash = "[{\"blockHash\":\"0x12\",\"to\":" ++ address_target ++ "},\"latest\"]";
+    try expect_contains(try h.request("eth_call", bad_hash), "{\"code\":-32602");
+    // A padded hex nonce or a decimal one reads as Nethermind's `ULongConverter` reads it.
+    const padded = "[{\"nonce\":\"0x01\",\"v\":\"27\",\"to\":" ++ address_target ++
+        "},\"latest\"]";
+    try expect_contains(try h.request("eth_call", padded), "\"result\":\"0x\"");
+}
+
 test "eth: prestateTracer diff leaves out an account destroyed in a reverted frame" {
     const h = try Harness.create();
     defer h.destroy();

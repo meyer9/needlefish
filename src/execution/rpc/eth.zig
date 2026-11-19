@@ -866,10 +866,57 @@ pub fn parse_call(
             if (value.tag != .string) return error.InvalidParams;
             _ = json.parse_quantity(u8, text) catch return error.InvalidParams;
         } else {
+            if (!typed_field_valid(name.bytes, value)) return error.InvalidParams;
             scanner.skip(value) catch return error.InvalidParams;
         }
     }
     return result;
+}
+
+/// Nethermind binds a call object as a `TransactionForRpc`, typing members the call does
+/// not use: a nonce (`ulong`), `v`, `r`, `s` (`UInt256`), `hash` and `blockHash`
+/// (`Hash256`), `blockNumber`, `blockTimestamp` (`ulong`) and `transactionIndex` (`long`).
+/// A value of the wrong type (a block tag as a nonce) refuses the request. Other members are
+/// not checked here.
+fn typed_field_valid(name: []const u8, value: json.Token) bool {
+    const Field = struct { name: []const u8, bits: u16 };
+    const quantities = [_]Field{
+        .{ .name = "nonce", .bits = 64 },
+        .{ .name = "v", .bits = 256 },
+        .{ .name = "r", .bits = 256 },
+        .{ .name = "s", .bits = 256 },
+        .{ .name = "blockNumber", .bits = 64 },
+        .{ .name = "blockTimestamp", .bits = 64 },
+        .{ .name = "transactionIndex", .bits = 63 },
+    };
+    for (quantities) |field| {
+        if (std.ascii.eqlIgnoreCase(name, field.name)) {
+            return lenient_quantity_valid(value, field.bits);
+        }
+    }
+    if (std.ascii.eqlIgnoreCase(name, "hash") or std.ascii.eqlIgnoreCase(name, "blockHash")) {
+        if (value.tag != .string) return false;
+        _ = json.parse_hash(value.bytes) catch return false;
+    }
+    return true;
+}
+
+/// A number as Nethermind's `ULongConverter` and `UInt256Converter` read one: a JSON
+/// number, or a string of `0x` and hex digits (leading zeros allowed) or of decimal digits,
+/// fitting `bits` bits.
+fn lenient_quantity_valid(value: json.Token, bits: u16) bool {
+    assert(bits > 0 and bits <= 256);
+    const text = value.bytes;
+    if (value.tag != .string and value.tag != .number) return false;
+    const hex = value.tag == .string and text.len >= 2 and text[0] == '0' and text[1] == 'x';
+    const digits = if (hex) text[2..] else text;
+    if (digits.len == 0) return hex;
+    const radix: u8 = if (hex) 16 else 10;
+    // `parseUnsigned` also takes `_` separators; .NET does not.
+    for (digits) |digit| _ = std.fmt.charToDigit(digit, radix) catch return false;
+    const parsed = std.fmt.parseUnsigned(u256, digits, radix) catch return false;
+    if (bits == 256) return true;
+    return parsed >> @intCast(bits) == 0;
 }
 
 /// A request's `blobVersionedHashes` (each a `B256`), stored in `space` after `used`.
@@ -1774,4 +1821,26 @@ test {
     _ = @import("debug_http_test.zig");
     _ = @import("debug_large_test.zig");
     _ = @import("eth_proof_test.zig");
+}
+
+test "eth: call object numbers read as Nethermind's converters read them" {
+    const t = std.testing;
+    const string = struct {
+        fn of(text: []const u8) json.Token {
+            return .{ .tag = .string, .bytes = text };
+        }
+    }.of;
+    try t.expect(lenient_quantity_valid(string("0x01"), 64));
+    try t.expect(lenient_quantity_valid(string("0x"), 64));
+    try t.expect(lenient_quantity_valid(string("12"), 64));
+    try t.expect(lenient_quantity_valid(.{ .tag = .number, .bytes = "7" }, 64));
+    try t.expect(lenient_quantity_valid(string("0xffffffffffffffff"), 64));
+    try t.expect(!lenient_quantity_valid(string("0x10000000000000000"), 64));
+    try t.expect(!lenient_quantity_valid(string("0x8000000000000000"), 63));
+    try t.expect(!lenient_quantity_valid(string("finalized"), 64));
+    try t.expect(!lenient_quantity_valid(string("1_0"), 64));
+    try t.expect(!lenient_quantity_valid(.{ .tag = .true }, 64));
+    try t.expect(typed_field_valid("other", string("finalized")));
+    try t.expect(!typed_field_valid("Nonce", string("finalized")));
+    try t.expect(!typed_field_valid("blockHash", string("0x12")));
 }
