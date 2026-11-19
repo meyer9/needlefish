@@ -86,6 +86,18 @@ const header_bytes = 4 + 2 + 4 + 4 + 4;
 const account_side_bytes = 8 + 32 + 32;
 const storage_entry_bytes = 20 + 32 + 32 + 32;
 
+/// The longest encoding of a changeset within `config`: every account with both sides, every
+/// code, and (hashed) a distinct owner per entry.
+pub fn encoded_length_max(config: Config) u64 {
+    const accounts: u64 = config.accounts_max;
+    const storage: u64 = config.storage_max;
+    const length = header_bytes + accounts * (21 + 2 * account_side_bytes) +
+        storage * storage_entry_bytes + @as(u64, config.codes_max) * 4 +
+        config.code_bytes_max + 4 + (accounts + storage) * 32;
+    assert(length >= header_bytes + 4);
+    return length;
+}
+
 pub const Error = error{ ChangesetFull, InvalidChangeset };
 
 /// A changeset with fixed capacity, allocated once.
@@ -269,6 +281,12 @@ pub const Changeset = struct {
     pub fn encode(self: *const Changeset, out: []u8) []u8 {
         const length = self.encoded_length();
         assert(out.len >= length);
+        assert(length <= encoded_length_max(.{
+            .accounts_max = @intCast(self.accounts.len),
+            .storage_max = @intCast(self.storage.len),
+            .codes_max = @intCast(self.code_ends.len),
+            .code_bytes_max = @intCast(self.code_bytes.len),
+        }));
         var writer: Writer = .{ .buffer = out };
         writer.int(u32, magic);
         writer.int(u16, if (self.hashed) version_hashed else version);

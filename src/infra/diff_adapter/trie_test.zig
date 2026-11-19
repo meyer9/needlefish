@@ -620,5 +620,149 @@ test "diff trie: seeded fuzz, the primary against hash-builder and every variant
         const variants = field(response, "variants").object;
         try testing.expectEqual(fuzz.preimages, variants.contains("node-address"));
         try testing.expect(variants.contains("hash-builder"));
+        try testing.expect(variants.contains("disk-small"));
     }
+}
+
+// `disk-small` against the primary and hash-builder, node by node: blocks of a few hundred
+// writes, two native unwinds (and the same blocks again) every seven, and the counters of
+// the persistence the primary never reaches with them.
+
+const trie_node = @import("trie_node.zig");
+const trie_model = @import("trie_model.zig");
+const trie_request = @import("trie_request.zig");
+const HashedWrites = @import("../../execution/db/root.zig").overlay.HashedWrites;
+
+const small_keys = 384;
+const small_slots = 24;
+const small_blocks = 30;
+const small_writes = 300;
+
+const SmallRun = struct {
+    prng: Prng,
+    model: trie_model.Model,
+    keys: [small_keys]Hash = undefined,
+    slots: [small_slots]Hash = undefined,
+    ops: [small_writes]trie_request.Op = undefined,
+
+    /// One block's ops (no empty account), applied to the model; its writes.
+    fn block(run: *SmallRun) !HashedWrites {
+        var touched: trie_model.Touched = .{};
+        for (&run.ops, 0..) |*op, index| {
+            const key = run.keys[run.prng.below(small_keys)];
+            const exists = run.model.find(&key) != null;
+            const choice = run.prng.below(100);
+            op.* = .{ .kind = .account, .key = key };
+            if (exists and choice < 60) {
+                op.kind = .storage;
+                op.slot = run.slots[run.prng.below(small_slots)];
+                op.value = if (run.prng.chance(1, 5)) 0 else run.prng.range(1, 1 << 60);
+            } else if (exists and choice < 62) {
+                op.kind = .wipe;
+            } else if (exists and choice < 64) {
+                op.kind = .delete;
+            } else {
+                op.info = .{ .nonce = run.prng.range(1, 1 << 20), .balance = run.prng.int(u64) };
+            }
+            try run.model.apply(run.ops[index..][0..1], &touched);
+        }
+        return run.model.writes(&touched);
+    }
+};
+
+fn expect_same_disk_proofs(primary: *trie_node.Node, small: *trie_node.Node, key: Hash) !void {
+    const proofs = try testing.allocator.alloc(trie_node.AccountProof, 2);
+    defer testing.allocator.free(proofs);
+    const storage = try testing.allocator.alloc(trie_node.StorageProof, 2);
+    defer testing.allocator.free(storage);
+    var values: [2][1]u256 = undefined;
+    const slot = [1]Hash{key};
+    var accounts: [2]?trie_node.AccountState = undefined;
+    for ([2]*trie_node.Node{ primary, small }, 0..) |node, index| {
+        accounts[index] = try node.db.proof_hashed(
+            &key,
+            &slot,
+            &proofs[index],
+            storage[index..][0..1],
+            &values[index],
+        );
+    }
+    try testing.expectEqualDeep(accounts[0], accounts[1]);
+    try testing.expectEqual(values[0][0], values[1][0]);
+    try testing.expectEqual(proofs[0].count, proofs[1].count);
+    for (0..proofs[0].count) |index| {
+        const at: u32 = @intCast(index);
+        try testing.expectEqualSlices(u8, proofs[0].node_at(at), proofs[1].node_at(at));
+    }
+    try testing.expectEqual(storage[0].count, storage[1].count);
+}
+
+fn small_commit(nodes: [2]*trie_node.Node, writes: HashedWrites, root: Hash) !void {
+    for (nodes) |node| {
+        try node.commit_hashed(writes);
+        try testing.expectEqualSlices(u8, &root, &node.state_root());
+    }
+}
+
+test "diff trie: disk-small persists every few blocks and agrees with the primary" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const dir = try std.fmt.allocPrint(arena, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    const primary_path = try std.fmt.allocPrint(arena, "{s}/primary.db", .{dir});
+    const small_path = try std.fmt.allocPrint(arena, "{s}/small.db", .{dir});
+    const primary = try trie_node.Node.create(testing.allocator, .disk, primary_path);
+    defer primary.destroy();
+    const small = try trie_node.Node.create(testing.allocator, .disk_small, small_path);
+    defer small.destroy();
+    var run: SmallRun = .{ .prng = Prng.init(0x5a11_0000 + build_options.fuzz_seed), .model = .{
+        .arena = arena,
+    } };
+    for (&run.keys) |*key| run.prng.fill(key);
+    for (&run.slots) |*slot| run.prng.fill(slot);
+    const nodes = [2]*trie_node.Node{ primary, small };
+    var writes: [small_blocks]HashedWrites = undefined;
+    var roots: [small_blocks + 1]Hash = undefined;
+    roots[0] = trie.empty_root;
+    for (0..small_blocks) |index| {
+        writes[index] = try run.block();
+        roots[index + 1] = try run.model.state_root();
+        try small_commit(nodes, writes[index], roots[index + 1]);
+        if (index % 7 == 6) {
+            // Two blocks back natively, then the same two blocks again.
+            for (nodes) |node| {
+                try testing.expect(try node.unwind_to(index - 1));
+                try testing.expectEqualSlices(u8, &roots[index - 1], &node.state_root());
+            }
+            try small_commit(nodes, writes[index - 1], roots[index]);
+            try small_commit(nodes, writes[index], roots[index + 1]);
+        }
+        for (0..4) |_| {
+            try expect_same_disk_proofs(primary, small, run.keys[run.prng.below(small_keys)]);
+        }
+    }
+    try expect_small_persisted(small);
+}
+
+/// disk-small flushed, built tables, compacted, checkpointed and evicted from its caches
+/// several times (with these blocks the primary does none of it but evict).
+fn expect_small_persisted(small: *trie_node.Node) !void {
+    const trees = &small.db.flat.?;
+    var flushes: u64 = 0;
+    var merges: u64 = 0;
+    var tables: u64 = 0;
+    inline for (.{ "accounts", "storage", "account_branches", "storage_branches" }) |name| {
+        const stats = @field(trees, name).stats;
+        try testing.expect(stats.flushes >= 5);
+        flushes += stats.flushes;
+        merges += stats.merges;
+        tables += stats.tables_written;
+    }
+    try testing.expect(merges >= 5);
+    try testing.expect(tables >= flushes + merges);
+    try testing.expect(small.db.checkpoints_completed >= 5);
+    try testing.expect(small.db.disk.?.record_cache.stats.evictions > 0);
+    try testing.expect(trees.cache.stats.evictions > 0);
 }

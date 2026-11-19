@@ -141,9 +141,11 @@ hashed key space to needlefish's own on-disk database in the request's `trie.dir
 committed as the node commits a block (`StateDb.commit_hashed`, `Database.commit_applied`),
 with native unwinds and eth_getProof's proofs. Its `variants` are other root paths: `sparse`
 (the stateless `SparseState`), `state-trie` (the in-memory `StateTrie`), `hash-builder` (the
-whole state from scratch), and, when the request carries preimages, `node-address` (the
-durable node's address-keyed path). Its coverage is `nf:edge:<index>` of the trie, state
-database and storage engine functions only.
+whole state from scratch), `disk-small` (the primary's path over a database at the smallest
+sizes the node allows, so it flushes and checkpoints every block and compacts every few), and,
+when the request carries preimages, `node-address` (the durable node's address-keyed path).
+Its coverage is `nf:edge:<index>` of the trie, state database and storage engine functions
+only.
 
 For coverage-guided fuzzing, build with `-Ddiff-coverage` and set `BASE_DIFF_COVERAGE=1`:
 

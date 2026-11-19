@@ -9,6 +9,9 @@
 //!   back and retried after the storage quiets down. Proofs are `Database.proof_hashed`
 //!   (eth_getProof's disk walk). Unwinds are native: `set_head` to the ancestor, which
 //!   unwinds the stored changesets.
+//! - `.disk_small` (`disk-small`): the same, over `config_disk_small` (the smallest sizes the
+//!   node's code allows), so a request of tens of blocks reaches flushes, merges, checkpoints
+//!   and cache evictions.
 //! - `.memory` (`node-address`): the durable node's in-memory state (`State` tables and
 //!   `StateTrie`), keyed by address; blocks go through an `Overlay` and
 //!   `execute_and_commit`; proofs through `proof_at` at the head (eth_getProof's live path).
@@ -27,6 +30,8 @@ const to_disk = @import("../../execution/import/to_disk.zig");
 const io_storage = @import("../../execution/db/storage/io_storage.zig");
 const branch_record = @import("../../execution/db/branch_record.zig");
 const sector_size = @import("../../execution/db/storage/storage.zig").sector_size;
+const table_module = @import("../../execution/db/storage/table.zig");
+const record_cache = @import("../../execution/db/record_cache.zig");
 const FileIo = @import("file_io.zig").FileIo;
 
 const database = db.database;
@@ -42,7 +47,7 @@ pub const AccountProof = trie.StateTrie.AccountProof;
 pub const StorageProof = trie.StateTrie.StorageProof;
 pub const AccountState = db.history.AccountState;
 
-pub const Mode = enum { disk, memory };
+pub const Mode = enum { disk, disk_small, memory };
 
 /// Blocks a request may hold (the chain index by height).
 pub const blocks_max = 256;
@@ -115,6 +120,56 @@ pub const config_disk: database.Config = .{
     },
 };
 
+/// `disk-small`: `config_disk` at the smallest sizes the node's code allows, so a request
+/// of tens of blocks reaches what the primary's sizes put off past it: memtable flushes into
+/// tables (a flush minimum of one), merges, checkpoints (a journal of two largest entries:
+/// `Room` finds it short before every block and checkpoints), and cache evictions. The
+/// per-block bounds (changeset, `DiskState` work, record writes) and the key bounds that
+/// size the levels stay `config_disk`'s, so it takes every block the primary does.
+const small_block_size: u32 = sector_size;
+/// One largest block entry: a header, and a changeset at `changeset_config`'s limits.
+const small_entry_body_bytes: u32 = blk: {
+    const body = database.block_entry_fixed_size + 16 +
+        db.changeset.encoded_length_max(changeset_config);
+    break :blk @intCast(std.mem.alignForward(u64, body, sector_size));
+};
+/// A checkpoint at most: every retained block (`Database.chain_bytes_capacity`) and 16 MiB.
+const small_checkpoint_bytes: u64 =
+    @as(u64, chain_config.bytes_max) + 3 * @as(u64, small_entry_body_bytes) + (16 << 20);
+
+pub const config_disk_small: database.Config = blk: {
+    var config = config_disk;
+    config.engine = .{
+        // The journal's smallest (`journal.zig` init): two largest entries.
+        .journal_size_bytes = 2 * (sector_size + @as(u64, small_entry_body_bytes)),
+        // The zone holds a checkpoint (it does not set how often one runs).
+        .checkpoint_zone_size_bytes = small_checkpoint_bytes,
+        .entry_body_size_max = small_entry_body_bytes,
+        .checkpoint_block_size = small_block_size,
+        .grid_block_count = 1 << 14,
+    };
+    // The chain retention stays the primary's: retained blocks are evicted oldest-inserted
+    // first, so after unwinds to one ancestor its side blocks could outlive it, and fewer
+    // retained blocks could evict a block's parent (`UnknownParent`). A checkpoint holds the
+    // retained blocks, and one block's memtable entries with room to spare.
+    config.checkpoint_staging_bytes = small_checkpoint_bytes;
+    config.queue_entries_max = 1;
+    // A checkpoint writes this much per commit, and compaction runs on the same budget, so
+    // merges span blocks and checkpoints.
+    config.checkpoint_bytes_per_commit = 64 * small_block_size;
+    config.flat_flush_entries_min = 1;
+    config.flat_branch_flush_entries_min = 1;
+    config.flat_cache_blocks = table_module.BlockCache.ways;
+    config.disk_state.?.record_cache_entries = record_cache.ways;
+    break :blk config;
+};
+
+comptime {
+    assert(small_entry_body_bytes <= config_disk.engine.entry_body_size_max);
+    assert(config_disk_small.engine.checkpoint_zone_size_bytes % small_block_size == 0);
+    assert(config_disk_small.chain_bytes_capacity() < config_disk_small.checkpoint_staging_bytes);
+}
+
 /// The in-memory state of a durable node without a grid (journal and checkpoints only).
 pub const config_memory: database.Config = .{
     .engine = blk: {
@@ -170,7 +225,11 @@ pub const Node = struct {
     fn init(allocator: std.mem.Allocator, mode: Mode, path: []const u8) !*Node {
         const self = try allocator.create(Node);
         errdefer allocator.destroy(self);
-        const config = if (mode == .disk) config_disk else config_memory;
+        const config = switch (mode) {
+            .disk => config_disk,
+            .disk_small => config_disk_small,
+            .memory => config_memory,
+        };
         self.* = .{
             .allocator = allocator,
             .mode = mode,
@@ -207,9 +266,11 @@ pub const Node = struct {
 
     pub fn destroy(self: *Node) void {
         const allocator = self.allocator;
-        // The storage must hold no operation in flight: finish what was started.
+        // The storage must hold no operation in flight: finish what was started, a paced
+        // checkpoint unpaced (no commit grants it more).
         var ticks: u32 = 0;
         while (ticks < ticks_max and (!self.storage.idle() or self.draining())) : (ticks += 1) {
+            self.db.checkpoint_flush();
             self.tick();
         }
         self.overlay.deinit(allocator);
@@ -263,7 +324,11 @@ pub const Node = struct {
     fn unsettled(node: *const Node) bool {
         const database_ = &node.db;
         if (database_.phase != .ready) return false;
-        return database_.durable_sequence < database_.submitted_sequence or !database_.idle();
+        if (database_.durable_sequence < database_.submitted_sequence) return true;
+        if (database_.idle()) return false;
+        // A paced checkpoint waiting for the next commits' grants (disk-small) goes on with
+        // them; anything else in flight finishes now.
+        return !(database_.engine.checkpoint_paused() and node.storage.idle());
     }
 
     pub fn tick(self: *Node) void {
@@ -340,7 +405,7 @@ pub const Node = struct {
 
     /// Disk mode: commits the next block from its writes in hashed key space.
     pub fn commit_hashed(self: *Node, writes: HashedWrites) Error!void {
-        assert(self.mode == .disk);
+        assert(self.mode != .memory);
         if (self.height == blocks_max) return error.NodeFailed;
         var attempts: u32 = 0;
         while (attempts < attempts_max) : (attempts += 1) {
