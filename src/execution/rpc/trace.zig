@@ -1228,6 +1228,7 @@ fn trace_call_prestate(
     var request = request_in;
     collected.authorities = request.message.authorization_list orelse &.{};
     collected.callee = request.message.to;
+    collected.sender = request.message.from;
     request.message.inspect = collected.inspect();
     switch (try eth.simulate(api, call, request)) {
         .invalid => |reason| return eth.fail_invalid(call, reason),

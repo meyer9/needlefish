@@ -104,6 +104,8 @@ pub const Collected = struct {
     authorities: []const evm.transaction.Authorization = &.{},
     /// The traced call's callee (debug_traceCall), null for a creation.
     callee: ?Address = null,
+    /// The traced call's sender (debug_traceCall).
+    sender: ?Address = null,
 
     /// Carves the collector out of `space` (left untouched until used); null when it is too
     /// small. An eighth each goes to accounts and slots, a quarter to the snapshot of the
@@ -229,6 +231,19 @@ pub const Collected = struct {
         collected.add_created(state, evm.evm.create_address(sender, nonce));
     }
 
+    /// debug_traceCall's sender, which Nethermind's tracer looks up with the address a
+    /// creation makes (counted created; the `NativePrestateTracer` constructor). An unpriced
+    /// call creates a missing sender (`TransactionProcessor.RecoverSenderIfNeeded`), which
+    /// is still there when the tracer reads the post-state: never missing, so a sender whose
+    /// nonce the call did not bump (a creation that cannot pay its value) is no diff.
+    fn add_call_sender(collected: *Collected, state: *State, sender: Address) void {
+        if (collected.callee == null) collected.add_created_by(state, sender);
+        const entry = collected.add_account(state, sender) orelse return;
+        if (std.mem.eql(u8, &entry.post.code_hash, &missing_code_hash)) {
+            entry.post.code_hash = evm.primitives.keccak_empty;
+        }
+    }
+
     /// Lists `address` as created in the transaction (looked up if it was not loaded).
     pub fn add_created(collected: *Collected, state: *State, address: Address) void {
         const entry = collected.add_account(state, address) orelse return;
@@ -336,6 +351,7 @@ pub const Collected = struct {
         const collected: *Collected = @ptrCast(@alignCast(context));
         collected.collect(state);
         if (collected.callee) |callee| collected.add_callee(state, callee);
+        if (collected.sender) |sender| collected.add_call_sender(state, sender);
         for (collected.authorities) |authorization| {
             const authority = authorization.authority orelse continue;
             _ = collected.add_account(state, authority);

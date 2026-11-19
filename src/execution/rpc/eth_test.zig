@@ -3270,6 +3270,22 @@ test "eth: prestateTracer diff lists a create that fails before it runs" {
     try expect_contains(post, child ++ "{\"codeHash\":\"0x" ++ zeros_62 ++ "00\"}");
 }
 
+test "eth: prestateTracer diff of a creation call that cannot pay its value" {
+    const h = try Harness.create();
+    defer h.destroy();
+    // As Nethermind: the address the creation makes is looked up and counted created, so
+    // post lists it missing; the missing sender, which Nethermind creates for an unpriced
+    // call and whose nonce the failed creation leaves alone, is no diff.
+    const request = "[{\"from\":\"0x00000000000000000000000000000000000000aa\",\"input\":" ++
+        "\"0x6001600055\",\"value\":\"0xffffffffffffffffffffffffffff\"},\"latest\"," ++
+        "{\"tracer\":\"prestateTracer\",\"tracerConfig\":{\"diffMode\":true}}]";
+    const diff = try h.request("debug_traceCall", request);
+    try testing.expect(std.mem.startsWith(u8, diff, "\"result\":{\"pre\":{},\"post\":{"));
+    try expect_contains(diff, "\"0x45eb6484d76cfe3f45708b91f5af8ce495134fac\":{\"codeHash\":" ++
+        "\"0x" ++ zeros_62 ++ "00\"}");
+    try testing.expect(std.mem.indexOf(u8, diff, "00000000000000000000aa") == null);
+}
+
 test "eth: prestateTracer diff lists a looked-up missing account with a zero code hash" {
     const h = try Harness.create();
     defer h.destroy();
