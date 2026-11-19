@@ -24,6 +24,8 @@ pub const Inclusion = struct {
     block_number: u64,
     index: u32,
     base_fee: ?u64,
+    /// A simulated block's base fee above u64 (`simulate_block.Sealed`), else null.
+    base_fee_override: ?u256 = null,
     /// Denim: the block's millisecond timestamp (`blockTimestampMs`), when known.
     timestamp_ms: ?u64 = null,
     /// The block's timestamp (`blockTimestamp` of transactions and logs), when known.
@@ -72,6 +74,19 @@ pub fn timestamp_ms_of(second: []const u8, number: u64, timestamp: u64) ?u64 {
 }
 
 pub fn header_fields(w: *Writer, header: *const Header, hash: Hash, size: usize) WriteError!void {
+    return header_fields_base_fee(w, header, hash, size, null);
+}
+
+/// `header_fields` with a simulated block's `baseFeePerGas` above the header's u64
+/// (`simulate_block.Sealed`) when `base_fee_override` is set.
+pub fn header_fields_base_fee(
+    w: *Writer,
+    header: *const Header,
+    hash: Hash,
+    size: usize,
+    base_fee_override: ?u256,
+) WriteError!void {
+    assert(base_fee_override == null or header.base_fee_per_gas == std.math.maxInt(u64));
     try field_data(w, "hash", &hash);
     try field_data(w, "parentHash", &header.parent_hash.bytes);
     try field_data(w, "sha3Uncles", &header.ommers_hash.bytes);
@@ -89,7 +104,9 @@ pub fn header_fields(w: *Writer, header: *const Header, hash: Hash, size: usize)
     try field_data(w, "mixHash", &header.mix_hash.bytes);
     try field_data(w, "nonce", &header.nonce.bytes);
     try field_quantity(w, "size", size);
-    if (header.base_fee_per_gas) |fee| try field_quantity(w, "baseFeePerGas", fee);
+    if (header.base_fee_per_gas) |fee| {
+        try field_quantity(w, "baseFeePerGas", base_fee_override orelse fee);
+    }
     if (header.withdrawals_root) |root| try field_data(w, "withdrawalsRoot", &root.bytes);
     if (header.blob_gas_used) |used| try field_quantity(w, "blobGasUsed", used);
     if (header.excess_blob_gas) |excess| try field_quantity(w, "excessBlobGas", excess);
@@ -259,8 +276,22 @@ fn deposit_fields(w: *Writer, deposit: consensus.Deposit) WriteError!void {
     inline for (.{ "v", "r", "s", "yParity" }) |name| try field_quantity(w, name, @as(u8, 0));
 }
 
+/// `Envelope.effective_gas_price` over a base fee of any size, the base fee itself when the
+/// fee cap is below it.
+fn effective_gas_price(envelope: Envelope, base_fee: u256) u256 {
+    assert(envelope != .deposit);
+    const fee_cap: u256 = envelope.max_fee_per_gas();
+    if (fee_cap < base_fee) return base_fee;
+    const tip = @min(envelope.max_priority_fee_per_gas(), fee_cap - base_fee);
+    assert(base_fee + tip <= fee_cap);
+    return base_fee + tip;
+}
+
 fn fee_fields(w: *Writer, envelope: Envelope, inclusion: ?Inclusion) WriteError!void {
-    const base_fee = if (inclusion) |i| i.base_fee else null;
+    var base_fee: ?u256 = null;
+    if (inclusion) |i| {
+        if (i.base_fee) |fee| base_fee = i.base_fee_override orelse fee;
+    }
     switch (envelope) {
         .legacy, .eip2930 => try field_quantity(w, "gasPrice", envelope.max_fee_per_gas()),
         .deposit => try field_quantity(w, "gasPrice", @as(u8, 0)),
@@ -268,7 +299,7 @@ fn fee_fields(w: *Writer, envelope: Envelope, inclusion: ?Inclusion) WriteError!
             // alloy: the effective tip (zero when the fee cap is below the base fee, as
             // only a simulated block allows) plus the base fee.
             const price = if (base_fee) |fee|
-                envelope.effective_gas_price(fee) orelse fee
+                effective_gas_price(envelope, fee)
             else
                 envelope.max_fee_per_gas();
             try field_quantity(w, "gasPrice", price);

@@ -291,14 +291,14 @@ pub const Block = struct {
     }
 
     /// The block's RLP length, `rlp([header, transactions, ommers, withdrawals?])`.
-    pub fn size_bytes(block: *const Block, sealed: *const Header) usize {
+    pub fn size_bytes(block: *const Block, sealed: *const Sealed) usize {
         var transactions_payload: usize = 0;
         for (block.transactions[0..block.count]) |raw| {
             transactions_payload += if (raw[0] >= 0xc0) raw.len else rlp.bytes_length(raw);
         }
         var payload = sealed.rlp_length() + rlp.list_length(transactions_payload) +
             rlp.list_length(0);
-        if (sealed.withdrawals_root != null) payload += rlp.list_length(0);
+        if (sealed.header.withdrawals_root != null) payload += rlp.list_length(0);
         return rlp.list_length(payload);
     }
 
@@ -307,13 +307,21 @@ pub const Block = struct {
     pub fn write(
         block: *const Block,
         w: *json.Writer,
-        sealed: *const Header,
+        sealed: *const Sealed,
         hash: B256,
         full: bool,
         chain_id: u64,
     ) json.Writer.WriteError!void {
         assert(block.count == block.receipt_count);
-        try format.header_fields(w, sealed, hash.bytes, block.size_bytes(sealed));
+        const sealed_header = &sealed.header;
+        const size = block.size_bytes(sealed);
+        try format.header_fields_base_fee(
+            w,
+            sealed_header,
+            hash.bytes,
+            size,
+            sealed.base_fee_override,
+        );
         try w.key("uncles");
         try w.begin_array();
         try w.end_array();
@@ -326,18 +334,73 @@ pub const Block = struct {
             }
             try format.simulated_transaction(w, raw, block.senders[index], chain_id, .{
                 .block_hash = hash.bytes,
-                .block_number = sealed.number,
+                .block_number = sealed_header.number,
                 .index = @intCast(index),
-                .base_fee = sealed.base_fee_per_gas,
-                .timestamp = sealed.timestamp,
+                .base_fee = sealed_header.base_fee_per_gas,
+                .base_fee_override = sealed.base_fee_override,
+                .timestamp = sealed_header.timestamp,
             });
         }
         try w.end_array();
-        if (sealed.withdrawals_root != null) {
+        if (sealed_header.withdrawals_root != null) {
             try w.key("withdrawals");
             try w.begin_array();
             try w.end_array();
         }
+    }
+};
+
+/// A simulated block's header with its base fee as overridden: geth (big.Int) and
+/// Nethermind (UInt256) keep a `baseFeePerGas` override above `Header`'s u64 whole, so the
+/// hash, size and `baseFeePerGas` carry `base_fee_override` when it is set.
+pub const Sealed = struct {
+    header: Header,
+    base_fee_override: ?u256,
+
+    const field_names = @typeInfo(Header).@"struct".field_names;
+
+    pub fn rlp_length(sealed: *const Sealed) usize {
+        const fee = sealed.base_fee_override orelse return sealed.header.rlp_length();
+        return rlp.list_length(wide_payload_length(&sealed.header, fee));
+    }
+
+    /// keccak256(rlp(header)), the base fee whole.
+    pub fn hash(sealed: *const Sealed) B256 {
+        const fee = sealed.base_fee_override orelse return sealed.header.hash();
+        assert(fee > std.math.maxInt(u64));
+        assert(sealed.header.base_fee_per_gas == std.math.maxInt(u64));
+        assert(sealed.header.optionals_contiguous());
+        var sink: consensus.hashing.KeccakSink = .{};
+        var encoder = sink.encoder();
+        const payload = wide_payload_length(&sealed.header, fee);
+        encoder.list_header(payload);
+        inline for (field_names) |name| {
+            const value = @field(sealed.header, name);
+            if (comptime std.mem.eql(u8, name, "base_fee_per_gas")) {
+                rlp.encode(&encoder, fee);
+            } else if (comptime @typeInfo(@TypeOf(value)) == .optional) {
+                if (value) |present| rlp.encode(&encoder, present);
+            } else {
+                rlp.encode(&encoder, value);
+            }
+        }
+        assert(encoder.position == rlp.list_length(payload));
+        return sink.final();
+    }
+
+    fn wide_payload_length(header: *const Header, fee: u256) usize {
+        var total: usize = 0;
+        inline for (field_names) |name| {
+            const value = @field(header.*, name);
+            if (comptime std.mem.eql(u8, name, "base_fee_per_gas")) {
+                total += rlp.length(fee);
+            } else if (comptime @typeInfo(@TypeOf(value)) == .optional) {
+                if (value) |present| total += rlp.length(present);
+            } else {
+                total += rlp.length(value);
+            }
+        }
+        return total;
     }
 };
 
@@ -418,4 +481,46 @@ test "simulate_block: transaction types follow alloy's preferred type" {
     try testing.expectEqual(consensus.TxType.legacy, tx_type_of(false, false, false, true));
     try testing.expectEqual(consensus.TxType.eip1559, tx_type_of(false, true, false, true));
     try testing.expectEqual(consensus.TxType.eip7702, tx_type_of(true, true, true, true));
+}
+
+test "simulate_block: a base fee above u64 is hashed whole" {
+    const fee: u256 = 0x9ed5eb1431d6880000;
+    const header: Header = .{
+        .number = 5,
+        .gas_limit = 30_000_000,
+        .extra_data = "base",
+        .base_fee_per_gas = std.math.maxInt(u64),
+    };
+    // The header's fields, in order, with the base fee widened.
+    const Wide = struct {
+        parent_hash: B256,
+        ommers_hash: B256,
+        beneficiary: Address,
+        state_root: B256,
+        transactions_root: B256,
+        receipts_root: B256,
+        logs_bloom: Bloom,
+        difficulty: u256,
+        number: u64,
+        gas_limit: u64,
+        gas_used: u64,
+        timestamp: u64,
+        extra_data: []const u8,
+        mix_hash: B256,
+        nonce: primitives.B64,
+        base_fee_per_gas: u256,
+    };
+    var wide: Wide = undefined;
+    inline for (@typeInfo(Wide).@"struct".field_names) |name| {
+        if (comptime !std.mem.eql(u8, name, "base_fee_per_gas")) {
+            @field(wide, name) = @field(header, name);
+        }
+    }
+    wide.base_fee_per_gas = fee;
+    const sealed: Sealed = .{ .header = header, .base_fee_override = fee };
+    try testing.expect(sealed.hash().eql(consensus.hashing.keccak_rlp(wide)));
+    try testing.expectEqual(rlp.length(wide), sealed.rlp_length());
+    const narrow: Sealed = .{ .header = header, .base_fee_override = null };
+    try testing.expect(narrow.hash().eql(header.hash()));
+    try testing.expect(!narrow.hash().eql(sealed.hash()));
 }

@@ -418,6 +418,7 @@ fn block_env(
     env.prev_randao = @splat(0);
     env.blob_base_fee = null;
     env.base_fee = 0;
+    env.base_fee_override = null;
     if (simulation.validation) {
         const spec = simulation.api.spec;
         env.base_fee = spec.next_base_fee(.{
@@ -467,14 +468,17 @@ fn simulate_block(
     }
     try w.end_array();
     const calls_end = w.out.end;
-    const sealed = block.header(.{
-        .spec = simulation.api.spec,
-        .parent_hash = parent.hash,
-        .env = &env,
-        .difficulty = difficulty,
-        .extra_data = simulation.extra_data,
-        .parent_beacon_block_root = simulation.parent_beacon_block_root,
-    });
+    const sealed: assembly.Sealed = .{
+        .header = block.header(.{
+            .spec = simulation.api.spec,
+            .parent_hash = parent.hash,
+            .env = &env,
+            .difficulty = difficulty,
+            .extra_data = simulation.extra_data,
+            .parent_beacon_block_root = simulation.parent_beacon_block_root,
+        }),
+        .base_fee_override = env.base_fee_override,
+    };
     const hash = sealed.hash();
     _ = assembly.patch_block_hashes(w.out.buffer[calls_start..calls_end], hash);
     try block.write(w, &sealed, hash, simulation.full_transactions, simulation.api.spec.chain_id);
@@ -546,7 +550,9 @@ pub fn apply_block_overrides(call: *Call, env: *BlockEnv, raw: []const u8) Handl
         } else if (is(key, "random") or is(key, "prevRandao")) {
             env.prev_randao = try fixed_of(32, member.value);
         } else if (is(key, "baseFee") or is(key, "baseFeePerGas")) {
-            env.base_fee = saturate(u64, try quantity_of(u256, member.value));
+            const base_fee = try quantity_of(u256, member.value);
+            env.base_fee = saturate(u64, base_fee);
+            env.base_fee_override = if (base_fee > env.base_fee) base_fee else null;
         } else if (is(key, "blobBaseFee")) {
             env.blob_base_fee = saturate(u128, try quantity_of(u256, member.value));
         } else if (is(key, "beaconRoot") or is(key, "parentBeaconBlockRoot")) {

@@ -656,6 +656,15 @@ test "eth: eth_simulateV1 limits and rejections" {
     const fee_text = try h.request("eth_simulateV1", fees);
     try expect_contains(fee_text, "\"baseFeePerGas\":\"0x7\"");
     try expect_contains(fee_text, "\"returnData\":\"0x" ++ zeros_62 ++ "10\"");
+    // A base fee above 2^64 - 1 stays whole in the header and for BASEFEE, as Nethermind's
+    // UInt256 (`Sealed` hashes it whole).
+    const wide = "[{\"blockStateCalls\":[{\"blockOverrides\":{\"baseFeePerGas\":" ++
+        "\"0x9ed5eb1431d6880000\"},\"stateOverrides\":{" ++ override_target ++
+        ":{\"code\":\"0x485f5260205ff3\"}},\"calls\":[{\"to\":" ++ override_target ++ "}]}]}]";
+    const wide_text = try h.request("eth_simulateV1", wide);
+    try expect_contains(wide_text, "\"baseFeePerGas\":\"0x9ed5eb1431d6880000\"");
+    try expect_contains(wide_text, "\"returnData\":\"0x" ++ zeros_62[0..46] ++
+        "9ed5eb1431d6880000\"");
     try expect_contains(try h.request("eth_simulateV1", "[{}]"), "invalid params");
     // A gas limit above the block's and the RPC gas cap is refused, not run (a looping call
     // without gas would otherwise spin for 2^64 gas).

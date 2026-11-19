@@ -94,6 +94,9 @@ pub const BlockEnv = struct {
     beneficiary: Address,
     gas_limit: u64,
     base_fee: u64,
+    /// An RPC block override of the base fee above `base_fee`'s range (geth and Nethermind
+    /// keep it whole): BASEFEE and the fee rules see it; `base_fee` holds it saturated.
+    base_fee_override: ?u256 = null,
     prev_randao: Hash,
     parent_hash: Hash,
     parent_beacon_block_root: ?Hash = null,
@@ -878,7 +881,10 @@ pub const Executor = struct {
         executor.arena.reset();
         defer executor.abort_block();
         var free_block = block.*;
-        if (!call_in.keep_base_fee) free_block.base_fee = 0;
+        if (!call_in.keep_base_fee) {
+            free_block.base_fee = 0;
+            free_block.base_fee_override = null;
+        }
         executor.set_block_env(&free_block);
         var call = call_in;
         if (call.prepare) |prepare| prepare.run(prepare.context, executor.state, &call);
@@ -1018,12 +1024,14 @@ pub const Executor = struct {
             blob_base_fee = params.base_fee(block.excess_blob_gas orelse 0);
         }
         if (block.blob_base_fee) |overridden| blob_base_fee = overridden;
+        assert(block.base_fee_override == null or
+            block.base_fee_override.? > std.math.maxInt(u64));
         executor.machine.block = .{
             .number = block.number,
             .coinbase = block.beneficiary,
             .timestamp = block.timestamp,
             .gas_limit = block.gas_limit,
-            .base_fee = block.base_fee,
+            .base_fee = block.base_fee_override orelse block.base_fee,
             .prevrandao = block.prev_randao,
             .blob_base_fee = blob_base_fee,
             .op = op_rules.context(executor.spec, block.timestamp),
