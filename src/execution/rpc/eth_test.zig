@@ -796,6 +796,18 @@ test "eth: eth_simulateV1 traceTransfers adds ERC-7528 transfer logs outside the
     const identity = try h.request("eth_simulateV1", precompile);
     try testing.expectEqual(@as(usize, 1), count_of(identity, "\"logIndex\""));
     try expect_contains(identity, "\"data\":\"0x" ++ zeros_62 ++ "07\"");
+    // The flags read as Nethermind's BooleanConverter: a string must start with true/false.
+    const upper = request ++ ",\"traceTransfers\":\"TRUE\"}]";
+    const string_flag = try h.request("eth_simulateV1", upper);
+    try testing.expectEqual(@as(usize, 2), count_of(string_flag, "\"logIndex\""));
+    const refused = [_][]const u8{ "\"latest\"", "null", "1", "{}" };
+    const flags = [_][]const u8{ "traceTransfers", "validation", "returnFullTransactions" };
+    var body: [1024]u8 = undefined;
+    for (flags) |flag| for (refused) |value| {
+        const format = request_prefix_format ++ "eth_simulateV1\",\"params\":{s},\"{s}\":{s}}}]}}";
+        const text = try std.fmt.bufPrint(&body, format, .{ request, flag, value });
+        try expect_contains(try h.request_runtime(text), "\"code\":-32602");
+    };
 }
 
 /// Reverts with `Error("nope")`: CODECOPY the 100 bytes after the 10-byte prefix, REVERT.

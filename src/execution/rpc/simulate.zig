@@ -338,10 +338,19 @@ fn run_block_checked(
     };
 }
 
+/// A boolean option, false when absent. Nethermind's BooleanConverter also reads a string
+/// starting with "true" or "false" (any case, as .NET's Utf8Parser does) and refuses
+/// anything else, null included.
 fn json_true(raw: []const u8, name: []const u8) HandlerError!bool {
     const value = (json.find_path(raw, &.{name}) catch return error.InvalidParams) orelse
         return false;
-    return std.mem.eql(u8, value, "true");
+    if (std.mem.eql(u8, value, "true")) return true;
+    if (std.mem.eql(u8, value, "false")) return false;
+    if (value.len < 2 or value[0] != '"') return error.InvalidParams;
+    const text = value[1..];
+    if (std.ascii.startsWithIgnoreCase(text, "true")) return true;
+    if (std.ascii.startsWithIgnoreCase(text, "false")) return false;
+    return error.InvalidParams;
 }
 
 /// The environment of a simulated block on `parent`: unvalidated blocks run with a zero
