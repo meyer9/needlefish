@@ -299,8 +299,12 @@ fn write_fields(
     try w.string(kind_name(frame.kind));
     try w.key("from");
     try w.data(&frame.from);
-    try w.key("to");
-    try w.data(&frame.to);
+    // geth's `processOutput` clears a failed CREATE's `to`: no account was created.
+    const is_create = frame.kind == .create or frame.kind == .create2;
+    if (!is_create or error_text(frame.exit) == null) {
+        try w.key("to");
+        try w.data(&frame.to);
+    }
     if (frame.kind != .staticcall) {
         try w.key("value");
         try w.quantity(value);

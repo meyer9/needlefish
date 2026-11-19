@@ -1932,6 +1932,26 @@ test "eth: callTracer gives a call that cannot pay its value its top frame" {
     try testing.expectEqual(@as(usize, 1), count_of(flat, "\"traceAddress\""));
 }
 
+test "eth: callTracer gives a creation that cannot pay its value a frame without to" {
+    const h = try Harness.create();
+    defer h.destroy();
+    // geth's `processOutput` (and revm-inspectors) clear a failed CREATE's `to`; gasUsed is
+    // the intrinsic gas: 53000 plus the initcode word cost.
+    const call = "[{\"value\":\"0xef\",\"gas\":\"0x186a0\",\"input\":\"0x6001600055\"}," ++
+        "\"latest\",";
+    const traced = try h.request("debug_traceCall", call ++ "{\"tracer\":\"callTracer\"}]");
+    try expect_contains(traced, "\"result\":{\"type\":\"CREATE\",\"from\":\"0x" ++
+        "0000000000000000000000000000000000000000\",\"value\":\"0xef\",\"gas\":\"0x186a0\"," ++
+        "\"gasUsed\":\"0xcf4e\",\"input\":\"0x6001600055\",\"error\":" ++
+        "\"insufficient balance for transfer\"}");
+    const selectors = try h.request("debug_traceCall", call ++ "{\"tracer\":\"4byteTracer\"}]");
+    try expect_contains(selectors, "\"result\":{}");
+    const flat = try h.request("debug_traceCall", call ++ "{\"tracer\":\"flatCallTracer\"}]");
+    try expect_contains(flat, "\"error\":\"Insufficient balance for transfer\"");
+    try expect_contains(flat, "\"creationMethod\":\"create\"");
+    try testing.expect(std.mem.indexOf(u8, flat, "\"address\"") == null);
+}
+
 test "eth: callTracer gives a deposit rejected before any frame a frame from the tx" {
     var store = try meter_history();
     defer store.deinit(testing.allocator);
