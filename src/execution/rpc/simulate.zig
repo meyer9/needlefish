@@ -652,6 +652,7 @@ fn run_call(
         .index = block.count,
         .tx_hash = try add_transaction(simulation, block, &message, raw, sender.nonce),
     };
+    if (simulation.validation) message.envelope = block.transactions[block.count - 1];
     try add_da_footprint(simulation, env, block);
     var hooks: evm.evm.Tracer = undefined;
     if (simulation.transfers) |transfers| {
@@ -850,18 +851,14 @@ fn fail_invalid(
         .intrinsic_gas_too_low, .floor_gas_too_low => {
             return call.fail(code_intrinsic_gas, "intrinsic gas too low");
         },
-        .insufficient_funds => {
-            const text = std.fmt.bufPrint(
-                buffer,
-                "insufficient funds for gas * price + value: have {d} want {d}",
-                .{ sender.balance, cost_of(message) },
-            ) catch "insufficient funds for gas * price + value";
-            return call.fail(code_insufficient_funds, text);
-        },
+        // Nethermind's `SimulateErrorMessages.InsufficientFunds`.
+        .insufficient_funds => return call.fail(code_insufficient_funds, insufficient_funds),
         .initcode_too_large => return call.fail(code_initcode_size, "max initcode size exceeded"),
         else => return eth.fail_invalid(call, reason),
     }
 }
+
+const insufficient_funds = "Insufficient funds to pay for gas fees and value for a transaction";
 
 /// What the sender must hold for the call: its gas at the gas price (the fee cap) plus value.
 fn cost_of(message: *const node.executor.Executor.Call) u512 {

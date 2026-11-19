@@ -716,6 +716,10 @@ pub const Executor = struct {
         /// `validation`).
         nonce: ?u64 = null,
         validate: bool = false,
+        /// `session_call` with `validate`: the call's EIP-2718 encoding, over which the OP
+        /// Stack L1 data and operator fees are charged (Nethermind charges a validated
+        /// simulated call its rollup fees).
+        envelope: []const u8 = &.{},
     };
 
     pub const Inspect = struct {
@@ -839,6 +843,7 @@ pub const Executor = struct {
             .skip_sender_code_check = true,
             .disable_fee_charge = !call.validate,
             .disable_tx_gas_cap = true,
+            .envelope = if (call.validate) call.envelope else &.{},
         };
         const result = try evm.transaction.transact(executor.machine, fork, &tx);
         return switch (result) {

@@ -697,7 +697,7 @@ test "eth: eth_simulateV1 call errors and validation" {
     try expect_failure(h, "eth_simulateV1", validated ++ "}]}]}]", "-38012", low_fee);
     const priced = validated ++ ",\"maxFeePerGas\":\"0x10000000000\"";
     const nonce = priced ++ ",\"nonce\":\"0x5\"}]}]}]";
-    const funds = "insufficient funds for gas * price + value: have 0 want ";
+    const funds = "Insufficient funds to pay for gas fees and value for a transaction\"}";
     try expect_failure(h, "eth_simulateV1", priced ++ "}]}]}]", "-38014", funds);
     // As Nethermind, the balance is checked before the nonce.
     try expect_failure(h, "eth_simulateV1", nonce, "-38014", funds);
@@ -706,6 +706,22 @@ test "eth: eth_simulateV1 call errors and validation" {
         poor_sender ++ ",\"to\":" ++ address_target ++ ",\"maxFeePerGas\":\"0x10000000000\"";
     const funded_nonce = funded ++ ",\"nonce\":\"0x5\"}]}]}]";
     try expect_failure(h, "eth_simulateV1", funded_nonce, "-38011", "nonce too high\"}");
+}
+
+test "eth: eth_simulateV1 with validation charges the OP rollup fees" {
+    const h = try Harness.create_for(&denim_rpc_spec);
+    defer h.destroy();
+    // The sender holds exactly gas * price; the operator fee constant (L1Block slot 8) is
+    // charged over the call's encoding on top (Nethermind), so the funds fall short.
+    const blocks = "[{\"validation\":true,\"blockStateCalls\":[{\"stateOverrides\":{" ++
+        poor_sender ++ ":{\"balance\":\"0x52080000000000\"}";
+    const operator_fee = ",\"0x4200000000000000000000000000000000000015\":{\"stateDiff\":{" ++
+        "\"0x" ++ zeros_62 ++ "08\":\"0x" ++ zeros_62 ++ "ff\"}}";
+    const calls = "},\"calls\":[{\"from\":" ++ poor_sender ++ ",\"to\":" ++ address_target ++
+        ",\"gas\":\"0x5208\",\"maxFeePerGas\":\"0x10000000000\"}]}]}]";
+    const funds = "Insufficient funds to pay for gas fees and value for a transaction\"}";
+    try expect_failure(h, "eth_simulateV1", blocks ++ operator_fee ++ calls, "-38014", funds);
+    try expect_contains(try h.request("eth_simulateV1", blocks ++ calls), "\"status\":\"0x1\"");
 }
 
 test "eth: a sender at the maximum nonce" {
