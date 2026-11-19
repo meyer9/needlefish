@@ -105,10 +105,12 @@ pub const Schedule = struct {
         const time_raw = try member(overrides, &.{ "time", "timestamp" });
         const timestamp = if (time_raw) |raw| blk: {
             const timestamp = try quantity(u64, raw);
-            const denim = schedule.denim orelse std.math.maxInt(u64);
-            const same_allowed = timestamp >= denim and prev >= denim;
-            if (timestamp < prev or (timestamp == prev and !same_allowed)) {
-                return fail_timestamp(call, buffer, timestamp, prev);
+            // Nethermind (`SimulateTxExecutor.Execute`) refuses an overridden time that
+            // does not pass the previous block's, even where Denim repeats a second.
+            if (timestamp <= prev) {
+                const text = "Block timestamp out of order {d} is <= than given base " ++
+                    "timestamp of {d}!";
+                return fail(call, buffer, code_block_timestamp, text, timestamp, prev);
             }
             break :blk timestamp;
         } else schedule.next_timestamp(target, prev) orelse

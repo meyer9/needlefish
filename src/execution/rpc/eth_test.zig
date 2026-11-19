@@ -664,6 +664,12 @@ test "eth: eth_simulateV1 limits and rejections" {
     const late = "[{\"blockStateCalls\":[{\"blockOverrides\":{\"time\":" ++ max ++ "}},{}]}]";
     try expect_contains(try h.request("eth_simulateV1", late), "{\"code\":-38021,\"message\":" ++
         "\"block timestamps must be in order: 18446744073709551615 <= 18446744073709551615\"}");
+    // Two blocks overriding the same time: Nethermind refuses the second.
+    const same = "[{\"blockStateCalls\":[{\"blockOverrides\":{\"time\":" ++ max ++ "}}," ++
+        "{\"blockOverrides\":{\"time\":" ++ max ++ "}}]}]";
+    try expect_contains(try h.request("eth_simulateV1", same), "{\"code\":-38021,\"message\":" ++
+        "\"Block timestamp out of order 18446744073709551615 is <= than given base " ++
+        "timestamp of 18446744073709551615!\"}");
     const validation = "[{\"blockStateCalls\":[],\"validation\":true}]";
     try expect_contains(try h.request("eth_simulateV1", validation), "{\"code\":-32602," ++
         "\"message\":\"calls are empty.\"}");
@@ -700,7 +706,7 @@ test "eth: eth_simulateV1 limits and rejections" {
     try expect_failure(h, "eth_simulateV1", tip, "-32003", "max priority fee per gas higher");
 }
 
-test "eth: eth_simulateV1 Denim timestamps repeat at 2^64 - 1" {
+test "eth: eth_simulateV1 Denim default timestamps repeat at 2^64 - 1" {
     const h = try Harness.create_for(&denim_rpc_spec);
     defer h.destroy();
     const max = "\"0xffffffffffffffff\"";
@@ -709,7 +715,8 @@ test "eth: eth_simulateV1 Denim timestamps repeat at 2^64 - 1" {
     try testing.expectEqual(@as(usize, 2), count_of(saturated, "\"timestamp\":" ++ max));
     const stalled = "[{\"blockStateCalls\":[{\"blockOverrides\":{\"time\":" ++ max ++ "}}," ++
         "{\"blockOverrides\":{\"time\":" ++ max ++ "}}]}]";
-    try expect_contains(try h.request("eth_simulateV1", stalled), "\"result\":[");
+    // An overridden time must still pass the previous block's (Nethermind), Denim or not.
+    try expect_failure(h, "eth_simulateV1", stalled, "-38021", "Block timestamp out of order");
 }
 
 test "eth: eth_simulateV1 call errors and validation" {
