@@ -53,14 +53,22 @@ pub const Info = struct {
     }
 };
 
-/// The `post` code hash Nethermind reads for an account that does not exist after the
-/// transaction but did exist in its world state during it: one that existed before (a
-/// state override creates one, even empty), or a precompile, which Nethermind creates when
-/// it is called. A diff lists such an account with `codeHash` zero in `post`. An account
-/// that never existed (a zero-value call to an unused address) is not listed.
+/// The `post` code hash Nethermind reads for an account the transaction looked up that does
+/// not exist after it (NativePrestateTracer.ProcessDiffState): zero, against the empty-code
+/// hash it assumes for an account with no code before, so a diff lists the account in
+/// `post` with `codeHash` zero. Over a block every such account is listed, a never-existing
+/// callee included. For debug_traceCall Nethermind lists only one that existed in its world
+/// state during the call: one that existed before (a state override creates one, even
+/// empty) or a precompile; a call's untouched never-existing callee is not listed.
 const missing_code_hash: Hash = @splat(0);
 
-fn lists_missing(state: *const State, address: Address, existed: bool) bool {
+fn lists_missing(
+    collected: *const Collected,
+    state: *const State,
+    address: Address,
+    existed: bool,
+) bool {
+    if (!collected.call) return true;
     return existed or state.static_warm.contains(address);
 }
 
@@ -115,6 +123,8 @@ pub const Collected = struct {
     authorities: []const evm.transaction.Authorization = &.{},
     /// The traced call's callee (debug_traceCall), null for a creation.
     callee: ?Address = null,
+    /// The trace is of a call (debug_traceCall), not of a stored transaction.
+    call: bool = false,
 
     /// Carves the collector out of `space` (left untouched until used); null when it is too
     /// small. An eighth each goes to accounts and slots, a quarter to the snapshot of the
@@ -213,9 +223,8 @@ pub const Collected = struct {
             const found = collected.pre_of(state, account.address);
             const pre = found.info;
             var post = collected.info_of(state, account.info, &pre);
-            if (!account.in_database and lists_missing(state, account.address, found.existed)) {
-                post.code_hash = missing_code_hash;
-            }
+            const listed = lists_missing(collected, state, account.address, found.existed);
+            if (!account.in_database and listed) post.code_hash = missing_code_hash;
             collected.accounts[collected.account_count] = .{
                 .address = account.address,
                 .pre = pre,
@@ -285,7 +294,7 @@ pub const Collected = struct {
             post = collected.info_of(state, account.info, &pre);
             break :missing !account.in_database;
         } else !found.existed;
-        if (missing and lists_missing(state, address, found.existed)) {
+        if (missing and lists_missing(collected, state, address, found.existed)) {
             post.code_hash = missing_code_hash;
         }
         const count = collected.account_count;
