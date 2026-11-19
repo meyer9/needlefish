@@ -3160,6 +3160,26 @@ test "eth: prestateTracer reports revm's loaded accounts as revm-inspectors does
         "\"0x7dc6c0165f09500b75146b66eec05a39dbbc40d2\":{\"nonce\":1}}}", created);
 }
 
+test "eth: prestateTracer diff leaves out an account destroyed in a reverted frame" {
+    const h = try Harness.create();
+    defer h.destroy();
+    // 0x..c0de creates a child whose init code self-destructs (CALLER SELFDESTRUCT), then
+    // reverts everything (INVALID). As Nethermind and geth, the destroyed account stays out
+    // of post although the revert undid the destruction; an account created without
+    // destroying itself is listed missing (a zero code hash).
+    const request = "[{\"from\":\"0x7dc6c0165f09500b75146b66eec05a39dbbc40d2\",\"to\":" ++
+        "\"0x000000000000000000000000000000000000c0de\"},\"latest\",{\"stateOverrides\":{" ++
+        "\"0x000000000000000000000000000000000000c0de\":{\"code\":\"0x61";
+    const config = "6000526002601e6000f0fe\"}},\"tracer\":\"prestateTracer\"," ++
+        "\"tracerConfig\":{\"diffMode\":true}}]";
+    // The child, at nonce 0 of 0x..c0de.
+    const child = "\"0x8bbc3514477d75ec797bbe4e19d7961660bb849c\":";
+    const destroyed = try h.request("debug_traceCall", request ++ "33ff" ++ config);
+    try testing.expect(std.mem.indexOf(u8, destroyed, child) == null);
+    const kept = try h.request("debug_traceCall", request ++ "0000" ++ config);
+    try expect_contains(kept, child ++ "{\"codeHash\":\"0x" ++ zeros_62 ++ "00\"}");
+}
+
 test "eth: prestateTracer diff lists a looked-up missing account with a zero code hash" {
     const h = try Harness.create();
     defer h.destroy();

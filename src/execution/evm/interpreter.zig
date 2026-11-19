@@ -1079,6 +1079,9 @@ fn self_destruct(comptime fork: Fork, f: *Frame, evm: *Evm) ?Exit {
     }
     if (f.gas < cost) return fail_accessed(evm, result.target_access, .out_of_gas);
     f.gas -= cost;
+    // Tracer bookkeeping only: the instruction ran, so a diff leaves the account out of
+    // `post` even if a frame reverts (Nethermind's and geth's deleted accounts).
+    if (result.destroys) f.account.self_destruct_tx = evm.state.tx_id;
     if (!result.previously_destroyed) f.refund += gas.selfdestruct_refund(fork);
     if (evm.tracer) |tracer| trace_self_destruct(tracer, f, target, balance);
     return .self_destruct;

@@ -87,6 +87,9 @@ pub const Account = struct {
     seen_tx: u32 = 0,
     /// The transaction whose SELFDESTRUCT destroyed the account.
     destroyed_tx: u32 = 0,
+    /// The last transaction that ran a SELFDESTRUCT destroying the account, kept when a
+    /// frame reverts (prestateTracer: Nethermind's and geth's deleted accounts).
+    self_destruct_tx: u32 = 0,
 
     /// Whether the account counts as "empty/non-existent" for the given fork:
     /// EIP-161 empty from Spurious Dragon, otherwise absent from the state.
@@ -783,6 +786,8 @@ pub const State = struct {
         target_empty: bool,
         target_cold: bool,
         previously_destroyed: bool,
+        /// Whether the account is destroyed (before Cancun, or created in the transaction).
+        destroys: bool,
         /// The target's access (`unsee` it when the instruction then fails).
         target_access: Access,
     };
@@ -804,9 +809,10 @@ pub const State = struct {
             .target_empty = target_account.is_empty_for(fork),
             .target_cold = target_access.is_cold,
             .previously_destroyed = account.self_destructed,
+            .destroys = fork.before(.cancun) or account.created_tx == state.tx_id,
             .target_access = target_access,
         };
-        const destroys = fork.before(.cancun) or account.created_tx == state.tx_id;
+        const destroys = result.destroys;
         if (account != target_account) {
             try state.touch(target_account);
             try state.set_balance(target_account, target_account.info.balance + balance);

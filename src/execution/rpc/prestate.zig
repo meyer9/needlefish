@@ -65,7 +65,8 @@ pub const AccountEntry = struct {
     post: Info,
     /// Created by CREATE in the transaction (revm `is_created`).
     created: bool = false,
-    /// Destroyed by SELFDESTRUCT in the transaction (revm `is_selfdestructed`).
+    /// Destroyed by a SELFDESTRUCT that ran in the transaction, even in a frame that then
+    /// reverted (Nethermind's and geth's deleted accounts).
     destroyed: bool = false,
 };
 
@@ -201,7 +202,7 @@ pub const Collected = struct {
                 .pre = pre,
                 .post = post,
                 .created = account.created_tx == tx_id,
-                .destroyed = account.destroyed_tx == tx_id,
+                .destroyed = account.self_destruct_tx == tx_id,
             };
             collected.account_count += 1;
         }
