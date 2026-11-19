@@ -20,7 +20,8 @@
 //! with a valid signature is looked up, its authorization valid or not, and so is the
 //! block's beneficiary for every transaction (deposits included), and so is an account an
 //! instruction names but does not load because it fails first (`State.named`). A slot first
-//! read by an SSTORE that then runs out of gas is left out (`State.unstamp_slot`).
+//! read by an SSTORE that then runs out of gas is left out (`State.unstamp_slot`). A diff's
+//! `post` gives an account missing after the transaction a zero `codeHash`.
 
 const std = @import("std");
 const assert = std.debug.assert;
@@ -51,6 +52,11 @@ pub const Info = struct {
         return info.balance == 0 and info.nonce == 0 and no_code;
     }
 };
+
+/// The `post` code hash of an account missing after the transaction: Nethermind (as geth)
+/// reads a zero hash for it, so a diff lists every account the transaction looked up that
+/// does not exist afterwards (a precompile it called, say) with `codeHash` zero in `post`.
+const missing_code_hash: Hash = @splat(0);
 
 pub const AccountEntry = struct {
     address: Address,
@@ -188,10 +194,12 @@ pub const Collected = struct {
                 return;
             }
             const pre = collected.pre_of(state, account.address);
+            var post = collected.info_of(state, account.info, &pre);
+            if (!account.in_database) post.code_hash = missing_code_hash;
             collected.accounts[collected.account_count] = .{
                 .address = account.address,
                 .pre = pre,
-                .post = collected.info_of(state, account.info, &pre),
+                .post = post,
                 .created = account.created_tx == tx_id,
                 .destroyed = account.destroyed_tx == tx_id,
             };
@@ -250,10 +258,17 @@ pub const Collected = struct {
             return null;
         }
         const pre = collected.pre_of(state, address);
-        const post = if (state.accounts.get(address)) |account|
-            collected.info_of(state, account.info, &pre)
-        else
-            pre;
+        var post = pre;
+        if (state.accounts.get(address)) |account| {
+            post = collected.info_of(state, account.info, &pre);
+            if (!account.in_database) post.code_hash = missing_code_hash;
+        } else {
+            const found = state.database.basic(address) catch blk: {
+                collected.failed = true;
+                break :blk null;
+            };
+            if (found == null) post.code_hash = missing_code_hash;
+        }
         const count = collected.account_count;
         std.mem.copyBackwards(
             AccountEntry,

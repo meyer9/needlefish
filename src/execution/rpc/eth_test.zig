@@ -3022,6 +3022,25 @@ test "eth: prestateTracer reports revm's loaded accounts as revm-inspectors does
         "\"0x7dc6c0165f09500b75146b66eec05a39dbbc40d2\":{\"nonce\":1}}}", created);
 }
 
+test "eth: prestateTracer diff lists a looked-up missing account with a zero code hash" {
+    const h = try Harness.create();
+    defer h.destroy();
+    // The identity precompile has no account. Nethermind (as geth) reads a zero code hash
+    // for an account missing after the transaction, which differs from the empty-code
+    // hash it assumes before: the diff's post lists it, its pre does not.
+    const call = "[{\"from\":\"0x7e5f4552091a69125d5dfcb7b8c2659029395bdf\",\"to\":" ++
+        "\"0x0000000000000000000000000000000000000004\"},\"latest\",{\"tracer\":" ++
+        "\"prestateTracer\"";
+    const diff_config = ",\"tracerConfig\":{\"diffMode\":true}}]";
+    const diff = try h.request("debug_traceCall", call ++ diff_config);
+    const post = diff[std.mem.indexOf(u8, diff, "\"post\"").?..];
+    const identity = "\"0x0000000000000000000000000000000000000004\":";
+    try expect_contains(post, identity ++ "{\"codeHash\":\"0x" ++ zeros_62 ++ "00\"}");
+    try testing.expectEqual(@as(usize, 1), count_of(diff, identity));
+    const plain = try h.request("debug_traceCall", call ++ "}]");
+    try testing.expect(std.mem.indexOf(u8, plain, identity) == null);
+}
+
 /// keccak256(0x00), the code hash of the one-byte code `0x00`.
 const code_hash_00 = "\"0xbc36789e7a1e281436464229828f817d6612f7b477d66591ff96a9e064bcc98a\"";
 
