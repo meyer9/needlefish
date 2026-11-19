@@ -89,6 +89,8 @@ pub const Error = error{
     OutOfMemory,
     /// `trie` mode: an `address`, `slotKey` or `slotKeys` entry does not hash to its key.
     PreimageMismatch,
+    /// `trie` mode: an account op's `code` does not hash to its `codeHash`.
+    CodeMismatch,
 };
 
 /// Parses a request line. The result borrows `line` and `arena`.

@@ -100,4 +100,5 @@ test {
     _ = @import("coverage.zig");
     _ = @import("system_config.zig");
     _ = @import("trie_test.zig");
+    _ = @import("trie_hooks_test.zig");
 }

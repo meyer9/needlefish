@@ -262,10 +262,13 @@ pub const HashedAccountWrite = struct { key: Hash, info: ?AccountInfo };
 pub const HashedSlotWrite = struct { key: Hash, slot: Hash, value: u256 };
 
 /// A block's writes in hashed key space, as post-block values: `accounts` ascending by key,
-/// `slots` by key then slot, no key (or key and slot) twice.
+/// `slots` by key then slot, no key (or key and slot) twice. `codes`: the codes the block
+/// deploys (an evm block's `insert_code`s), each nonempty; `build_hashed_changeset` does not
+/// read them (`StateDb.commit_hashed` lists them).
 pub const HashedWrites = struct {
     accounts: []const HashedAccountWrite,
     slots: []const HashedSlotWrite,
+    codes: []const []const u8 = &.{},
 };
 
 /// The hashed-key counterpart of `Overlay.build_changeset`: fills `changeset` (a hashed

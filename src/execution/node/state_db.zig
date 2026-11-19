@@ -223,9 +223,42 @@ pub const StateDb = struct {
         if (db.state.disk == null) return error.Unsupported;
         const reader: HashedReader = .{ .state = db.state };
         try db_module.overlay.build_hashed_changeset(reader, writes, &db.changeset);
+        try db.add_hashed_codes(writes.codes);
         try db.state.apply(&db.changeset);
         db.undo_push();
         assert(db.changeset.hashed);
+    }
+
+    /// Lists the block's codes in its changeset as `Overlay.build_changeset` does for an evm
+    /// block (which `State.apply` then stores): every code the state does not know, and a
+    /// code the arena holds without a journal entry that an account change sets
+    /// (`add_set_codes`). Each code once.
+    fn add_hashed_codes(db: *StateDb, codes: []const []const u8) Error!void {
+        const changeset = &db.changeset;
+        for (codes, 0..) |bytes, index| {
+            assert(bytes.len > 0);
+            const hash = keccak256(bytes);
+            const listed = for (codes[0..index]) |earlier| {
+                if (std.mem.eql(u8, earlier, bytes)) break true;
+            } else false;
+            if (listed) continue;
+            if (db.state.code_known(hash)) {
+                if (db.state.code_in_arena(hash) == null) continue;
+                if (!sets_code(changeset, &hash)) continue;
+            }
+            try changeset.add_code(bytes);
+        }
+        assert(changeset.codes_len <= codes.len);
+    }
+
+    fn sets_code(changeset: *const db_module.Changeset, hash: *const Hash) bool {
+        for (changeset.account_changes()) |*change| {
+            const new = change.new orelse continue;
+            if (!std.mem.eql(u8, &new.code_hash, hash)) continue;
+            const old = change.old orelse return true;
+            if (!std.mem.eql(u8, &old.code_hash, hash)) return true;
+        }
+        return false;
     }
 
     /// Disk-mode reads by trie key, for `build_hashed_changeset`.

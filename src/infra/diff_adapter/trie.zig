@@ -18,10 +18,23 @@
 //! over another database, restarted after every block, cleanly and as a crash in turn, and
 //! read after the restart), `disk-deep` (the primary's path over `config_disk_deep`, each
 //! block committed as blocks of 8 + 8 writes, so the flat trees merge into level 2; unwinds
-//! as revert and ops), and on requests whose every key carries its preimages, `node-address`:
-//! the durable node's in-memory state keyed by address (`Overlay`, `execute_and_commit`,
-//! `proof_at`) in another database in `trie.dir`. A variant that fails reports the error on
-//! that block and every later one.
+//! as revert and ops), `disk-view-history` (the primary's path over another `config_disk_small`
+//! database with el-run's archive capture, `trie_history.zig`: after the last block, every
+//! canonical block is read again through a history view of it, `DiskState.view_begin`; the
+//! other blocks report their number only), and on requests whose every key carries its
+//! preimages, `node-address` (the durable node's in-memory state keyed by address: `Overlay`,
+//! `execute_and_commit`, `proof_at`) and `memory-history` (the same with `base node
+//! --proofs-history`'s window: after the last block the database restarts, which rebuilds the
+//! window, and every canonical block in it is proven again by `proof_at` and `proofs_at` at
+//! its number; the other blocks report their number only). Each in another database in
+//! `trie.dir`. A variant that fails reports the error on that block and every later one.
+//!
+//! On requests with preimages, every disk-mode database also answers each proof target by
+//! address, as el-run's RPC does (`proof_at` at the head, eth_getProof; `State.basic` and
+//! `State.storage`, eth_getBalance and eth_getStorageAt); a disagreement with the hashed
+//! answer is that block's `error` (its fields still reported). A proof whose account exists
+//! reports its code (`code`) when the database holds it (`State.code_by_hash`, read from the
+//! code tables), as eth_getCode.
 
 const std = @import("std");
 const assert = std.debug.assert;
@@ -31,10 +44,12 @@ const trie_request = @import("trie_request.zig");
 const trie_model = @import("trie_model.zig");
 const trie_node = @import("trie_node.zig");
 const trie_variants = @import("trie_variants.zig");
+const Archive = @import("trie_history.zig").Archive;
 const response = @import("response.zig");
 const Coverage = @import("coverage.zig").Coverage;
 
 const Hash = [32]u8;
+const empty_root = @import("../../execution/trie/root.zig").empty_root;
 const Writer = std.Io.Writer;
 const Case = trie_request.Case;
 const Block = trie_request.Block;
@@ -51,6 +66,8 @@ pub const ProofResult = struct {
     account: ?AccountState,
     account_proof: []const []const u8,
     storage: []SlotProof,
+    /// The account's code, when it exists and the database holds the code.
+    code: ?[]const u8 = null,
 };
 
 /// One block's result; a variant fills what it computes, or `error_text`.
@@ -73,7 +90,9 @@ const variant_names = [_][]const u8{
     "disk-small",
     "disk-small-reopen",
     "disk-deep",
+    "disk-view-history",
     "node-address",
+    "memory-history",
 };
 const VariantId = enum(u8) {
     sparse,
@@ -82,8 +101,15 @@ const VariantId = enum(u8) {
     disk_small,
     disk_small_reopen,
     disk_deep,
+    disk_view_history,
     node_address,
+    memory_history,
 };
+
+/// Variants keyed by address: on requests with preimages only.
+fn address_keyed(id: VariantId) bool {
+    return id == .node_address or id == .memory_history;
+}
 
 /// The variants over another disk-mode database in `trie.dir`, each the primary's path.
 const DiskSpec = struct { id: VariantId, mode: trie_node.Mode, file: []const u8 };
@@ -92,7 +118,12 @@ const disk_specs = [_]DiskSpec{
     .{ .id = .disk_small_reopen, .mode = .disk_small, .file = "disk-small-reopen.db" },
     .{ .id = .disk_deep, .mode = .disk_deep, .file = "disk-deep.db" },
 };
-const db_files = [_][]const u8{ "primary.db", "node-address.db" } ++ blk: {
+const db_files = [_][]const u8{
+    "primary.db",
+    "node-address.db",
+    "disk-view-history.db",
+    "memory-history.db",
+} ++ blk: {
     var files: [disk_specs.len][]const u8 = undefined;
     for (disk_specs, &files) |spec, *file| file.* = spec.file;
     break :blk files;
@@ -116,6 +147,12 @@ const Run = struct {
     primary_heights: [trie_node.blocks_max + 1]u64 = undefined,
     address_node: ?*Node = null,
     address_heights: [trie_node.blocks_max + 1]u64 = undefined,
+    /// `disk-view-history`: its database, archive, and the state root of each of its blocks.
+    view: Disk = .{},
+    view_roots: [trie_node.blocks_max + 1]Hash = undefined,
+    archive: ?Archive = null,
+    /// `memory-history`.
+    history: Disk = .{},
     disks: [disk_specs.len]Disk = @splat(.{}),
     sparse: ?*trie_variants.Sparse = null,
     state_trie: ?trie_variants.StateTrieVariant = null,
@@ -148,6 +185,9 @@ pub fn run(
     state.primary_heights[0] = 0;
     state.address_heights[0] = 0;
     for (&state.disks) |*disk| disk.heights[0] = 0;
+    state.view.heights[0] = 0;
+    state.history.heights[0] = 0;
+    state.view_roots[0] = empty_root;
     for (&state.variants) |*blocks| blocks.* = try arena.alloc(BlockResult, case.blocks.len);
     try start_variants(&state, address_path);
     defer stop_variants(&state);
@@ -155,10 +195,12 @@ pub fn run(
     for (case.blocks, blocks, 0..) |*block, *result, index| {
         result.* = try run_block(&state, block, index);
     }
+    finish_views(&state);
+    finish_history(&state);
     var variants: std.ArrayList(Variant) = .empty;
     for (variant_names, state.variants, 0..) |name, results, index| {
         const id: VariantId = @fromBackingInt(@intCast(index));
-        if (id == .node_address and !case.preimages) continue;
+        if (address_keyed(id) and !case.preimages) continue;
         try variants.append(arena, .{ .name = name, .blocks = results });
     }
     return .{ .blocks = blocks, .variants = variants.items };
@@ -175,20 +217,39 @@ fn start_variants(state: *Run, address_path: []const u8) error{OutOfMemory}!void
         break :blk null;
     };
     for (disk_specs, &state.disks) |spec, *disk| {
-        const path = try std.fs.path.join(state.arena, &.{ state.case.dir, spec.file });
-        disk.node = Node.create(allocator, spec.mode, path) catch |err| blk: {
-            state.failed[@backingInt(spec.id)] = @errorName(err);
-            break :blk null;
-        };
+        disk.node = try create_node(state, spec.id, spec.mode, spec.file);
+    }
+    state.view.node = try create_node(state, .disk_view_history, .disk_small, db_files[2]);
+    if (state.view.node) |node| {
+        state.archive = try Archive.init(state.arena, allocator);
+        try node.capture_enable();
     }
     if (!state.case.preimages) return;
     state.address_node = Node.create(allocator, .memory, address_path) catch |err| blk: {
         state.failed[@backingInt(VariantId.node_address)] = @errorName(err);
         break :blk null;
     };
+    state.history.node = try create_node(state, .memory_history, .memory_history, db_files[3]);
+}
+
+/// A variant's database in `trie.dir`, or null with the variant failed.
+fn create_node(
+    state: *Run,
+    id: VariantId,
+    mode: trie_node.Mode,
+    file: []const u8,
+) error{OutOfMemory}!?*Node {
+    const path = try std.fs.path.join(state.arena, &.{ state.case.dir, file });
+    return Node.create(state.allocator, mode, path) catch |err| {
+        state.failed[@backingInt(id)] = @errorName(err);
+        return null;
+    };
 }
 
 fn stop_variants(state: *Run) void {
+    if (state.history.node) |node| node.destroy();
+    if (state.archive) |*archive| archive.deinit(state.allocator);
+    if (state.view.node) |node| node.destroy();
     if (state.address_node) |node| node.destroy();
     for (&state.disks) |*disk| if (disk.node) |node| node.destroy();
     if (state.state_trie) |*variant| variant.deinit(state.allocator);
@@ -221,8 +282,10 @@ fn run_block(state: *Run, block: *const Block, index: usize) !BlockResult {
     try state.model.apply(block.ops, &touched_ops);
     for (touched_ops.accounts.keys()) |key| try touched_all.accounts.put(state.arena, key, {});
     for (touched_ops.slots.keys()) |ref| try touched_all.slots.put(state.arena, ref, {});
-    const writes_native = try state.model.writes(&touched_ops);
-    const writes_all = try state.model.writes(&touched_all);
+    var writes_native = try state.model.writes(&touched_ops);
+    var writes_all = try state.model.writes(&touched_all);
+    writes_native.codes = try block_codes(state.arena, &.{block.ops});
+    writes_all.codes = try block_codes(state.arena, &.{ block.revert, block.ops });
     const named = try named_keys(state.arena, block);
     var result: BlockResult = .{ .number = block.number };
     // The primary.
@@ -233,12 +296,28 @@ fn run_block(state: *Run, block: *const Block, index: usize) !BlockResult {
     result.state_root = node.state_root();
     result.storage_roots = try node_storage_roots(state, node, named);
     result.proofs = try node_proofs(state, node, block);
+    result.error_text = try read_check(state, node, block, result.proofs.?);
     state.height = parent + 1;
     run_variants(state, block, index, parent, named, .{
         .native = writes_native,
         .all = writes_all,
     });
     return result;
+}
+
+/// The codes the account ops of `lists` carry, each once (an evm block's deployed codes).
+fn block_codes(arena: std.mem.Allocator, lists: []const []const Op) ![]const []const u8 {
+    var codes: std.ArrayList([]const u8) = .empty;
+    for (lists) |ops| {
+        for (ops) |*op| {
+            const code = op.code orelse continue;
+            const listed = for (codes.items) |item| {
+                if (std.mem.eql(u8, item, code)) break true;
+            } else false;
+            if (!listed) try codes.append(arena, code);
+        }
+    }
+    return codes.items;
 }
 
 /// Every key an op of the block (its revert too) names, once, ascending.
@@ -258,7 +337,7 @@ fn hash_less_than(_: void, a: Hash, b: Hash) bool {
 
 /// A disk-mode node's storage roots of `named`, from its account records.
 fn node_storage_roots(state: *Run, node: *Node, named: []const Hash) ![]const StorageRoot {
-    assert(node.mode != .memory);
+    assert(!node.in_memory());
     var roots: std.ArrayList(StorageRoot) = .empty;
     for (named) |*key| {
         const record = node.db.state.account_hashed(key) orelse continue;
@@ -269,7 +348,7 @@ fn node_storage_roots(state: *Run, node: *Node, named: []const Hash) ![]const St
 
 /// A disk-mode node's proofs of the block's targets (`Database.proof_hashed`).
 fn node_proofs(state: *Run, node: *Node, block: *const Block) ![]const ProofResult {
-    assert(node.mode != .memory);
+    assert(!node.in_memory());
     const proofs = try state.arena.alloc(ProofResult, block.proofs.len);
     const account_proof = try state.allocator.create(trie_node.AccountProof);
     defer state.allocator.destroy(account_proof);
@@ -290,8 +369,68 @@ fn node_proofs(state: *Run, node: *Node, block: *const Block) ![]const ProofResu
         );
         out.* = try proof_result(state.arena, target, account, account_proof, storage_proofs);
         for (out.storage, values[0..count]) |*slot, value| slot.value = value;
+        out.code = try code_of(state.arena, node, account);
     }
+    // As el-run's RPC after a request: the codes read from tables are released.
+    node.db.codes_release();
     return proofs;
+}
+
+/// The code of `account` from the database (eth_getCode), copied; null when it has none.
+fn code_of(arena: std.mem.Allocator, node: *Node, account: ?AccountState) !?[]const u8 {
+    const found = account orelse return null;
+    const code = node.db.state.code_by_hash(found.code_hash) orelse return null;
+    return try arena.dupe(u8, code);
+}
+
+/// On requests with preimages: every proof target of the block again by address, as
+/// el-run's RPC answers it (`proof_at` at the head, eth_getProof; `State.basic` and
+/// `State.storage`, eth_getBalance and eth_getStorageAt), against `proofs`. The first
+/// disagreement's description, or null.
+fn read_check(
+    state: *Run,
+    node: *Node,
+    block: *const Block,
+    proofs: []const ProofResult,
+) !?[]const u8 {
+    if (!state.case.preimages) return null;
+    assert(!node.in_memory());
+    const by_address = try address_proofs(state, node, block, node.db.head_info.number);
+    for (block.proofs, proofs, by_address) |*target, *hashed, *addressed| {
+        if (!proofs_equal(hashed, addressed)) return "proof_at disagrees with proof_hashed";
+        const address = target.address.?;
+        const info = node.db.state.basic(address);
+        const account = hashed.account;
+        if ((info == null) != (account == null)) return "State.basic disagrees with the proof";
+        if (info) |found| {
+            const same = found.nonce == account.?.nonce and found.balance == account.?.balance and
+                std.mem.eql(u8, &found.code_hash, &account.?.code_hash);
+            if (!same) return "State.basic disagrees with the proof";
+        }
+        for (target.slot_keys.?, hashed.storage) |*slot_key, *slot| {
+            const word = node.db.state.storage(address, std.mem.readInt(u256, slot_key, .big));
+            if (word != slot.value) return "State.storage disagrees with the proof";
+        }
+    }
+    return null;
+}
+
+fn proofs_equal(a: *const ProofResult, b: *const ProofResult) bool {
+    if (!std.meta.eql(a.account, b.account)) return false;
+    if (!nodes_equal(a.account_proof, b.account_proof)) return false;
+    if (a.storage.len != b.storage.len) return false;
+    for (a.storage, b.storage) |*x, *y| {
+        if (x.value != y.value or !nodes_equal(x.proof, y.proof)) return false;
+    }
+    const code_a = a.code orelse &.{};
+    const code_b = b.code orelse &.{};
+    return (a.code == null) == (b.code == null) and std.mem.eql(u8, code_a, code_b);
+}
+
+fn nodes_equal(a: []const []const u8, b: []const []const u8) bool {
+    if (a.len != b.len) return false;
+    for (a, b) |x, y| if (!std.mem.eql(u8, x, y)) return false;
+    return true;
 }
 
 /// Copies a proof out of the trie's proof buffers (values are filled by the caller).
@@ -349,7 +488,9 @@ fn run_variants(
                 .named = named,
                 .writes = writes,
             }),
+            .disk_view_history => view_block(state, parent, writes),
             .node_address => address_block(state, block, parent, named),
+            .memory_history => history_block(state, block, parent),
         };
         results[index] = outcome catch |err| {
             const text = @errorName(err);
@@ -393,12 +534,184 @@ fn disk_block(state: *Run, id: VariantId, block: *const Block, at: DiskBlock) an
         node = try node.reopen(crash_ticks);
         disk.node = node;
     }
+    const proofs = try node_proofs(state, node, block);
     return .{
         .number = 0,
         .state_root = node.state_root(),
         .storage_roots = try node_storage_roots(state, node, at.named),
-        .proofs = try node_proofs(state, node, block),
+        .proofs = proofs,
+        .error_text = try read_check(state, node, block, proofs),
     };
+}
+
+/// `disk-view-history` during the blocks: the primary's path (its own native unwinds), each
+/// block taken into the archive; it answers after the last block (`finish_views`).
+fn view_block(state: *Run, parent: u64, writes: BlockWrites) anyerror!BlockResult {
+    const node = state.view.node orelse return error.Unavailable;
+    const archive = &state.archive.?;
+    const native = try node.unwind_to(state.view.heights[@intCast(parent)]);
+    if (native) archive.truncate(node.height);
+    try node.commit_hashed(if (native) writes.native else writes.all);
+    try archive.take(node);
+    state.view.heights[@intCast(parent + 1)] = node.height;
+    state.view_roots[@intCast(node.height)] = node.state_root();
+    return .{ .number = 0 };
+}
+
+/// Whether block `index` is on the chain the request ends with: no later block replaces it
+/// (an unwind to below it).
+fn canonical(blocks: []const Block, index: usize) bool {
+    for (blocks[index + 1 ..]) |*later| {
+        if (later.number <= blocks[index].number) return false;
+    }
+    return true;
+}
+
+/// `disk-view-history` after the last block: every canonical block read again through a
+/// history view of it (el-run's archive `view_begin`), over the head's trees and the archive.
+fn finish_views(state: *Run) void {
+    const id = @backingInt(VariantId.disk_view_history);
+    if (state.failed[id] != null) return;
+    for (state.case.blocks, state.variants[id], 0..) |*block, *result, index| {
+        if (!canonical(state.case.blocks, index)) continue;
+        result.* = view_answer(state, block) catch |err| .{
+            .number = block.number,
+            .error_text = @errorName(err),
+        };
+    }
+}
+
+fn view_answer(state: *Run, block: *const Block) !BlockResult {
+    const node = state.view.node.?;
+    const archive = &state.archive.?;
+    const height = state.view.heights[@intCast(block.number)];
+    const root = state.view_roots[@intCast(height)];
+    archive.view_height = height;
+    const disk = &node.db.disk.?;
+    disk.view_begin(root, archive.overlay());
+    defer disk.view_end();
+    const named = try named_keys(state.arena, block);
+    const proofs = try node_proofs(state, node, block);
+    return .{
+        .number = block.number,
+        .state_root = root,
+        .storage_roots = try node_storage_roots(state, node, named),
+        .proofs = proofs,
+        .error_text = try read_check(state, node, block, proofs),
+    };
+}
+
+/// `memory-history` during the blocks: `node-address`'s path with a history window; it
+/// answers after the last block (`finish_history`).
+fn history_block(state: *Run, block: *const Block, parent: u64) anyerror!BlockResult {
+    const node = state.history.node orelse return error.Unavailable;
+    const native = try node.unwind_to(state.history.heights[@intCast(parent)]);
+    if (!native) try overlay_ops(node, block.revert);
+    try overlay_ops(node, block.ops);
+    try node.commit_overlay();
+    state.history.heights[@intCast(parent + 1)] = node.height;
+    return .{ .number = 0 };
+}
+
+/// `memory-history` after the last block: the database restarts (a clean shutdown and open,
+/// which rebuilds the window: `history_rebuild_window`), then every canonical block still in
+/// the window is proven at its number from history (`proof_at`, checked against
+/// `proofs_at`), its storage roots read from history (`account_at`). An open checks that
+/// every account's code is stored (`snapshot.verify`): when the request set a code hash
+/// without its code (a state no node holds) the window is read without the restart.
+fn finish_history(state: *Run) void {
+    const id = @backingInt(VariantId.memory_history);
+    if (!state.case.preimages or state.failed[id] != null) return;
+    const results = state.variants[id];
+    if (codes_stored(&state.history.node.?.db.state)) {
+        const node = state.history.node.?;
+        state.history.node = null; // Gone even when the reopen fails.
+        state.history.node = node.reopen(null) catch |err| {
+            for (results) |*result| result.error_text = @errorName(err);
+            return;
+        };
+    }
+    for (state.case.blocks, results, 0..) |*block, *result, index| {
+        if (!canonical(state.case.blocks, index)) continue;
+        const answer = history_answer(state, block) catch |err| {
+            result.error_text = @errorName(err);
+            continue;
+        };
+        if (answer) |found| result.* = found;
+    }
+}
+
+/// Whether every account of the in-memory state has its code stored.
+fn codes_stored(memory_state: *const db.State) bool {
+    var accounts = memory_state.account_table.iterator();
+    while (accounts.next()) |entry| {
+        if (!memory_state.code_known(entry.value_ptr.info.code_hash)) return false;
+    }
+    return true;
+}
+
+/// Block `block` from the history window; null when it is no longer in it.
+fn history_answer(state: *Run, block: *const Block) !?BlockResult {
+    const node = state.history.node.?;
+    const number = state.history.heights[@intCast(block.number)];
+    const store = node.db.history_reader() orelse return error.HistoryUnavailable;
+    const root = store.state_root_at(number) catch |err| switch (err) {
+        error.BlockOutOfWindow => return null,
+        else => return err,
+    };
+    const proofs = try address_proofs(state, node, block, number);
+    var roots: std.ArrayList(StorageRoot) = .empty;
+    for (try named_keys(state.arena, block)) |*key| {
+        const account = try store.account_at(number, key) orelse continue;
+        try roots.append(state.arena, .{ .key = key.*, .root = account.storage_root });
+    }
+    return .{
+        .number = block.number,
+        .state_root = root,
+        .storage_roots = roots.items,
+        .proofs = proofs,
+        .error_text = try proofs_at_check(state, node, block, number, proofs),
+    };
+}
+
+/// Every proof target of the block again in one storage walk (`proofs_at`, eth_getProof's
+/// many-slot path), against `proofs`. The first disagreement's description, or null.
+fn proofs_at_check(
+    state: *Run,
+    node: *Node,
+    block: *const Block,
+    number: u64,
+    proofs: []const ProofResult,
+) !?[]const u8 {
+    const allocator = state.allocator;
+    var set = try db.history.ProofSet.init(allocator, trie_request.proof_slots_max);
+    defer set.deinit(allocator);
+    const account_proof = try allocator.create(trie_node.AccountProof);
+    defer allocator.destroy(account_proof);
+    const storage_proof = try allocator.create(trie_node.StorageProof);
+    defer allocator.destroy(storage_proof);
+    var slots: [trie_request.proof_slots_max]u256 = undefined;
+    for (block.proofs, proofs) |*target, *single| {
+        const count = target.slots.len;
+        for (target.slot_keys.?, slots[0..count]) |*key, *slot| {
+            slot.* = std.mem.readInt(u256, key, .big);
+        }
+        const address = target.address.?;
+        const words = slots[0..count];
+        const account = try node.db.proofs_at(number, address, words, account_proof, &set);
+        if (!std.meta.eql(account, single.account)) return "proofs_at disagrees with proof_at";
+        const nodes = try nodes_of(state.arena, account_proof);
+        if (!nodes_equal(nodes, single.account_proof)) return "proofs_at disagrees with proof_at";
+        for (single.storage, 0..) |*slot, index| {
+            set.fill(@intCast(index), storage_proof);
+            const slot_nodes = try nodes_of(state.arena, storage_proof);
+            const value = set.value(@intCast(index));
+            if (value != slot.value or !nodes_equal(slot_nodes, slot.proof)) {
+                return "proofs_at disagrees with proof_at";
+            }
+        }
+    }
+    return null;
 }
 
 fn sparse_block(
@@ -496,7 +809,7 @@ fn address_block(
         try roots.append(state.arena, .{ .key = key.*, .root = root });
     }
     result.storage_roots = roots.items;
-    result.proofs = try address_proofs(state, node, block);
+    result.proofs = try address_proofs(state, node, block, node.db.head_info.number);
     return result;
 }
 
@@ -505,7 +818,11 @@ fn overlay_ops(node: *Node, ops: []const Op) anyerror!void {
     for (ops) |*op| {
         const address = op.address.?;
         switch (op.kind) {
-            .account => try overlay.set_account(address, op.info),
+            .account => {
+                // An evm block stores the code it deploys (`Overlay.insert_code`).
+                if (op.code) |code| _ = try overlay.insert_code(code);
+                try overlay.set_account(address, op.info);
+            },
             .storage => {
                 const slot = std.mem.readInt(u256, &op.slot_key.?, .big);
                 try overlay.set_storage(address, slot, op.value);
@@ -524,7 +841,13 @@ fn address_of(block: *const Block, key: *const Hash) ?[20]u8 {
     return null;
 }
 
-fn address_proofs(state: *Run, node: *Node, block: *const Block) anyerror![]const ProofResult {
+/// Proofs of the block's targets by address and slot key at block `number` (`proof_at`).
+fn address_proofs(
+    state: *Run,
+    node: *Node,
+    block: *const Block,
+    number: u64,
+) ![]const ProofResult {
     const proofs = try state.arena.alloc(ProofResult, block.proofs.len);
     const account_proof = try state.allocator.create(trie_node.AccountProof);
     defer state.allocator.destroy(account_proof);
@@ -541,7 +864,7 @@ fn address_proofs(state: *Run, node: *Node, block: *const Block) anyerror![]cons
             slot.* = std.mem.readInt(u256, key, .big);
         }
         const account = try node.db.proof_at(
-            node.db.head_info.number,
+            number,
             target.address.?,
             slots[0..count],
             account_proof,
@@ -550,7 +873,9 @@ fn address_proofs(state: *Run, node: *Node, block: *const Block) anyerror![]cons
         );
         out.* = try proof_result(state.arena, target, account, account_proof, storage_proofs);
         for (out.storage, values[0..count]) |*slot, value| slot.value = value;
+        out.code = try code_of(state.arena, node, account);
     }
+    node.db.codes_release();
     return proofs;
 }
 
@@ -591,7 +916,6 @@ fn write_block(out: *Writer, result: *const BlockResult) Writer.Error!void {
     if (result.error_text) |text| {
         try out.writeAll(",\"error\":");
         try std.json.Stringify.encodeJsonString(text, .{}, out);
-        return out.writeAll("}");
     }
     if (result.state_root) |root| {
         try out.writeAll(",\"stateRoot\":");
@@ -633,6 +957,10 @@ fn write_proof(out: *Writer, proof: *const ProofResult) Writer.Error!void {
         try response.data(out, &account.storage_root);
         try out.writeAll("}");
     } else try out.writeAll("null");
+    if (proof.code) |code| {
+        try out.writeAll(",\"code\":");
+        try response.data(out, code);
+    }
     try out.writeAll(",\"accountProof\":");
     try write_nodes(out, proof.account_proof);
     try out.writeAll(",\"storage\":[");

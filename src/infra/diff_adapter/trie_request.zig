@@ -4,8 +4,10 @@
 //! Keys and slots are 32-byte trie keys (already hashed). On some requests every op and
 //! proof target also carries its preimages (`address`, `slotKey`, `slotKeys`). Every
 //! preimage present must hash to its key (else the request is refused, `PreimageMismatch`);
-//! only the address-keyed variant uses them, and only when every op and target has them
-//! (`Case.preimages`).
+//! only the address-keyed variants use them, and only when every op and target has them
+//! (`Case.preimages`). An account op may carry the code it sets (`code`, hashing to its
+//! `codeHash`, else `CodeMismatch`; at most the evm's deployed code limit, EIP-170; a request
+//! at most `trie_node.request_codes_max` distinct codes of `request_code_bytes_max` bytes).
 
 const std = @import("std");
 const assert = std.debug.assert;
@@ -23,6 +25,8 @@ const Error = request.Error;
 pub const ops_max = trie_node.changeset_config.accounts_max;
 pub const proofs_max = 256;
 pub const proof_slots_max = 64;
+/// The evm's deployed code limit (EIP-170): the longest code a block can store.
+pub const code_size_max = 24_576;
 
 pub const RawOp = struct {
     op: []const u8 = "",
@@ -34,6 +38,7 @@ pub const RawOp = struct {
     value: ?[]const u8 = null,
     address: ?[]const u8 = null,
     slotKey: ?[]const u8 = null,
+    code: ?[]const u8 = null,
 };
 
 pub const RawProof = struct {
@@ -69,6 +74,8 @@ pub const Op = struct {
     /// Preimages, when the request carries them.
     address: ?Address = null,
     slot_key: ?Hash = null,
+    /// `account`: the code it sets, when the request carries it (nonempty).
+    code: ?[]const u8 = null,
 };
 
 pub const Proof = struct {
@@ -107,6 +114,7 @@ pub fn decode(arena: std.mem.Allocator, raw: *const RawTrie) Error!Case {
         applied = applied - block.unwind + 1;
     }
     var case: Case = .{ .dir = dir, .blocks = blocks, .preimages = false };
+    try check_codes(arena, &case);
     case.preimages = try check_preimages(&case);
     assert(case.blocks.len == raw.blocks.len);
     return case;
@@ -132,11 +140,11 @@ fn decode_block(arena: std.mem.Allocator, raw: *const RawBlock) Error!Block {
 
 fn decode_ops(arena: std.mem.Allocator, raws: []const RawOp) Error![]const Op {
     const ops = try arena.alloc(Op, raws.len);
-    for (raws, ops) |*raw, *op| op.* = try decode_op(raw);
+    for (raws, ops) |*raw, *op| op.* = try decode_op(arena, raw);
     return ops;
 }
 
-fn decode_op(raw: *const RawOp) Error!Op {
+fn decode_op(arena: std.mem.Allocator, raw: *const RawOp) Error!Op {
     const kind = std.meta.stringToEnum(Kind, raw.op) orelse return error.InvalidField;
     var op: Op = .{ .kind = kind, .key = try request.fixed(32, required(raw.key)) };
     if (raw.address) |text| op.address = try request.fixed(20, text);
@@ -154,6 +162,13 @@ fn decode_op(raw: *const RawOp) Error!Op {
         },
         .wipe, .delete => {},
     }
+    if (kind == .account) if (raw.code) |text| {
+        const code = try request.bytes(arena, text);
+        if (code.len > code_size_max) return error.InvalidField;
+        if (!hashes_to(code, &op.info.code_hash)) return error.CodeMismatch;
+        // The empty code is no code to store (its hash is the empty code hash).
+        if (code.len > 0) op.code = code;
+    };
     return op;
 }
 
@@ -170,6 +185,24 @@ fn decode_proof(arena: std.mem.Allocator, raw: *const RawProof) Error!Proof {
         proof.slot_keys = keys;
     }
     return proof;
+}
+
+/// The request's distinct codes fit what every database keeps (`trie_node.request_codes_max`
+/// codes, `request_code_bytes_max` bytes); `InvalidField` otherwise.
+fn check_codes(arena: std.mem.Allocator, case: *const Case) Error!void {
+    var codes: std.AutoArrayHashMapUnmanaged(Hash, void) = .empty;
+    var bytes: u64 = 0;
+    for (case.blocks) |*block| {
+        for ([2][]const Op{ block.revert, block.ops }) |ops| {
+            for (ops) |*op| {
+                const code = op.code orelse continue;
+                const entry = try codes.getOrPut(arena, op.info.code_hash);
+                if (!entry.found_existing) bytes += code.len;
+            }
+        }
+    }
+    if (codes.count() > trie_node.request_codes_max) return error.InvalidField;
+    if (bytes > trie_node.request_code_bytes_max) return error.InvalidField;
 }
 
 fn required(field: ?[]const u8) Error![]const u8 {

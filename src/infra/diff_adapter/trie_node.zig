@@ -11,12 +11,20 @@
 //!   unwinds the stored changesets.
 //! - `.disk_small` (`disk-small`): the same, over `config_disk_small` (the smallest sizes the
 //!   node's code allows), so a request of tens of blocks reaches flushes, merges, checkpoints
-//!   and cache evictions; `reopen` restarts it from its file (cleanly or as a crash).
+//!   and cache evictions; `reopen` restarts it from its file (cleanly or as a crash). Its
+//!   code store rewrites its tables every few checkpoints, and it prefetches each block's
+//!   trie paths as el-run's runner does (`prefetch_paths`).
+//! - Every disk-mode database but `disk-deep` stores a block's codes (`HashedWrites.codes`)
+//!   and keeps them out of RAM once in tables (`code_store.zig` pinned mode, as el-run's).
 //! - `.disk_deep` (`disk-deep`): the same over `config_disk_deep` (entries of 8 + 8 writes, a
-//!   three-block chain); `commit_split` commits a block's writes as that many blocks.
+//!   three-block chain); `commit_split` commits a block's writes as that many blocks, without
+//!   their codes (its entries hold none).
 //! - `.memory` (`node-address`): the durable node's in-memory state (`State` tables and
 //!   `StateTrie`), keyed by address; blocks go through an `Overlay` and
 //!   `execute_and_commit`; proofs through `proof_at` at the head (eth_getProof's live path).
+//! - `.memory_history` (`memory-history`): the same with a proofs history window
+//!   (`config_memory_history`, `base node --proofs-history`): `proof_at` and `proofs_at` at
+//!   any block of the window, and `reopen` rebuilds the window (`history_unwind_to`).
 //!
 //! Every operation is driven until it is durable before the next one, so the storage
 //! engine's work is a function of the request alone.
@@ -51,7 +59,7 @@ pub const AccountProof = trie.StateTrie.AccountProof;
 pub const StorageProof = trie.StateTrie.StorageProof;
 pub const AccountState = db.history.AccountState;
 
-pub const Mode = enum { disk, disk_small, disk_deep, memory };
+pub const Mode = enum { disk, disk_small, disk_deep, memory, memory_history };
 
 /// Blocks a request may hold (the chain index by height).
 pub const blocks_max = 256;
@@ -65,20 +73,45 @@ const attempts_max = 16;
 const block_size: u32 = 4 * sector_size;
 const record_writes_max: u32 = 4096;
 
+/// A block's codes at most: the node's own per-block limits (`StateDb.Config`).
+const block_codes: state_db_module.Config = .{};
+
 pub const changeset_config: db.changeset.Config = .{
     .accounts_max = 2048,
     .storage_max = 8192,
-    .codes_max = 1,
-    .code_bytes_max = 1024,
+    .codes_max = block_codes.block_codes_max,
+    .code_bytes_max = block_codes.block_code_bytes_max,
 };
+
+/// Distinct codes a request carries at most (`trie_request.zig` refuses more): every
+/// database keeps them all, and `disk-small`'s code store, at the smallest table list these
+/// sizes allow (about nine tables), rewrites its tables every few flushes.
+pub const request_codes_max = 1024;
+pub const request_code_bytes_max = 1 << 20;
+const code_size_max = (@import("../../execution/evm/root.zig").env.Config{}).code_size_max;
+/// A block's proof targets read one code each (pinned until `codes_release` after them).
+const code_pins_max = 256;
+
+/// The code table list the node sizes for a request's codes (`to_disk.zig`: every code fits
+/// half of it).
+fn code_tables_min(size: u32) u32 {
+    return Database.CodeStore.tables_max_min(size, request_codes_max, request_code_bytes_max);
+}
 
 const engine_config: @import("../../execution/db/storage/engine.zig").Config = .{
     .journal_size_bytes = 32 << 20,
-    .checkpoint_zone_size_bytes = 1024 * block_size,
-    .entry_body_size_max = 2 << 20,
+    .checkpoint_zone_size_bytes = checkpoint_bytes,
+    .entry_body_size_max = 8 << 20,
     .checkpoint_block_size = block_size,
     .grid_block_count = 1 << 14,
 };
+
+/// A checkpoint at most: every retained block, every code no table holds, and 16 MiB.
+const checkpoint_bytes: u32 = std.mem.alignForward(
+    u32,
+    (64 << 20) + 3 * (8 << 20) + request_code_bytes_max + (16 << 20),
+    block_size,
+);
 
 const chain_config: db.chain.Config = .{
     .blocks_max = blocks_max,
@@ -94,15 +127,20 @@ pub const config_disk: database.Config = .{
     .state = .{
         .accounts_max = 4,
         .storage_slots_max = 4,
-        .codes_max = 4,
-        .code_bytes_max = 4096,
+        .codes_max = request_codes_max,
+        .code_bytes_max = request_code_bytes_max,
         .account_nodes_max = 64,
         .storage_nodes_max = 64,
     },
+    // Codes out of RAM, read from their tables (`code_store.zig` pinned mode), as el-run's.
+    .code_tables_max = @max(16, code_tables_min(block_size)),
+    .code_pin_bytes = code_pins_max * code_size_max,
+    .code_pins_max = code_pins_max,
+    .code_cache_blocks = 256,
     .chain = chain_config,
     .changeset = changeset_config,
     .queue_entries_max = 4,
-    .checkpoint_staging_bytes = 16 << 20,
+    .checkpoint_staging_bytes = checkpoint_bytes,
     .flat_trees = true,
     .flat_flush_entries_min = 4096,
     .flat_cache_blocks = 256,
@@ -137,9 +175,10 @@ const small_entry_body_bytes: u32 = blk: {
         db.changeset.encoded_length_max(changeset_config);
     break :blk @intCast(std.mem.alignForward(u64, body, sector_size));
 };
-/// A checkpoint at most: every retained block (`Database.chain_bytes_capacity`) and 16 MiB.
-const small_checkpoint_bytes: u64 =
-    @as(u64, chain_config.bytes_max) + 3 * @as(u64, small_entry_body_bytes) + (16 << 20);
+/// A checkpoint at most: every retained block (`Database.chain_bytes_capacity`), every code no
+/// table holds (with blocks of one sector most), and 16 MiB.
+const small_checkpoint_bytes: u64 = @as(u64, chain_config.bytes_max) +
+    3 * @as(u64, small_entry_body_bytes) + request_code_bytes_max + (16 << 20);
 
 pub const config_disk_small: database.Config = blk: {
     var config = config_disk;
@@ -165,10 +204,24 @@ pub const config_disk_small: database.Config = blk: {
     config.flat_branch_flush_entries_min = 1;
     config.flat_cache_blocks = table_module.BlockCache.ways;
     config.disk_state.?.record_cache_entries = record_cache.ways;
+    // Codes: every checkpoint flushes the new ones into tables, the shortest list the store
+    // allows (a rewrite of every code just fits) makes it rewrite them all every few flushes,
+    // and its cache is one set.
+    config.code_tables_max = Database.CodeStore.tables_needed(
+        small_block_size,
+        request_codes_max,
+        request_code_bytes_max,
+    );
+    config.code_flush_bytes_min = 1;
+    config.code_cache_blocks = table_module.BlockCache.ways;
+    // el-run's block prefetch (`import/run.zig` `prefetch_paths`; `to_disk.zig`'s sizes).
+    config.flat_prefetch_keys_max = 1 << 13;
+    config.flat_prefetch_reads_max = 64;
     break :blk config;
 };
 
 comptime {
+    assert(config_disk.chain_bytes_capacity() + request_code_bytes_max < checkpoint_bytes);
     assert(small_entry_body_bytes <= config_disk.engine.entry_body_size_max);
     assert(config_disk_small.engine.checkpoint_zone_size_bytes % small_block_size == 0);
     assert(config_disk_small.chain_bytes_capacity() < config_disk_small.checkpoint_staging_bytes);
@@ -222,31 +275,59 @@ comptime {
     assert(config_disk_deep.chain.canonical_max > config_disk_deep.chain.reorg_depth_max);
 }
 
+/// A memory-mode checkpoint at most: the disk mode's and the whole state (48 MiB).
+const memory_checkpoint_bytes: u32 = checkpoint_bytes + (48 << 20);
+
 /// The in-memory state of a durable node without a grid (journal and checkpoints only).
 pub const config_memory: database.Config = .{
     .engine = blk: {
         var engine = engine_config;
         engine.grid_block_count = 0;
+        engine.checkpoint_zone_size_bytes = memory_checkpoint_bytes;
         break :blk engine;
     },
     .state = .{
         .accounts_max = 1 << 14,
         .storage_slots_max = 1 << 16,
-        .codes_max = 4,
-        .code_bytes_max = 4096,
+        .codes_max = request_codes_max,
+        .code_bytes_max = request_code_bytes_max,
         .account_nodes_max = 1 << 16,
         .storage_nodes_max = 1 << 18,
     },
     .chain = chain_config,
     .changeset = changeset_config,
     .queue_entries_max = 4,
-    .checkpoint_staging_bytes = 64 << 20,
+    .checkpoint_staging_bytes = memory_checkpoint_bytes,
 };
+
+/// `memory-history`: `config_memory` with a proofs history window, as `base node
+/// --proofs-history` configures its durable database (`service.zig` `init_durable`,
+/// `history_config`): the window holds every block of a request. The node's block retention
+/// already covers it (`retain_window` changes nothing below `chain.blocks_max`).
+pub const history_window = 64;
+pub const config_memory_history: database.Config = blk: {
+    var config = config_memory;
+    // Sized for requests (thousands of writes), not for the per-block bound: a request that
+    // outgrows them drops its history (`HistoryFull`), and the variant reports blocks only.
+    config.history = .{
+        .window_blocks = history_window,
+        .paths_max = 1 << 20,
+        .small_versions_max = 1 << 20,
+        .large_versions_max = 1 << 18,
+        .prune_per_commit = 1 << 15,
+    };
+    break :blk config;
+};
+
+comptime {
+    assert(config_memory_history.history.?.window_blocks <= chain_config.canonical_max);
+    assert(history_window <= chain_config.blocks_max);
+}
 
 const overlay_config: db.overlay.Config = .{
     .accounts_max = changeset_config.accounts_max,
     .slots_max = changeset_config.storage_max,
-    .codes_max = 1,
+    .codes_max = changeset_config.codes_max,
 };
 
 pub const Error = error{ NodeFailed, Stalled } || database.OperationError ||
@@ -291,6 +372,8 @@ pub const Node = struct {
         crash_replays: u64 = 0,
         /// Database blocks committed (`commit_split` makes several per request block).
         commits: u64 = 0,
+        /// Prefetches run before a commit (`prefetch_paths`).
+        prefetches: u64 = 0,
     };
 
     fn config_of(mode: Mode) database.Config {
@@ -299,6 +382,7 @@ pub const Node = struct {
             .disk_small => config_disk_small,
             .disk_deep => config_disk_deep,
             .memory => config_memory,
+            .memory_history => config_memory_history,
         };
     }
 
@@ -378,7 +462,6 @@ pub const Node = struct {
     /// journal after it), then opens it again at the same head. Returns the reopened node;
     /// `self` is gone (on failure too).
     pub fn reopen(self: *Node, crash_ticks: ?u32) Error!*Node {
-        assert(self.mode != .memory);
         const allocator = self.allocator;
         const mode = self.mode;
         const path = self.path;
@@ -448,7 +531,8 @@ pub const Node = struct {
     }
 
     fn state_db_config(changeset: db.changeset.Config) state_db_module.Config {
-        const undo_bytes = 4 * changeset.storage_max * 128 + (1 << 20);
+        // Two largest changesets: the block's (the journal's copy) and the one before.
+        const undo_bytes: u32 = @intCast(2 * db.changeset.encoded_length_max(changeset));
         return .{
             .block_accounts_max = changeset.accounts_max,
             .block_slots_max = changeset.storage_max,
@@ -577,7 +661,7 @@ pub const Node = struct {
 
     /// Disk mode: commits the next block from its writes in hashed key space.
     pub fn commit_hashed(self: *Node, writes: HashedWrites) Error!void {
-        assert(self.mode != .memory);
+        assert(!self.in_memory());
         var attempts: u32 = 0;
         while (attempts < attempts_max) : (attempts += 1) {
             if (try self.attempt_hashed(writes)) {
@@ -673,6 +757,7 @@ pub const Node = struct {
         try self.make_room();
         self.db.hold_checkpoints(true);
         defer self.db.hold_checkpoints(false);
+        self.prefetch_paths(writes);
         self.state_db.commit_hashed(writes) catch |err| switch (err) {
             error.Busy => return false,
             else => return err,
@@ -690,6 +775,33 @@ pub const Node = struct {
         self.hash_set(self.height, input.hash);
         self.stats.commits += 1;
         return true;
+    }
+
+    /// With a prefetcher (`disk-small`): reads ahead the branch records the commit's root
+    /// update resolves, as el-run's runner does before its commit (`import/run.zig`
+    /// `prefetch_paths`): the paths of the written accounts and slots, and of the owners of
+    /// slots whose account is not written. Best effort: results never depend on it.
+    fn prefetch_paths(self: *Node, writes: HashedWrites) void {
+        const prefetch = self.db.flat.?.prefetch orelse return;
+        if (prefetch.running) return;
+        prefetch.clear();
+        for (writes.accounts) |*write| prefetch.add_path(null, &write.key);
+        var account_index: usize = 0;
+        for (writes.slots) |*write| {
+            prefetch.add_path(&write.key, &write.slot);
+            while (account_index < writes.accounts.len and
+                std.mem.order(u8, &writes.accounts[account_index].key, &write.key) == .lt)
+            {
+                account_index += 1;
+            }
+            const written = account_index < writes.accounts.len and
+                std.mem.eql(u8, &writes.accounts[account_index].key, &write.key);
+            if (!written) prefetch.add_path(null, &write.key);
+        }
+        prefetch.start(&self.db.flat.?);
+        var ticks: u32 = 0;
+        while (prefetch.running and ticks < ticks_max) : (ticks += 1) self.tick();
+        self.stats.prefetches += 1;
     }
 
     fn rollback(self: *Node) Error!void {
@@ -728,7 +840,7 @@ pub const Node = struct {
     /// Memory mode: commits the block whose writes are in `overlay` (by address), as the
     /// durable node commits an executed block (`execute_and_commit`).
     pub fn commit_overlay(self: *Node) Error!void {
-        assert(self.mode == .memory);
+        assert(self.in_memory());
         if (self.height == blocks_max) return error.NodeFailed;
         const input = self.block_input(self.hash_at(self.height), self.height + 1);
         var attempts: u32 = 0;
@@ -746,6 +858,17 @@ pub const Node = struct {
             return;
         }
         return error.Stalled;
+    }
+
+    pub fn in_memory(self: *const Node) bool {
+        return self.mode == .memory or self.mode == .memory_history;
+    }
+
+    /// Disk mode: keeps every block's pre-state account and branch records from now on
+    /// (`DiskState.capture_enable`, as el-run's archive does).
+    pub fn capture_enable(self: *Node) error{OutOfMemory}!void {
+        assert(!self.in_memory());
+        try self.db.disk.?.capture_enable(self.allocator);
     }
 
     pub fn state_root(self: *const Node) Hash {

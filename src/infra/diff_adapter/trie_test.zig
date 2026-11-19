@@ -124,17 +124,19 @@ fn expect_roots(response: Value, roots: []const []const u8) !void {
     const blocks = field(response, "blocks").array.items;
     try testing.expectEqual(roots.len, blocks.len);
     for (blocks, roots) |block, root| {
+        try expect_no_error("blocks", block);
         try testing.expectEqualStrings(root, field(block, "stateRoot").string);
     }
     var variants = field(response, "variants").object.iterator();
     var count: u32 = 0;
     while (variants.next()) |entry| : (count += 1) {
-        for (entry.value_ptr.array.items, roots) |block, root| {
-            if (block.object.get("error")) |text| {
-                std.debug.print("{s}: {s}\n", .{ entry.key_ptr.*, text.string });
-                return error.TestUnexpectedResult;
-            }
-            try testing.expectEqualStrings(root, field(block, "stateRoot").string);
+        const results = entry.value_ptr.array.items;
+        try expect_history_answers(entry.key_ptr.*, results);
+        for (results, roots) |block, root| {
+            try expect_no_error(entry.key_ptr.*, block);
+            // A history variant reports a replaced block's number only.
+            const reported = block.object.get("stateRoot") orelse continue;
+            try testing.expectEqualStrings(root, reported.string);
         }
     }
     try testing.expect(count >= 3);
@@ -295,7 +297,65 @@ test "diff trie: a preimage that does not hash to its key refuses the request" {
     }
 }
 
+test "diff trie: codes are stored and read back; a code that does not hash is refused" {
+    const harness = try Harness.create();
+    defer harness.destroy();
+    const code = "0x6001600055";
+    const code_hash = keccak256(&.{ 0x60, 0x01, 0x60, 0x00, 0x55 });
+    var line: std.Io.Writer.Allocating = .init(testing.allocator);
+    defer line.deinit();
+    const w = &line.writer;
+    const account = "{{\"op\":\"account\",\"key\":\"" ++ key_a ++ "\",\"nonce\":\"0x1\"," ++
+        "\"balance\":\"0x0\",\"codeHash\":\"0x{x}\",\"code\":\"{s}\"}}";
+    // The code in block 1; block 2 sets it on key_b without it (the database holds it).
+    try w.print("{{\"number\":\"0x1\",\"ops\":[" ++ account ++ "],\"proofs\":[{s}]}}," ++
+        "{{\"number\":\"0x2\",\"ops\":[{{\"op\":\"account\",\"key\":\"" ++ key_b ++
+        "\",\"nonce\":\"0x1\",\"balance\":\"0x0\",\"codeHash\":\"0x{x}\"}}],\"proofs\":[" ++
+        "{{\"key\":\"" ++ key_b ++ "\",\"slots\":[]}}]}}", .{
+        &code_hash, code, proof_a, &code_hash,
+    });
+    const response = try harness.request(line.written());
+    try expect_variants_agree(response);
+    const blocks = field(response, "blocks").array.items;
+    for (blocks) |block| {
+        const proof = field(block, "proofs").array.items[0];
+        try testing.expectEqualStrings(code, field(proof, "code").string);
+    }
+    // A code that does not hash to its codeHash, and one longer than the evm's limit.
+    const wrong: Hash = @splat(0x77);
+    line.clearRetainingCapacity();
+    try w.print("{{\"number\":\"0x1\",\"ops\":[" ++ account ++ "],\"proofs\":[]}}", .{
+        &wrong, code,
+    });
+    const refused = try harness.request(line.written());
+    try testing.expect(!field(refused, "ok").bool);
+    try testing.expect(std.mem.indexOf(u8, field(refused, "error").string, "CodeMismatch") != null);
+    line.clearRetainingCapacity();
+    const long = try testing.allocator.alloc(u8, 24_577);
+    defer testing.allocator.free(long);
+    @memset(long, 0x5b);
+    try w.print("{{\"number\":\"0x1\",\"ops\":[" ++ account ++ "],\"proofs\":[]}}", .{
+        &keccak256(long), try std.fmt.allocPrint(harness.arena_state.allocator(), "0x{x}", .{long}),
+    });
+    const too_long = try harness.request(line.written());
+    try testing.expect(!field(too_long, "ok").bool);
+}
+
 /// A root of `key_a` with storage and `key_b` (as `root_two`).
+fn expect_no_error(name: []const u8, block: Value) !void {
+    const text = block.object.get("error") orelse return;
+    std.debug.print("{s}: {s}\n", .{ name, text.string });
+    return error.TestUnexpectedResult;
+}
+
+/// The history variants answer at least the last block (the head is always in the window).
+fn expect_history_answers(name: []const u8, results: []const Value) !void {
+    const history = std.mem.endsWith(u8, name, "-history");
+    if (!history) return;
+    const last = results[results.len - 1];
+    if (last.object.get("stateRoot") == null) return error.TestUnexpectedResult;
+}
+
 const root_two_storage = "0x22277f4e35f680dceefaba949c8fae906faf8f1a43d22064775d865620f7d544";
 
 /// Every variant block reports the primary's state root and storage roots (where it
@@ -303,18 +363,21 @@ const root_two_storage = "0x22277f4e35f680dceefaba949c8fae906faf8f1a43d22064775d
 fn expect_variants_agree(response: Value) !void {
     try expect_ok(response);
     const blocks = field(response, "blocks").array.items;
-    for (blocks) |block| try expect_proofs_verify(block);
+    for (blocks) |block| {
+        try expect_no_error("blocks", block);
+        try expect_proofs_verify(block);
+    }
     var variants = field(response, "variants").object.iterator();
     while (variants.next()) |entry| {
         const results = entry.value_ptr.array.items;
         try testing.expectEqual(blocks.len, results.len);
+        try expect_history_answers(entry.key_ptr.*, results);
         for (blocks, results) |block, result| {
-            if (result.object.get("error")) |text| {
-                std.debug.print("{s}: {s}\n", .{ entry.key_ptr.*, text.string });
-                return error.TestUnexpectedResult;
-            }
+            try expect_no_error(entry.key_ptr.*, result);
+            // A history variant reports a replaced block's number only.
+            const reported = result.object.get("stateRoot") orelse continue;
             const want = field(block, "stateRoot").string;
-            try testing.expectEqualStrings(want, field(result, "stateRoot").string);
+            try testing.expectEqualStrings(want, reported.string);
             try expect_same_storage_roots(block, result);
             if (result.object.get("proofs")) |proofs| {
                 try expect_same_proofs(field(block, "proofs"), proofs);
@@ -345,6 +408,10 @@ fn expect_same_proofs(want: Value, got: Value) !void {
         const json_a = try std.fmt.bufPrint(&buffer_want, "{f}", .{account_a_json});
         const json_b = try std.fmt.bufPrint(&buffer_got, "{f}", .{account_b_json});
         try testing.expectEqualStrings(json_a, json_b);
+        // A variant that stores codes reports the primary's.
+        if (b.object.get("code")) |code| {
+            try testing.expectEqualStrings(field(a, "code").string, code.string);
+        }
         try expect_same_nodes(field(a, "accountProof"), field(b, "accountProof"));
         for (field(a, "storage").array.items, field(b, "storage").array.items) |x, y| {
             try testing.expectEqualStrings(field(x, "value").string, field(y, "value").string);
@@ -426,6 +493,17 @@ const FuzzAccount = struct {
 
 const FuzzState = [keys_max]?FuzzAccount;
 
+/// The fuzz's codes by number: none, one byte, longer than a disk-small code table record
+/// (it stays in the arena and the checkpoint image), and the evm's largest.
+const fuzz_codes = [_]usize{ 0, 1, 5000, 24_576 };
+var fuzz_code_bytes: [fuzz_codes.len][24_576]u8 = undefined;
+
+fn fuzz_code(code: u8) []const u8 {
+    const bytes = fuzz_code_bytes[code][0..fuzz_codes[code]];
+    for (bytes, 0..) |*byte, index| byte.* = @truncate(index * 31 + code);
+    return bytes;
+}
+
 const Fuzz = struct {
     prng: Prng,
     preimages: bool,
@@ -461,8 +539,7 @@ const Fuzz = struct {
     }
 
     fn code_hash(code: u8) Hash {
-        if (code == 0) return trie.node.empty_code_hash;
-        return keccak256(&.{code});
+        return keccak256(fuzz_code(code));
     }
 
     fn write_key(fuzz: *const Fuzz, writer: *std.Io.Writer, index: usize) !void {
@@ -474,9 +551,11 @@ const Fuzz = struct {
         try w.writeAll("{\"op\":\"account\",");
         try fuzz.write_key(w, index);
         const code = code_hash(a.code);
-        try w.print(",\"nonce\":\"0x{x}\",\"balance\":\"0x{x}\",\"codeHash\":\"0x{x}\"}}", .{
+        try w.print(",\"nonce\":\"0x{x}\",\"balance\":\"0x{x}\",\"codeHash\":\"0x{x}\"", .{
             a.nonce, a.balance, &code,
         });
+        if (a.code != 0) try w.print(",\"code\":\"0x{x}\"", .{fuzz_code(a.code)});
+        try w.writeAll("}");
     }
 
     fn write_storage(
@@ -587,7 +666,7 @@ const Fuzz = struct {
         var account: FuzzAccount = .{
             .nonce = fuzz.prng.range(1, 3),
             .balance = fuzz.prng.below(1 << 20),
-            .code = @intCast(fuzz.prng.below(3)),
+            .code = @intCast(fuzz.prng.below(fuzz_codes.len)),
         };
         if (state[index]) |current| account.slots = current.slots;
         state[index] = account;
@@ -619,6 +698,8 @@ test "diff trie: seeded fuzz, the primary against hash-builder and every variant
         };
         const variants = field(response, "variants").object;
         try testing.expectEqual(fuzz.preimages, variants.contains("node-address"));
+        try testing.expectEqual(fuzz.preimages, variants.contains("memory-history"));
+        try testing.expect(variants.contains("disk-view-history"));
         try testing.expect(variants.contains("hash-builder"));
         try testing.expect(variants.contains("disk-small"));
         try testing.expect(variants.contains("disk-small-reopen"));
