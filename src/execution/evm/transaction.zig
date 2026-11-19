@@ -439,13 +439,27 @@ fn execute_top(
         // revm's first frame halts with `OutOfFunds`, returning its gas, when the caller
         // cannot transfer `value` (the up-front balance check is disabled).
         const caller = try evm.state.load(tx.caller);
-        if (caller.info.balance < tx.value) return .{
-            .status = .halt,
-            .exit = .out_of_funds,
-            .gas_remaining = tx.gas_limit - intrinsic.gas,
-            .gas_refund = 0,
-            .output = &.{},
-        };
+        if (caller.info.balance < tx.value) {
+            // The tracer sees the frame, as geth's EVM.Call enters it before the balance
+            // check; revm's call frame loads the callee (and its delegate) before the
+            // transfer fails, a create frame checks the balance first.
+            if (tx.to) |to| _ = try evm.resolve_code_address(fork, to);
+            if (evm.tracer != null) evm.trace_failed_top(fork, .{
+                .kind = if (tx.to == null) .create else .call,
+                .caller = tx.caller,
+                .target = tx.to orelse primitives.address_zero,
+                .value = tx.value,
+                .input = tx.data,
+                .gas_limit = tx.gas_limit - intrinsic.gas,
+            }, tx.nonce, .out_of_funds);
+            return .{
+                .status = .halt,
+                .exit = .out_of_funds,
+                .gas_remaining = tx.gas_limit - intrinsic.gas,
+                .gas_refund = 0,
+                .output = &.{},
+            };
+        }
     }
     return evm.execute_fork(fork, .{
         .kind = if (tx.to == null) .create else .call,

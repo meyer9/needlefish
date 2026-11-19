@@ -1912,6 +1912,26 @@ test "eth: callTracer gives a failed deposit revm-inspectors' top frame" {
     try expect_contains(selectors, "\"result\":{\"0x824bb845-2\":1}");
 }
 
+test "eth: callTracer gives a call that cannot pay its value its top frame" {
+    const h = try Harness.create();
+    defer h.destroy();
+    // geth's EVM.Call enters the frame before its balance check, and revm's first frame
+    // fails the transfer: the tracers see the frame; gasUsed is the calldata floor here.
+    const call = "[{\"to\":\"0x00000000000000000000000000000000000000aa\",\"value\":\"0xef\"," ++
+        "\"gas\":\"0x186a0\",\"input\":\"0x12345678\"},\"latest\",";
+    const traced = try h.request("debug_traceCall", call ++ "{\"tracer\":\"callTracer\"}]");
+    try expect_contains(traced, "\"result\":{\"type\":\"CALL\",\"from\":\"0x" ++
+        "0000000000000000000000000000000000000000\",\"to\":\"0x" ++
+        "00000000000000000000000000000000000000aa\"," ++
+        "\"value\":\"0xef\",\"gas\":\"0x186a0\",\"gasUsed\":\"0x52a8\",\"input\":" ++
+        "\"0x12345678\",\"error\":\"insufficient balance for transfer\"}");
+    const selectors = try h.request("debug_traceCall", call ++ "{\"tracer\":\"4byteTracer\"}]");
+    try expect_contains(selectors, "\"result\":{\"0x12345678-0\":1}");
+    const flat = try h.request("debug_traceCall", call ++ "{\"tracer\":\"flatCallTracer\"}]");
+    try expect_contains(flat, "\"error\":\"Insufficient balance for transfer\"");
+    try testing.expectEqual(@as(usize, 1), count_of(flat, "\"traceAddress\""));
+}
+
 test "eth: callTracer gives a deposit rejected before any frame a frame from the tx" {
     var store = try meter_history();
     defer store.deinit(testing.allocator);
