@@ -364,21 +364,12 @@ pub const State = struct {
     /// Addresses warm in the current transaction without being loaded (precompiles and
     /// native singletons, EIP-2929); consulted only when an account's stamp is stale.
     static_warm: StaticWarm = .{},
-    /// Accounts an instruction of the current transaction named but did not load, because
-    /// it failed first (out of gas, a static violation). Nethermind's prestateTracer lists
-    /// them; execution never reads them.
-    named: [named_max]Named = undefined,
-    named_count: u32 = 0,
-    /// More than `named_max` were named: the list is incomplete.
-    named_overflow: bool = false,
     /// Precompile and native-contract addresses an RPC state override made ordinary
     /// accounts: geth's override `Apply` drops any overridden address from the call's
     /// precompiles, so the EVM runs the account's code (they stay warm: EIP-2929 warms the
     /// fork's precompiles). Block execution never sets it; a session or reset clears it.
     ordinary: [ordinary_max]Address = undefined,
     ordinary_count: u32 = 0,
-
-    pub const named_max = 1024;
 
     pub const ordinary_max = 64;
 
@@ -397,23 +388,6 @@ pub const State = struct {
             if (std.mem.eql(u8, &other, &address)) return true;
         }
         return false;
-    }
-
-    pub const Named = struct {
-        address: Address,
-        /// A call target: Nethermind also looks up its EIP-7702 delegate.
-        call: bool,
-    };
-
-    /// Records an account the current instruction names but does not load.
-    pub fn note_named(state: *State, address: Address, call: bool) void {
-        if (state.named_count == named_max) {
-            state.named_overflow = true;
-            return;
-        }
-        state.named[state.named_count] = .{ .address = address, .call = call };
-        state.named_count += 1;
-        assert(state.named_count <= named_max);
     }
 
     pub fn init(allocator: std.mem.Allocator, database: Database, limits: Limits) !State {
@@ -477,8 +451,6 @@ pub const State = struct {
         assert(state.tx_id < std.math.maxInt(u32));
         state.tx_id += 1;
         state.static_warm = .{};
-        state.named_count = 0;
-        state.named_overflow = false;
         state.journal_len = 0;
         state.logs_len = 0;
         state.log_data_len = 0;
@@ -633,11 +605,31 @@ pub const State = struct {
         return entry.value_ptr;
     }
 
-    pub const Access = struct { account: *Account, is_cold: bool };
+    pub const Access = struct {
+        account: *Account,
+        is_cold: bool,
+        /// The transaction had read the account before this access (prestateTracer).
+        seen: bool = true,
+    };
 
     /// Load and warm an account (EIP-2929), reporting whether it was cold.
     pub fn access(state: *State, address: Address) Error!Access {
-        return state.warm(try state.load(address));
+        const account = try state.load_unseen(address);
+        const seen = account.seen_tx == state.tx_id;
+        account.seen_tx = state.tx_id;
+        var result = try state.warm(account);
+        result.seen = seen;
+        return result;
+    }
+
+    /// Takes back the transaction's first read of an account whose instruction then failed
+    /// before it ran (out of gas for the access, its memory or the call): geth's and
+    /// Nethermind's prestateTracer do not look such an account up. Execution is unaffected.
+    pub fn unsee(state: *State, account_access: Access) void {
+        assert(account_access.account.seen_tx == state.tx_id);
+        if (account_access.seen) return;
+        // No transaction has id 0 (`tx_id` starts at 1).
+        account_access.account.seen_tx = 0;
     }
 
     /// `access` leaving the account unseen (`seen_tx`, prestateTracer only) unless the
@@ -791,6 +783,8 @@ pub const State = struct {
         target_empty: bool,
         target_cold: bool,
         previously_destroyed: bool,
+        /// The target's access (`unsee` it when the instruction then fails).
+        target_access: Access,
     };
 
     /// SELFDESTRUCT `address` sending its balance to `target`. From Cancun (EIP-6780)
@@ -810,6 +804,7 @@ pub const State = struct {
             .target_empty = target_account.is_empty_for(fork),
             .target_cold = target_access.is_cold,
             .previously_destroyed = account.self_destructed,
+            .target_access = target_access,
         };
         const destroys = fork.before(.cancun) or account.created_tx == state.tx_id;
         if (account != target_account) {

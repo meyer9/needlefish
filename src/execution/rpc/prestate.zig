@@ -18,9 +18,10 @@
 //! changed fields.
 //! As Nethermind's tracer, an account also gets its `codeHash`, every EIP-7702 authority
 //! with a valid signature is looked up, its authorization valid or not, and so is the
-//! block's beneficiary for every transaction (deposits included), and so is an account an
-//! instruction names but does not load because it fails first (`State.named`). A slot first
-//! read by an SSTORE that then runs out of gas is left out (`State.unstamp_slot`). A diff's
+//! block's beneficiary for every transaction (deposits included). As geth's tracer, an
+//! account an instruction first reads but then cannot pay to run is left out
+//! (`State.unsee`), and so is a slot first read by an SSTORE that then runs out of gas
+//! (`State.unstamp_slot`). A diff's
 //! `post` gives an account missing after the transaction a zero `codeHash`.
 
 const std = @import("std");
@@ -206,23 +207,6 @@ pub const Collected = struct {
         }
         collected.collect_slots(state);
         sort(collected);
-        collected.add_named(state);
-    }
-
-    /// Lists the accounts an instruction named but did not load because it failed first:
-    /// Nethermind's tracer looks up the address operand of BALANCE, EXTCODE*, SELFDESTRUCT
-    /// and the calls (and a call target's EIP-7702 delegate) before the instruction runs.
-    fn add_named(collected: *Collected, state: *State) void {
-        if (state.named_overflow) {
-            collected.full = true;
-            return;
-        }
-        for (state.named[0..state.named_count]) |named| {
-            const entry = collected.add_account(state, named.address) orelse return;
-            if (!named.call) continue;
-            const delegate = evm.bytecode.delegation_target(entry.pre.code) orelse continue;
-            _ = collected.add_account(state, delegate);
-        }
     }
 
     /// Lists the callee and its EIP-7702 delegate as they were before the transaction, as

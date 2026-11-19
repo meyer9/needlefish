@@ -819,10 +819,12 @@ fn cold_slot_unaffordable(
     return !evm.state.is_slot_warm(f.account, key);
 }
 
-/// Fails an instruction before it loads `address`, which it names (prestateTracer).
-fn fail_named(evm: *Evm, address: primitives.Address, call_target: bool, exit: Exit) Exit {
+/// Fails an instruction that loaded an account before it could pay to run: as geth's
+/// prestateTracer (the failed opcode is reported with its error, and nothing is looked
+/// up), the account is left unseen unless the transaction read it before.
+fn fail_accessed(evm: *Evm, access: state_module.State.Access, exit: Exit) Exit {
     assert(exit.status() != .success);
-    evm.state.note_named(address, call_target);
+    evm.state.unsee(access);
     return exit;
 }
 
@@ -831,10 +833,12 @@ fn external_account(comptime fork: Fork, comptime opcode: u8, f: *Frame, evm: *E
     const address = primitives.u256_to_address(s.pop());
     const extra = gas.cold_account_access_extra;
     if (cold_account_unaffordable(fork, evm, address, f.gas, extra)) {
-        return fail_named(evm, address, false, .out_of_gas);
+        return .out_of_gas;
     }
     const access = evm.state.access(address) catch |err| return evm.fail(err);
-    if (!charge_cold_account(fork, f, access.is_cold)) return .out_of_gas;
+    if (!charge_cold_account(fork, f, access.is_cold)) {
+        return fail_accessed(evm, access, .out_of_gas);
+    }
     const account = access.account;
     switch (opcode) {
         op.BALANCE => s.push(account.info.balance),
@@ -852,7 +856,9 @@ fn external_account(comptime fork: Fork, comptime opcode: u8, f: *Frame, evm: *E
             const offset = s.pop();
             const size = s.pop();
             const code = evm.state.code(account) catch |err| return evm.fail(err);
-            return copy_to_memory(f, memory_offset, code, offset, size);
+            const exit = copy_to_memory(f, memory_offset, code, offset, size) orelse
+                return null;
+            return fail_accessed(evm, access, exit);
         },
         else => comptime unreachable,
     }
@@ -973,22 +979,18 @@ fn call(comptime fork: Fork, comptime kind: CallKind, f: *Frame, evm: *Evm) ?Exi
     const in_size = s.pop();
     const out_offset = s.pop();
     const out_size = s.pop();
-    if (kind == .call and value != 0 and f.is_static) {
-        return fail_named(evm, target, true, .static_violation);
-    }
+    if (kind == .call and value != 0 and f.is_static) return .static_violation;
     const in_range = memory_range(&f.memory, &f.gas, in_offset, in_size) orelse
-        return fail_named(evm, target, true, .out_of_gas);
+        return .out_of_gas;
     const out_range = memory_range(&f.memory, &f.gas, out_offset, out_size) orelse
-        return fail_named(evm, target, true, .out_of_gas);
+        return .out_of_gas;
     // revm charges the value transfer before loading the target, and loads it (and its
     // EIP-7702 delegate) only when the rest of the frame's gas covers the cold surcharge.
     const value_cost: u64 = if (value != 0) gas.call_value else 0;
-    if (f.gas < value_cost) return fail_named(evm, target, true, .out_of_gas);
+    if (f.gas < value_cost) return .out_of_gas;
     const after_value = f.gas - value_cost;
     const extra = gas.cold_account_access_extra;
-    if (cold_account_unaffordable(fork, evm, target, after_value, extra)) {
-        return fail_named(evm, target, true, .out_of_gas);
-    }
+    if (cold_account_unaffordable(fork, evm, target, after_value, extra)) return .out_of_gas;
     const access = evm.state.access(target) catch |err| return evm.fail(err);
     var cost: u64 = 0;
     if (fork.at_least(.berlin) and access.is_cold) cost += gas.cold_account_access_extra;
@@ -1003,21 +1005,22 @@ fn call(comptime fork: Fork, comptime kind: CallKind, f: *Frame, evm: *Evm) ?Exi
         if (bytecode.delegation_target(code)) |delegate| {
             const target_cold: u64 = if (access.is_cold) extra else 0;
             if (delegate_unaffordable(fork, evm, delegate, after_value, target_cold)) {
-                return fail_named(evm, delegate, false, .out_of_gas);
+                return fail_accessed(evm, access, .out_of_gas);
             }
             const delegated = evm.state.access(delegate) catch |err| return evm.fail(err);
             cost += if (delegated.is_cold) gas.cold_account_access else gas.warm_storage_read;
+            if (f.gas < cost) evm.state.unsee(delegated);
             code_address = delegate;
             code_account = delegated.account;
         }
     }
-    if (f.gas < cost) return .out_of_gas;
+    if (f.gas < cost) return fail_accessed(evm, access, .out_of_gas);
     f.gas -= cost;
     const requested: u64 = @intCast(@min(gas_requested, std.math.maxInt(u64)));
     var limit = requested;
     if (fork.at_least(.tangerine)) {
         limit = @min(requested, gas.all_but_one_64th(f.gas));
-    } else if (requested > f.gas) return .out_of_gas;
+    } else if (requested > f.gas) return fail_accessed(evm, access, .out_of_gas);
     f.gas -= limit;
     if (value != 0) limit += gas.call_stipend;
     evm.pending = .{ .call = .{
@@ -1059,9 +1062,9 @@ fn call_creates_account(
 
 fn self_destruct(comptime fork: Fork, f: *Frame, evm: *Evm) ?Exit {
     const target = primitives.u256_to_address(f.stack.pop());
-    if (f.is_static) return fail_named(evm, target, false, .static_violation);
+    if (f.is_static) return .static_violation;
     if (cold_account_unaffordable(fork, evm, target, f.gas, gas.cold_account_access)) {
-        return fail_named(evm, target, false, .out_of_gas);
+        return .out_of_gas;
     }
     const balance = f.account.info.balance;
     const result = evm.state.self_destruct(fork, f.address, target) catch |err| {
@@ -1074,7 +1077,7 @@ fn self_destruct(comptime fork: Fork, f: *Frame, evm: *Evm) ?Exit {
     } else if (fork.at_least(.tangerine) and result.target_empty) {
         cost += gas.new_account;
     }
-    if (f.gas < cost) return .out_of_gas;
+    if (f.gas < cost) return fail_accessed(evm, result.target_access, .out_of_gas);
     f.gas -= cost;
     if (!result.previously_destroyed) f.refund += gas.selfdestruct_refund(fork);
     if (evm.tracer) |tracer| trace_self_destruct(tracer, f, target, balance);

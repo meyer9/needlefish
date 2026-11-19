@@ -3296,25 +3296,46 @@ test "eth: prestateTracer lists an authority whose authorization nonce mismatche
     try expect_contains(traced, key);
 }
 
-test "eth: prestateTracer lists an account an instruction names before running out of gas" {
+test "eth: prestateTracer leaves out an account an instruction cannot pay to run" {
     const h = try Harness.create();
     defer h.destroy();
-    const funded = "7e5f4552091a69125d5dfcb7b8c2659029395bdf";
-    // BALANCE of a cold account without gas for the cold access: never read, yet listed.
-    const balance_code = "0x73" ++ funded ++ "3100";
-    const request = "[{\"to\":" ++ override_target ++ ",\"gas\":\"0x5400\"},\"latest\"," ++
-        "{\"tracer\":\"prestateTracer\",\"stateOverrides\":{" ++ override_target ++
-        ":{\"code\":\"";
-    const balance = try h.request("debug_traceCall", request ++ balance_code ++ "\"}}}]");
-    try expect_contains(balance, "\"0x" ++ funded ++ "\":{\"balance\"");
-    // A CALL the frame cannot pay for names its target and the target's delegate.
+    // 0x..be (one wei) and 0x..d1e (delegated to it) are named by the code below.
+    const other = "00000000000000000000000000000000000000be";
     const delegated = "0000000000000000000000000000000000000d1e";
+    const listed = "\"0x" ++ other ++ "\":{\"balance\"";
+    const other_key = "\"0x" ++ other ++ "\":";
+    const delegated_key = "\"0x" ++ delegated ++ "\":{\"balance\"";
+    const request = "[{\"to\":" ++ override_target ++ ",\"gas\":\"";
+    const tracer = "\"},\"latest\",{\"tracer\":\"prestateTracer\",\"stateOverrides\":{" ++
+        "\"0x" ++ other ++ "\":{\"balance\":\"0x1\"},\"0x" ++ delegated ++
+        "\":{\"code\":\"0xef0100" ++ other ++ "\"}," ++ override_target ++ ":{\"code\":\"";
+    // As geth's tracer (the failed opcode reported with its error), nothing is looked up.
+    // BALANCE of a cold account without gas for the cold access: never read.
+    const balance_code = "0x73" ++ other ++ "3100";
+    const balance = try h.request("debug_traceCall", request ++ "0x5400" ++ tracer ++
+        balance_code ++ "\"}}}]");
+    try testing.expect(std.mem.indexOf(u8, balance, other_key) == null);
+    // EXTCODECOPY of 64 KiB: the account is read, then the memory is unaffordable.
+    const copy_code = "0x61ffff60006000" ++ "73" ++ other ++ "3c00";
+    const copied = try h.request("debug_traceCall", request ++ "0x7918" ++ tracer ++
+        copy_code ++ "\"}}}]");
+    try testing.expect(std.mem.indexOf(u8, copied, other_key) == null);
+    // A CALL the frame cannot pay for: neither the target nor its delegate.
     const call_code = "0x60006000600060006000" ++ "73" ++ delegated ++ "61fffff100";
-    const with_delegate = request ++ call_code ++ "\"},\"0x" ++ delegated ++
-        "\":{\"code\":\"0xef0100" ++ funded ++ "\"}}}]";
-    const called = try h.request("debug_traceCall", with_delegate);
-    try expect_contains(called, "\"0x" ++ delegated ++ "\":{\"balance\"");
-    try expect_contains(called, "\"0x" ++ funded ++ "\":{\"balance\"");
+    const called = try h.request("debug_traceCall", request ++ "0x5400" ++ tracer ++
+        call_code ++ "\"}}}]");
+    try testing.expect(std.mem.indexOf(u8, called, delegated_key) == null);
+    try testing.expect(std.mem.indexOf(u8, called, other_key) == null);
+    // The same with gas to spare lists both, and so does a CALL that runs but cannot
+    // transfer its value (the caller has none).
+    const paid = try h.request("debug_traceCall", request ++ "0x30000" ++ tracer ++
+        call_code ++ "\"}}}]");
+    try expect_contains(paid, delegated_key);
+    try expect_contains(paid, listed);
+    const value_code = "0x60006000600060006001" ++ "73" ++ other ++ "61fffff100";
+    const valued = try h.request("debug_traceCall", request ++ "0x30000" ++ tracer ++
+        value_code ++ "\"}}}]");
+    try expect_contains(valued, listed);
 }
 
 test "eth: prestateTracer leaves out a slot whose SSTORE runs out of gas" {
