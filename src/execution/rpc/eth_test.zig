@@ -704,6 +704,13 @@ test "eth: eth_simulateV1 limits and rejections" {
     const tip = "[{\"blockStateCalls\":[{\"calls\":[{\"type\":\"0x7e\"}]},{\"calls\":" ++
         "[{\"maxPriorityFeePerGas\":\"0x2\",\"maxFeePerGas\":\"0x1\"}]}]}]";
     try expect_failure(h, "eth_simulateV1", tip, "-32003", "max priority fee per gas higher");
+    // A call for another chain in block 2 is refused before block 3's gas limit and state
+    // conflict, and before block 1's out-of-order number (Nethermind).
+    const chain = "[{\"blockStateCalls\":[{\"blockOverrides\":{\"number\":\"0x0\"}}," ++
+        "{\"calls\":[{\"chainId\":\"0x32ff\"}]},{\"blockOverrides\":{\"gasLimit\":" ++
+        max ++ "},\"stateOverrides\":{" ++ override_target ++
+        ":{\"state\":{},\"stateDiff\":{}}}}]}]";
+    try expect_failure(h, "eth_simulateV1", chain, "-32000", "invalid chain ID");
 }
 
 test "eth: eth_simulateV1 Denim default timestamps repeat at 2^64 - 1" {

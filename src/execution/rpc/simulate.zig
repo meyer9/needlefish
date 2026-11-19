@@ -175,7 +175,7 @@ fn simulate_v1(api: *Api, call: *Call) HandlerError!void {
         header.number,
         header.timestamp,
     );
-    try precheck_blocks(call, space, blocks, header.gas_limit);
+    try precheck_blocks(call, space, blocks, header.gas_limit, api.spec.chain_id);
     // base/base orders and bounds every block before running any.
     try plan_blocks(call, space, schedule, blocks);
     var history: node.HistoryDatabase = undefined;
@@ -282,6 +282,7 @@ fn precheck_blocks(
     buffer: []u8,
     blocks: []const u8,
     base_gas_limit: u64,
+    chain_id: u64,
 ) HandlerError!void {
     var list = try Elements.init(blocks);
     while (try list.next(blocks_max)) |block_raw| {
@@ -303,6 +304,24 @@ fn precheck_blocks(
             }
         };
         try precheck_fee_caps(call, block_raw);
+        try precheck_chain_ids(call, block_raw, chain_id);
+    }
+}
+
+/// The calls' chain ids, checked block by block before any block runs: Nethermind refuses
+/// a call for another chain (-32000 "invalid chain ID") ahead of a later block's limits.
+fn precheck_chain_ids(call: *Call, block_raw: []const u8, chain_id: u64) HandlerError!void {
+    const calls = (json.find_path(block_raw, &.{"calls"}) catch return error.InvalidParams) orelse
+        return;
+    if (std.mem.eql(u8, calls, "null")) return;
+    var list = try Elements.init(calls);
+    while (try list.next(calls_max)) |call_raw| {
+        const found = json.find_path(call_raw, &.{"chainId"}) catch return error.InvalidParams;
+        const raw = found orelse continue;
+        if (std.mem.eql(u8, raw, "null")) continue;
+        if (try quantity_of(u64, raw) != chain_id) {
+            return call.fail(call_error.code_invalid_input, "invalid chain ID");
+        }
     }
 }
 
