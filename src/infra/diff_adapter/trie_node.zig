@@ -45,6 +45,10 @@ const record_cache = @import("../../execution/db/record_cache.zig");
 const FileIo = @import("file_io.zig").FileIo;
 const OpenMode = @import("../../utilities/io/common.zig").OpenMode;
 
+comptime {
+    assert(FileIo.sector_size == sector_size);
+}
+
 const database = db.database;
 const Hash = [32]u8;
 const Address = [20]u8;
@@ -59,7 +63,7 @@ pub const AccountProof = trie.StateTrie.AccountProof;
 pub const StorageProof = trie.StateTrie.StorageProof;
 pub const AccountState = db.history.AccountState;
 
-pub const Mode = enum { disk, disk_small, disk_deep, memory, memory_history };
+pub const Mode = enum { disk, disk_small, disk_deep, memory, memory_history, memory_budget };
 
 /// Blocks a request may hold (the chain index by height).
 pub const blocks_max = 256;
@@ -319,7 +323,20 @@ pub const config_memory_history: database.Config = blk: {
     break :blk config;
 };
 
+/// `memory-history-budget`: `config_memory_history` with a window as long as the blocks a
+/// request commits (each request block is committed as up to four), under a byte budget the
+/// variant sets per request (`Node.create_budget`), as `base node --proofs-history` always
+/// runs (`history_config`: `bytes_max` is `Limits.history_bytes_max`).
+pub const budget_window = 192;
+pub const config_memory_budget: database.Config = blk: {
+    var config = config_memory_history;
+    config.history.?.window_blocks = budget_window;
+    break :blk config;
+};
+
 comptime {
+    assert(budget_window <= chain_config.blocks_max);
+    assert(budget_window <= chain_config.canonical_max);
     assert(config_memory_history.history.?.window_blocks <= chain_config.canonical_max);
     assert(history_window <= chain_config.blocks_max);
 }
@@ -346,6 +363,8 @@ pub const Node = struct {
     overlay: db.Overlay,
     /// The database file (it outlives the node: `reopen`).
     path: []const u8,
+    /// `memory-history-budget`'s history byte budget (`create_budget`).
+    history_bytes_max: ?u64 = null,
     /// Block hashes of the canonical chain by height modulo the ring (genesis at 0): the
     /// newest `blocks_max + 1`, more than an unwind reaches.
     hashes: [blocks_max + 1]Hash = undefined,
@@ -374,6 +393,17 @@ pub const Node = struct {
         commits: u64 = 0,
         /// Prefetches run before a commit (`prefetch_paths`).
         prefetches: u64 = 0,
+        /// Power losses that tore a journal entry, a checkpoint block, a superblock copy
+        /// (`restart_torn`), and what the opens after them found: journal replays that
+        /// stopped at a torn header or body, superblocks repaired, blocks lost (never
+        /// durable, committed again).
+        torn_journal: u64 = 0,
+        torn_checkpoint: u64 = 0,
+        torn_superblock: u64 = 0,
+        stops_header: u64 = 0,
+        stops_body: u64 = 0,
+        superblocks_repaired: u64 = 0,
+        blocks_lost: u64 = 0,
     };
 
     fn config_of(mode: Mode) database.Config {
@@ -383,6 +413,7 @@ pub const Node = struct {
             .disk_deep => config_disk_deep,
             .memory => config_memory,
             .memory_history => config_memory_history,
+            .memory_budget => config_memory_budget,
         };
     }
 
@@ -393,14 +424,18 @@ pub const Node = struct {
         mode: Mode,
         path: []const u8,
         open_mode: OpenMode,
+        history_bytes_max: ?u64,
     ) !*Node {
+        assert((history_bytes_max != null) == (mode == .memory_budget));
         const self = try allocator.create(Node);
         errdefer allocator.destroy(self);
-        const config = config_of(mode);
+        var config = config_of(mode);
+        if (history_bytes_max) |bytes_max| config.history.?.bytes_max = bytes_max;
         self.* = .{
             .allocator = allocator,
             .mode = mode,
             .path = path,
+            .history_bytes_max = history_bytes_max,
             .fd = undefined,
             .storage = undefined,
             .db = undefined,
@@ -424,7 +459,22 @@ pub const Node = struct {
 
     /// `init` and `start`: a database ready at its genesis, or nothing.
     pub fn create(allocator: std.mem.Allocator, mode: Mode, path: []const u8) !*Node {
-        const self = try init(allocator, mode, path, .create);
+        return create_with(allocator, mode, path, null);
+    }
+
+    /// `memory-history-budget`: `create` with a history byte budget of `bytes_max`.
+    pub fn create_budget(allocator: std.mem.Allocator, path: []const u8, bytes_max: u64) !*Node {
+        assert(bytes_max > 0);
+        return create_with(allocator, .memory_budget, path, bytes_max);
+    }
+
+    fn create_with(
+        allocator: std.mem.Allocator,
+        mode: Mode,
+        path: []const u8,
+        history_bytes_max: ?u64,
+    ) !*Node {
+        const self = try init(allocator, mode, path, .create, history_bytes_max);
         self.start() catch |err| {
             self.destroy();
             return err;
@@ -465,6 +515,7 @@ pub const Node = struct {
         const allocator = self.allocator;
         const mode = self.mode;
         const path = self.path;
+        const budget = self.history_bytes_max;
         const kept = .{ self.hashes, self.height, self.blocks_made, self.room };
         var stats = self.stats;
         const crash = crash_ticks != null;
@@ -483,15 +534,104 @@ pub const Node = struct {
             self.release();
             try closed;
         }
-        const node = init(allocator, mode, path, .read_write) catch return error.NodeFailed;
-        errdefer node.release();
-        node.hashes, node.height, node.blocks_made, node.room = kept;
         const replayed = stats.entries_replayed;
-        try node.open_existing(&stats);
+        const node = try reopened(allocator, mode, path, budget, kept, &stats);
         if (crash and stats.entries_replayed > replayed) stats.crash_replays += 1;
         node.stats = stats;
+        return node;
+    }
+
+    /// Opens the database file again after a restart, at the head `kept` names.
+    fn reopened(
+        allocator: std.mem.Allocator,
+        mode: Mode,
+        path: []const u8,
+        history_bytes_max: ?u64,
+        kept: anytype,
+        stats: *Stats,
+    ) Error!*Node {
+        const node = init(allocator, mode, path, .read_write, history_bytes_max) catch
+            return error.NodeFailed;
+        errdefer node.release();
+        node.hashes, node.height, node.blocks_made, node.room = kept;
+        try node.open_existing(stats);
+        node.stats = stats.*;
         assert(node.height == node.db.head_info.number);
         return node;
+    }
+
+    /// Where `restart_torn`'s power loss tears a write.
+    pub const Tear = enum { journal, checkpoint, superblock };
+
+    /// Restarts after a power loss that tears one in-flight write at whole-sector
+    /// granularity (`FileIo.tear_arm`); the open must reject the torn write and recover the
+    /// newest durable state:
+    /// - `journal`: `writes` are submitted as the next block and the power goes while its
+    ///   journal entry is written (`variant` even: its header sector torn, odd: its first
+    ///   body sector). The block was never durable: the database reopens at the block before
+    ///   it, and the caller commits it again, as a node re-executes a block it lost.
+    /// - `checkpoint`: a checkpoint is asked for and its next block write is torn; the
+    ///   superblock still names the previous checkpoint.
+    /// - `superblock`: the checkpoint completes and superblock copy `variant % 4` is torn
+    ///   (copies before it name the new checkpoint, those after it the previous one).
+    /// Returns the reopened node; `self` is gone (on failure too).
+    pub fn restart_torn(self: *Node, tear: Tear, variant: u32, writes: ?HashedWrites) Error!*Node {
+        assert(!self.in_memory());
+        assert((tear == .journal) == (writes != null));
+        const kept = .{ self.hashes, self.height, self.blocks_made, self.room };
+        var stats = self.stats;
+        const engine = self.db.config.engine;
+        const zone = engine.checkpoint_zone_offset(0);
+        self.io.tear_arm(switch (tear) {
+            .journal => .{
+                .offset_min = engine.journal_offset(),
+                .offset_max = engine.grid_offset(),
+                .prefix_sectors = variant % 2,
+            },
+            .checkpoint => .{ .offset_min = zone, .offset_max = engine.journal_offset() },
+            .superblock => .{ .offset_min = 0, .offset_max = zone, .skip = variant % 4 },
+        });
+        self.power_loss(tear, writes) catch |err| {
+            self.release();
+            return err;
+        };
+        switch (tear) {
+            .journal => stats.torn_journal += 1,
+            .checkpoint => stats.torn_checkpoint += 1,
+            .superblock => stats.torn_superblock += 1,
+        }
+        const allocator = self.allocator;
+        const mode = self.mode;
+        const path = self.path;
+        self.release();
+        const node = try reopened(allocator, mode, path, null, kept, &stats);
+        const result = node.db.engine.open_result catch unreachable; // Open succeeded.
+        node.stats.stops_header += @intFromBool(result.journal_stop == .header_corrupt);
+        node.stats.stops_body += @intFromBool(result.journal_stop == .body_corrupt);
+        node.stats.superblocks_repaired += @intFromBool(result.superblock_repaired);
+        node.stats.blocks_lost += @intFromBool(tear == .journal);
+        return node;
+    }
+
+    /// Drives the storage until the armed tear lands (`FileIo.crashed`): with `writes`, as
+    /// the next block's journal entry; else as part of a checkpoint asked for now.
+    fn power_loss(self: *Node, tear: Tear, writes: ?HashedWrites) Error!void {
+        if (writes) |block| {
+            var attempts: u32 = 0;
+            while (try self.submit_hashed(block) == null) : (attempts += 1) {
+                if (attempts >= attempts_max) return error.Stalled;
+                try self.wait_quiet();
+            }
+        } else {
+            self.db.request_checkpoint();
+        }
+        var ticks: u32 = 0;
+        while (!self.io.crashed) : (ticks += 1) {
+            if (ticks >= ticks_max) return error.Stalled;
+            if (tear != .journal) self.db.checkpoint_flush();
+            self.tick();
+        }
+        assert(self.io.crashed and self.io.tear == null);
     }
 
     /// A clean close: a checkpoint written, and nothing left in flight.
@@ -754,12 +894,22 @@ pub const Node = struct {
 
     /// One try: false when the database was busy (nothing changed).
     fn attempt_hashed(self: *Node, writes: HashedWrites) Error!bool {
+        const hash = try self.submit_hashed(writes) orelse return false;
+        self.height += 1;
+        self.hash_set(self.height, hash);
+        self.stats.commits += 1;
+        return true;
+    }
+
+    /// Applies `writes` and submits the block's journal entry (`commit_applied`); its hash,
+    /// or null when the database was busy (nothing changed). Not yet durable.
+    fn submit_hashed(self: *Node, writes: HashedWrites) Error!?Hash {
         try self.make_room();
         self.db.hold_checkpoints(true);
         defer self.db.hold_checkpoints(false);
         self.prefetch_paths(writes);
         self.state_db.commit_hashed(writes) catch |err| switch (err) {
-            error.Busy => return false,
+            error.Busy => return null,
             else => return err,
         };
         var input = self.block_input(self.hash_at(self.height), self.height + 1);
@@ -767,14 +917,12 @@ pub const Node = struct {
         const committed = self.db.commit_applied(&input) catch |err| {
             // A failed database cannot unwind; any other refusal changed nothing.
             if (self.db.phase == .ready) try self.rollback();
-            if (err == error.Busy) return false;
+            if (err == error.Busy) return null;
             return err;
         };
         assert(std.mem.eql(u8, &self.db.head_info.state_root, &committed.state_root));
-        self.height += 1;
-        self.hash_set(self.height, input.hash);
-        self.stats.commits += 1;
-        return true;
+        assert(self.db.head_info.number == self.height + 1);
+        return input.hash;
     }
 
     /// With a prefetcher (`disk-small`): reads ahead the branch records the commit's root
@@ -861,7 +1009,10 @@ pub const Node = struct {
     }
 
     pub fn in_memory(self: *const Node) bool {
-        return self.mode == .memory or self.mode == .memory_history;
+        return switch (self.mode) {
+            .memory, .memory_history, .memory_budget => true,
+            .disk, .disk_small, .disk_deep => false,
+        };
     }
 
     /// Disk mode: keeps every block's pre-state account and branch records from now on

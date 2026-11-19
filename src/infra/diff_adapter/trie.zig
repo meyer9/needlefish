@@ -93,6 +93,7 @@ const variant_names = [_][]const u8{
     "disk-view-history",
     "node-address",
     "memory-history",
+    "memory-history-budget",
 };
 const VariantId = enum(u8) {
     sparse,
@@ -104,11 +105,15 @@ const VariantId = enum(u8) {
     disk_view_history,
     node_address,
     memory_history,
+    memory_history_budget,
 };
 
 /// Variants keyed by address: on requests with preimages only.
 fn address_keyed(id: VariantId) bool {
-    return id == .node_address or id == .memory_history;
+    return switch (id) {
+        .node_address, .memory_history, .memory_history_budget => true,
+        else => false,
+    };
 }
 
 /// The variants over another disk-mode database in `trie.dir`, each the primary's path.
@@ -123,6 +128,7 @@ const db_files = [_][]const u8{
     "node-address.db",
     "disk-view-history.db",
     "memory-history.db",
+    "memory-history-budget.db",
 } ++ blk: {
     var files: [disk_specs.len][]const u8 = undefined;
     for (disk_specs, &files) |spec, *file| file.* = spec.file;
@@ -151,8 +157,9 @@ const Run = struct {
     view: Disk = .{},
     view_roots: [trie_node.blocks_max + 1]Hash = undefined,
     archive: ?Archive = null,
-    /// `memory-history`.
+    /// `memory-history` and `memory-history-budget`.
     history: Disk = .{},
+    budget: Disk = .{},
     disks: [disk_specs.len]Disk = @splat(.{}),
     sparse: ?*trie_variants.Sparse = null,
     state_trie: ?trie_variants.StateTrieVariant = null,
@@ -187,6 +194,7 @@ pub fn run(
     for (&state.disks) |*disk| disk.heights[0] = 0;
     state.view.heights[0] = 0;
     state.history.heights[0] = 0;
+    state.budget.heights[0] = 0;
     state.view_roots[0] = empty_root;
     for (&state.variants) |*blocks| blocks.* = try arena.alloc(BlockResult, case.blocks.len);
     try start_variants(&state, address_path);
@@ -197,6 +205,7 @@ pub fn run(
     }
     finish_views(&state);
     finish_history(&state);
+    finish_budget(&state);
     var variants: std.ArrayList(Variant) = .empty;
     for (variant_names, state.variants, 0..) |name, results, index| {
         const id: VariantId = @fromBackingInt(@intCast(index));
@@ -247,6 +256,7 @@ fn create_node(
 }
 
 fn stop_variants(state: *Run) void {
+    if (state.budget.node) |node| node.destroy();
     if (state.history.node) |node| node.destroy();
     if (state.archive) |*archive| archive.deinit(state.allocator);
     if (state.view.node) |node| node.destroy();
@@ -491,6 +501,7 @@ fn run_variants(
             .disk_view_history => view_block(state, parent, writes),
             .node_address => address_block(state, block, parent, named),
             .memory_history => history_block(state, block, parent),
+            .memory_history_budget => budget_block(),
         };
         results[index] = outcome catch |err| {
             const text = @errorName(err);
@@ -516,8 +527,8 @@ const DiskBlock = struct {
 /// `disk-small`, `disk-small-reopen` and `disk-deep`: the primary's path over another
 /// database, with its own unwind decision (it may retain fewer blocks, or none to unwind
 /// to). `disk-deep` commits the block as several (`Node.commit_split`); `disk-small-reopen`
-/// restarts the database after the block, clean after even blocks and as a crash (part way
-/// into a checkpoint) after odd ones, and answers from the reopened database.
+/// restarts the database around the block (`restart_plan`) and answers from the restarted
+/// database.
 fn disk_block(state: *Run, id: VariantId, block: *const Block, at: DiskBlock) anyerror!BlockResult {
     const disk = for (disk_specs, &state.disks) |spec, *disk| {
         if (spec.id == id) break disk;
@@ -525,13 +536,25 @@ fn disk_block(state: *Run, id: VariantId, block: *const Block, at: DiskBlock) an
     var node = disk.node orelse return error.Unavailable;
     const native = try node.unwind_to(disk.heights[@intCast(at.parent)]);
     const writes = if (native) at.writes.native else at.writes.all;
+    const plan: Restart = if (id == .disk_small_reopen) restart_plan(at.index) else .none;
+    const variant: u32 = @intCast(at.index / 8);
+    if (plan == .torn_journal) {
+        disk.node = null; // Gone even when the restart fails.
+        node = try node.restart_torn(.journal, variant, writes);
+        disk.node = node;
+    }
     if (node.mode == .disk_deep) try node.commit_split(writes) else try node.commit_hashed(writes);
     disk.heights[@intCast(at.parent + 1)] = node.height;
-    if (id == .disk_small_reopen) {
-        disk.node = null; // Gone even when the reopen fails.
-        // A crash lands at a different point of the checkpoint it asks for each time.
-        const crash_ticks: ?u32 = if (at.index % 2 == 1) @intCast(at.index % 8) else null;
-        node = try node.reopen(crash_ticks);
+    if (plan != .none and plan != .torn_journal) {
+        disk.node = null; // Gone even when the restart fails.
+        node = switch (plan) {
+            .clean => try node.reopen(null),
+            // A crash lands at a different point of the checkpoint it asks for each time.
+            .crash => try node.reopen(@intCast(at.index % 8)),
+            .torn_checkpoint => try node.restart_torn(.checkpoint, variant, null),
+            .torn_superblock => try node.restart_torn(.superblock, variant, null),
+            .none, .torn_journal => unreachable, // Handled above.
+        };
         disk.node = node;
     }
     const proofs = try node_proofs(state, node, block);
@@ -541,6 +564,35 @@ fn disk_block(state: *Run, id: VariantId, block: *const Block, at: DiskBlock) an
         .storage_roots = try node_storage_roots(state, node, at.named),
         .proofs = proofs,
         .error_text = try read_check(state, node, block, proofs),
+    };
+}
+
+/// How `disk-small-reopen` restarts around a block.
+const Restart = enum {
+    none,
+    /// A clean shutdown and open, after the block.
+    clean,
+    /// A power loss part way into a checkpoint that drops every write in flight, after the
+    /// block.
+    crash,
+    /// A power loss tearing the block's own journal entry: the block is lost and committed
+    /// again (`Node.restart_torn`).
+    torn_journal,
+    /// After the block, a power loss tearing a checkpoint block, or a superblock copy.
+    torn_checkpoint,
+    torn_superblock,
+};
+
+/// Even blocks restart cleanly; odd ones crash, in turn dropping the writes in flight, tearing
+/// the block's journal entry, a checkpoint block, and a superblock copy.
+fn restart_plan(index: usize) Restart {
+    if (index % 2 == 0) return .clean;
+    return switch (index / 2 % 4) {
+        0 => .crash,
+        1 => .torn_journal,
+        2 => .torn_checkpoint,
+        3 => .torn_superblock,
+        else => unreachable, // A remainder of four.
     };
 }
 
@@ -631,14 +683,96 @@ fn finish_history(state: *Run) void {
             return;
         };
     }
+    window_answers(state, &state.history, results);
+}
+
+/// `memory-history-budget` during the blocks: nothing yet (`finish_budget` runs it).
+fn budget_block() anyerror!BlockResult {
+    return .{ .number = 0 };
+}
+
+/// Every canonical block still in `history`'s window, into `results`.
+fn window_answers(state: *Run, history: *Disk, results: []BlockResult) void {
     for (state.case.blocks, results, 0..) |*block, *result, index| {
         if (!canonical(state.case.blocks, index)) continue;
-        const answer = history_answer(state, block) catch |err| {
+        const answer = history_answer(state, history, block) catch |err| {
             result.error_text = @errorName(err);
             continue;
         };
         if (answer) |found| result.* = found;
     }
+}
+
+/// `memory-history-budget` after `memory-history`: the request again, by address, into an
+/// in-memory database whose history has a byte budget (`base node --proofs-history` always
+/// sets one: `history_config`), each request block committed as up to four blocks
+/// (`budget_chunks`). The budget is a third of what `memory-history`'s window held beyond its
+/// state (`budget_bytes`), so the window shrinks as blocks commit (`fit_budget`,
+/// `prune_step`); then the database restarts, which rebuilds the window under the budget from
+/// an estimate (`history_rebuild_guess`; at least `4 * history_sample_blocks` = 32 blocks),
+/// and every canonical block still in it is proven as `memory-history` proves them.
+fn finish_budget(state: *Run) void {
+    const id = @backingInt(VariantId.memory_history_budget);
+    if (!state.case.preimages or state.failed[id] != null) return;
+    const results = state.variants[id];
+    budget_run(state) catch |err| {
+        for (results) |*result| result.error_text = @errorName(err);
+        return;
+    };
+    window_answers(state, &state.budget, results);
+}
+
+fn budget_run(state: *Run) !void {
+    if (state.failed[@backingInt(VariantId.memory_history)] != null) return error.Unavailable;
+    const measured = state.history.node orelse return error.Unavailable;
+    const store = measured.db.history_reader() orelse return error.HistoryUnavailable;
+    const base = db.history.reset_bytes_estimate(&measured.db.state.state_trie);
+    const bytes_max = budget_bytes(base, store.bytes_used());
+    const file = db_files[4];
+    const path = try std.fs.path.join(state.arena, &.{ state.case.dir, file });
+    state.budget.node = try Node.create_budget(state.allocator, path, bytes_max);
+    const chunks = budget_chunks(state.case.blocks.len);
+    var height: u64 = 0;
+    for (state.case.blocks) |*block| {
+        const node = state.budget.node.?;
+        const parent = height - block.unwind;
+        const native = try node.unwind_to(state.budget.heights[@intCast(parent)]);
+        const ops = if (native) block.ops else try std.mem.concat(state.arena, Op, &.{
+            block.revert,
+            block.ops,
+        });
+        for (0..chunks) |chunk| {
+            const start = chunk * ops.len / chunks;
+            const end = (chunk + 1) * ops.len / chunks;
+            try overlay_ops(node, ops[start..end]);
+            try node.commit_overlay();
+        }
+        height = parent + 1;
+        state.budget.heights[@intCast(height)] = node.height;
+    }
+    if (!codes_stored(&state.budget.node.?.db.state)) return;
+    const node = state.budget.node.?;
+    state.budget.node = null; // Gone even when the reopen fails.
+    state.budget.node = try node.reopen(null);
+}
+
+/// The history byte budget of `memory-history-budget`: its state's (`reset`, estimated) with
+/// half again for the estimate's error, and a third of the versions `memory-history`'s whole
+/// window held beyond it.
+fn budget_bytes(base: u64, used: u64) u64 {
+    const versions = used -| base;
+    const bytes = base + base / 2 + versions / 3;
+    assert(bytes >= base);
+    return @max(bytes, 1);
+}
+
+/// Blocks each request block is committed as: up to four, at most 200 in all (the chain
+/// retains 256), so a request of nine blocks reaches the rebuild estimate's 32.
+fn budget_chunks(blocks: usize) usize {
+    assert(blocks <= trie_node.blocks_max);
+    const chunks = std.math.clamp(200 / @max(blocks, 1), 1, 4);
+    assert(chunks * blocks <= 200 or chunks == 1);
+    return chunks;
 }
 
 /// Whether every account of the in-memory state has its code stored.
@@ -651,10 +785,20 @@ fn codes_stored(memory_state: *const db.State) bool {
 }
 
 /// Block `block` from the history window; null when it is no longer in it.
-fn history_answer(state: *Run, block: *const Block) !?BlockResult {
-    const node = state.history.node.?;
-    const number = state.history.heights[@intCast(block.number)];
-    const store = node.db.history_reader() orelse return error.HistoryUnavailable;
+fn history_answer(state: *Run, history: *Disk, block: *const Block) !?BlockResult {
+    const node = history.node.?;
+    const number = history.heights[@intCast(block.number)];
+    const store = node.db.history_reader() orelse {
+        // Under a budget below the state itself the node keeps no history (`history_off`)
+        // and serves the head alone, from the live trie; without one that is a fault.
+        if (node.history_bytes_max == null) return error.HistoryUnavailable;
+        if (number != node.db.head_info.number) return null;
+        return .{
+            .number = block.number,
+            .state_root = node.state_root(),
+            .proofs = try address_proofs(state, node, block, number),
+        };
+    };
     const root = store.state_root_at(number) catch |err| switch (err) {
         error.BlockOutOfWindow => return null,
         else => return err,

@@ -350,7 +350,7 @@ fn expect_no_error(name: []const u8, block: Value) !void {
 
 /// The history variants answer at least the last block (the head is always in the window).
 fn expect_history_answers(name: []const u8, results: []const Value) !void {
-    const history = std.mem.endsWith(u8, name, "-history");
+    const history = std.mem.indexOf(u8, name, "-history") != null;
     if (!history) return;
     const last = results[results.len - 1];
     if (last.object.get("stateRoot") == null) return error.TestUnexpectedResult;
@@ -699,6 +699,7 @@ test "diff trie: seeded fuzz, the primary against hash-builder and every variant
         const variants = field(response, "variants").object;
         try testing.expectEqual(fuzz.preimages, variants.contains("node-address"));
         try testing.expectEqual(fuzz.preimages, variants.contains("memory-history"));
+        try testing.expectEqual(fuzz.preimages, variants.contains("memory-history-budget"));
         try testing.expect(variants.contains("disk-view-history"));
         try testing.expect(variants.contains("hash-builder"));
         try testing.expect(variants.contains("disk-small"));

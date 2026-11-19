@@ -470,3 +470,189 @@ test "diff trie: commit_hashed lists a block's codes as an evm block's commit do
     try testing.expectEqualSlices(u8, code_b, node.db.state.code_by_hash(keccak256(code_b)).?);
     node.db.codes_release();
 }
+
+// Power losses that tear an in-flight write (`Node.restart_torn`), on `disk-small`'s config
+// as `disk-small-reopen` runs them: the block's own journal entry (the block is lost and
+// committed again), a checkpoint block, or a superblock copy; and a crash that drops the
+// writes in flight. Native unwinds across them. After every restart the database agrees
+// with the primary.
+
+const torn_blocks = 24;
+
+test "diff trie: torn writes: every open rejects them and recovers the durable state" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const dir = try std.fmt.allocPrint(arena, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    const primary_path = try std.fmt.allocPrint(arena, "{s}/primary.db", .{dir});
+    const small_path = try std.fmt.allocPrint(arena, "{s}/small.db", .{dir});
+    const primary = try Node.create(testing.allocator, .disk, primary_path);
+    defer primary.destroy();
+    var small: ?*Node = try Node.create(testing.allocator, .disk_small, small_path);
+    defer if (small) |node| node.destroy();
+    var run = try Run.init(arena, 0x7042_0000 + build_options.fuzz_seed);
+    var blocks: [torn_blocks]HashedWrites = undefined;
+    var roots: [torn_blocks + 1]Hash = undefined;
+    roots[0] = trie.empty_root;
+    for (0..torn_blocks) |index| {
+        blocks[index] = (try run.block(arena))[0];
+        roots[index + 1] = try run.model.state_root();
+        try primary.commit_hashed(blocks[index]);
+        small = try torn_block(small.?, blocks[index], index);
+        try testing.expectEqualSlices(u8, &roots[index + 1], &small.?.state_root());
+        if (index % 7 == 6) {
+            // Two blocks back natively on the restarted database, then the same two again.
+            for ([2]*Node{ primary, small.? }) |node| {
+                try testing.expect(try node.unwind_to(index - 1));
+                try testing.expectEqualSlices(u8, &roots[index - 1], &node.state_root());
+            }
+            for (blocks[index - 1 ..][0..2], roots[index..][0..2]) |again, root| {
+                try primary.commit_hashed(again);
+                try small.?.commit_hashed(again);
+                try testing.expectEqualSlices(u8, &root, &small.?.state_root());
+            }
+        }
+        for (0..targets_count) |_| {
+            const want = try record(arena, &run, primary, run.prng.below(keys_count));
+            try expect_disk_answers(&run, small.?, &want);
+        }
+    }
+    try expect_torn(small.?.stats);
+}
+
+/// Block `index` on `node` with a restart in turn: its journal entry torn (lost, then
+/// committed again), a checkpoint block torn, a superblock copy torn, its writes in flight
+/// dropped. Returns the restarted node (`node` is gone).
+fn torn_block(node: *Node, writes: HashedWrites, index: usize) !*Node {
+    const variant: u32 = @intCast(index / 4);
+    switch (index % 4) {
+        0 => {
+            const restarted = try node.restart_torn(.journal, variant, writes);
+            try testing.expectEqual(restarted.height, restarted.db.head_info.number);
+            try restarted.commit_hashed(writes);
+            return restarted;
+        },
+        1 => {
+            try node.commit_hashed(writes);
+            return node.restart_torn(.checkpoint, variant, null);
+        },
+        2 => {
+            try node.commit_hashed(writes);
+            return node.restart_torn(.superblock, variant, null);
+        },
+        3 => {
+            try node.commit_hashed(writes);
+            return node.reopen(@intCast(index % 8));
+        },
+        else => unreachable, // A remainder of four.
+    }
+}
+
+/// Each tear ran as often as planned; every torn journal entry lost its block, and the opens
+/// stopped at torn headers and torn bodies; torn superblock copies were repaired.
+fn expect_torn(stats: Node.Stats) !void {
+    try testing.expectEqual(@as(u64, torn_blocks / 4), stats.torn_journal);
+    try testing.expectEqual(@as(u64, torn_blocks / 4), stats.torn_checkpoint);
+    try testing.expectEqual(@as(u64, torn_blocks / 4), stats.torn_superblock);
+    try testing.expectEqual(stats.torn_journal, stats.blocks_lost);
+    try testing.expect(stats.stops_header > 0 and stats.stops_body > 0);
+    try testing.expect(stats.superblocks_repaired > 0);
+}
+
+// `memory-history-budget`'s database: the history window under a byte budget a third of
+// what an unbudgeted window held beyond its state, as `trie.zig` sets it. The window shrinks
+// while blocks commit; the restart rebuilds it from an estimate (40 blocks: more than
+// `4 * history_sample_blocks`), and every block left in it is proven as it was then.
+
+const budget_blocks = 40;
+
+test "diff trie: memory-history-budget shrinks its window and rebuilds it from an estimate" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const dir = try std.fmt.allocPrint(arena, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    const history_path = try std.fmt.allocPrint(arena, "{s}/history.db", .{dir});
+    const budget_path = try std.fmt.allocPrint(arena, "{s}/budget.db", .{dir});
+    const history = try Node.create(testing.allocator, .memory_history, history_path);
+    defer history.destroy();
+    var run = try Run.init(arena, 0xb0d6_0000 + build_options.fuzz_seed);
+    var ops: [budget_blocks][]const Op = undefined;
+    var roots: [budget_blocks + 1]Hash = undefined;
+    roots[0] = trie.empty_root;
+    for (&ops, roots[1..]) |*block_ops, *root| {
+        block_ops.* = (try run.block(arena))[1];
+        try overlay_commit(history, block_ops.*);
+        root.* = try run.model.state_root();
+    }
+    const store = history.db.history_reader().?;
+    const base = db.history.reset_bytes_estimate(&history.db.state.state_trie);
+    const bytes_max = base + base / 2 + (store.bytes_used() - base) / 3;
+    var budget: ?*Node = try Node.create_budget(testing.allocator, budget_path, bytes_max);
+    defer if (budget) |node| node.destroy();
+    for (ops, roots[1..]) |block_ops, root| {
+        try overlay_commit(budget.?, block_ops);
+        try testing.expectEqualSlices(u8, &root, &budget.?.state_root());
+    }
+    const shrunk = budget.?.db.history_reader().?;
+    try testing.expect(shrunk.window_shrinks > 0);
+    try testing.expect(shrunk.window().?.oldest > 0);
+    budget = try budget.?.reopen(null);
+    try expect_budget_window(&run, budget.?, history, &roots);
+}
+
+/// The rebuild tried a start above the oldest block it could rebuild from (genesis), as the
+/// estimate picks it, and kept a shrunk window; each block in it is proven as the unbudgeted
+/// window proves it.
+fn expect_budget_window(run: *const Run, budget: *Node, history: *Node, roots: []const Hash) !void {
+    const window = budget.db.history_reader().?.window().?;
+    try testing.expectEqual(@as(u64, budget_blocks), window.head);
+    try testing.expect(window.oldest > 0);
+    try testing.expect(budget.db.history_rebuild_commits < budget_blocks or
+        budget.db.history_rebuild_widens > 0);
+    var got = try Proofs.create();
+    defer got.destroy();
+    var want = try Proofs.create();
+    defer want.destroy();
+    for (window.oldest..window.head + 1) |number| {
+        const store = budget.db.history_reader().?;
+        try testing.expectEqualSlices(u8, &roots[number], &(try store.state_root_at(number)));
+        for (0..targets_count) |target| {
+            const address = run.addresses[target * 7];
+            const words = target_slot_words(run, target * 7);
+            var values: [2]u256 = undefined;
+            var values_want: [2]u256 = undefined;
+            const account = try budget.db.proof_at(
+                number,
+                address,
+                &words,
+                got.account,
+                got.storage,
+                &values,
+            );
+            const account_want = try history.db.proof_at(
+                number,
+                address,
+                &words,
+                want.account,
+                want.storage,
+                &values_want,
+            );
+            try testing.expectEqualDeep(account_want, account);
+            try testing.expectEqual(values_want, values);
+            try expect_same_proof(want.account, got.account);
+            for (want.storage, got.storage) |*a, *b| try expect_same_proof(a, b);
+        }
+    }
+}
+
+fn expect_same_proof(want: anytype, got: anytype) !void {
+    try testing.expectEqual(want.count, got.count);
+    for (0..want.count) |index| {
+        const at: u32 = @intCast(index);
+        try testing.expectEqualSlices(u8, want.node_at(at), got.node_at(at));
+    }
+}
