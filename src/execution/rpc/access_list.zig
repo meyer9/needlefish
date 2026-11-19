@@ -9,8 +9,9 @@
 //!      not), the address operand of BALANCE, EXTCODESIZE, EXTCODECOPY, EXTCODEHASH and
 //!      SELFDESTRUCT, and the callee of CALL, CALLCODE, DELEGATECALL and STATICCALL unless
 //!      excluded. Reverted frames count. The list is sorted by address, then slot.
-//!   2. A failed first run returns that list with its gas and error. Otherwise the call
-//!      runs again with the list as its access list, for the gas used and error.
+//!   2. As geth's `AccessList` and Nethermind's `ConvergeAccessList` (not reth): the call
+//!      runs again with that list attached until a run lists nothing new, failed runs
+//!      included; the gas used and error are the last run's.
 //!
 //! The coinbase is not excluded. EIP-7702 authorities are not either: call requests carry
 //! no authorization list here. Buffers are carved from the API scratch after the call
@@ -228,31 +229,61 @@ fn create_access_list(api: *Api, call: *Call) HandlerError!void {
         return call.fail(rpc.code.internal_error, "scratch too small");
     const executor = api.chain.executor;
     var inspector: Inspector = .{ .entries = buffers.entries, .machine = executor.machine };
+    // geth's `AccessList` (Nethermind `ConvergeAccessList`): run with the current list
+    // attached, collect, and repeat until the run lists nothing new; the gas and error are
+    // those of that last run, the list's intrinsic cost included and its accesses warm.
+    var rounds: u32 = 0;
+    var converged: ?Executed = null;
+    while (converged == null and rounds < rounds_max) : (rounds += 1) {
+        converged = try run_round(api, call, &request, &inspector, buffers);
+    }
+    const last = converged orelse
+        return call.fail(rpc.code.server_error, "access list did not converge");
+    // The last run is done with the items and keys: the error text goes there.
+    const text_buffer = std.mem.sliceAsBytes(buffers.keys);
+    const failure = if (last.success) null else failure_text(text_buffer, last);
+    try write_result(call.writer, inspector.slice(), last.gas_used, failure);
+}
+
+/// Runs the call with its current access list under the inspector; the run when it listed
+/// nothing new, else null with the request carrying the run's list.
+fn run_round(
+    api: *Api,
+    call: *Call,
+    request: *eth.CallRequest,
+    inspector: *Inspector,
+    buffers: Buffers,
+) HandlerError!?Executed {
+    const executor = api.chain.executor;
+    inspector.len = 0;
+    inspector.excluded = null;
     inspector.seed(request.message.access_list);
     const tracer = inspector.tracer();
     executor.machine.tracer = &tracer;
-    const inspected = eth.simulate(api, call, request);
+    const inspected = eth.simulate(api, call, request.*);
     executor.machine.tracer = null;
-    const first = switch (try inspected) {
+    const executed = switch (try inspected) {
         .invalid => |reason| return eth.fail_invalid(call, reason),
         .executed => |executed| executed,
     };
     if (inspector.overflow) return call.fail(rpc.code.server_error, "access list too large");
-    const list = inspector.slice();
-    // The item and key buffers are free until the second run: the error text goes there.
-    const text_buffer = std.mem.sliceAsBytes(buffers.keys);
-    if (!first.success) {
-        return write_result(call.writer, list, first.gas_used, failure_text(text_buffer, first));
-    }
-    request.message.access_list = to_items(list, buffers.items, buffers.keys) catch
+    // The run's list holds the attached one's entries, less the excluded addresses and
+    // duplicates: the same count means the same list.
+    if (inspector.len == entry_count(request.message.access_list)) return executed;
+    request.message.access_list = to_items(inspector.slice(), buffers.items, buffers.keys) catch
         unreachable; // Proof: items and keys hold as many as the entry buffer.
-    const second = switch (try eth.simulate(api, call, request)) {
-        .invalid => |reason| return eth.fail_invalid(call, reason),
-        .executed => |executed| executed,
-    };
-    // The second run is done with the items and keys.
-    const failure = if (second.success) null else failure_text(text_buffer, second);
-    try write_result(call.writer, list, second.gas_used, failure);
+    return null;
+}
+
+/// Each run that does not converge adds an entry (or drops excluded ones and duplicates
+/// from the request's list, the first time), so the list converges within this many.
+const rounds_max = entries_max + 2;
+
+/// Account and slot entries of `list`, duplicates counted.
+fn entry_count(list: []const Item) usize {
+    var count: usize = 0;
+    for (list) |item| count += 1 + item.storage_keys.len;
+    return count;
 }
 
 /// reth's error text for a reverted or halted call (`ensure_success`).

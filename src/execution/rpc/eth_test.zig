@@ -4154,18 +4154,19 @@ test "eth: eth_createAccessList follows reth's access list inspector" {
     try testing.expectEqualStrings(expected, try h.request("eth_createAccessList", call));
 }
 
-test "eth: eth_createAccessList returns a failed call's list, gas and error" {
+test "eth: eth_createAccessList converges past a failed run, with its gas and error" {
     const h = try Harness.create();
     defer h.destroy();
     try put_access_list_contracts(h);
     const call = "[{\"to\":" ++ address_hex("42") ++ ",\"accessList\":[{\"address\":" ++
         address_hex("77") ++ ",\"storageKeys\":[]}]}]";
-    // The first run's gas: 21000 + 2400 intrinsic; PUSH1 3, cold SLOAD 2100, POP 2, PUSH1 3,
-    // cold EXTCODESIZE 2600, POP 2, PUSH0 PUSH0 4: 28114.
+    // The failed run lists more, so it runs again with that list (geth, Nethermind); the
+    // gas is that run's: 21000 + 3 * 2400 + 1900 intrinsic; PUSH1 3, warm SLOAD 100, POP 2,
+    // PUSH1 3, warm EXTCODESIZE 100, POP 2, PUSH0 PUSH0 4: 30314.
     const expected = "\"result\":{\"accessList\":[{\"address\":" ++ address_hex("42") ++
         ",\"storageKeys\":[" ++ slot_hex("01") ++ "]},{\"address\":" ++ address_hex("55") ++
         ",\"storageKeys\":[]},{\"address\":" ++ address_hex("77") ++
-        ",\"storageKeys\":[]}],\"gasUsed\":\"0x6dd2\",\"error\":\"execution reverted\"}";
+        ",\"storageKeys\":[]}],\"gasUsed\":\"0x766a\",\"error\":\"execution reverted\"}";
     try testing.expectEqualStrings(expected, try h.request("eth_createAccessList", call));
 }
 
