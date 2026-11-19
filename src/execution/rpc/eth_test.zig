@@ -661,6 +661,14 @@ test "eth: eth_simulateV1 limits and rejections" {
         "},\"stateOverrides\":{" ++ override_target ++ ":{\"code\":\"0x5b5f56\"}}," ++
         "\"calls\":[{\"to\":" ++ override_target ++ "}]}]}]";
     try expect_failure(h, "eth_simulateV1", unbounded, "-38026", "Client adjustable limit reached");
+    // Nethermind checks every block's overrides before it runs any call: a later block's gas
+    // limit is refused before an earlier block's incomplete deposit.
+    const later = "[{\"blockStateCalls\":[{\"calls\":[{\"type\":\"0x7e\"}]}," ++
+        "{\"blockOverrides\":{\"gasLimit\":" ++ max ++ "}}]}]";
+    try expect_failure(h, "eth_simulateV1", later, "-38026", "Client adjustable limit reached");
+    const tip = "[{\"blockStateCalls\":[{\"calls\":[{\"type\":\"0x7e\"}]},{\"calls\":" ++
+        "[{\"maxPriorityFeePerGas\":\"0x2\",\"maxFeePerGas\":\"0x1\"}]}]}]";
+    try expect_failure(h, "eth_simulateV1", tip, "-32003", "max priority fee per gas higher");
 }
 
 test "eth: eth_simulateV1 Denim timestamps repeat at 2^64 - 1" {

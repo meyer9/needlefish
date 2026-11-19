@@ -175,6 +175,7 @@ fn simulate_v1(api: *Api, call: *Call) HandlerError!void {
         header.number,
         header.timestamp,
     );
+    try precheck_blocks(call, space, blocks, header.gas_limit);
     // base/base orders and bounds every block before running any.
     try plan_blocks(call, space, schedule, blocks);
     var history: node.HistoryDatabase = undefined;
@@ -270,6 +271,55 @@ fn count_blocks(blocks: []const u8) HandlerError!u64 {
     var count: u64 = 0;
     while (try list.next(4 * blocks_max)) |_| count += 1;
     return count;
+}
+
+/// Nethermind's (OP) checks over every block before it runs any, in block order: a gas
+/// limit override above both the base block's limit and the RPC gas cap (base/base's
+/// client limit), an account override with both `state` and `stateDiff`, and a call whose
+/// priority fee exceeds its fee cap (revm's `validate_env`, a missing cap read as 0).
+fn precheck_blocks(
+    call: *Call,
+    buffer: []u8,
+    blocks: []const u8,
+    base_gas_limit: u64,
+) HandlerError!void {
+    var list = try Elements.init(blocks);
+    while (try list.next(blocks_max)) |block_raw| {
+        if (try block_overrides(block_raw)) |raw| {
+            const gas_limit = json.find_path(raw, &.{"gasLimit"}) catch
+                return error.InvalidParams;
+            if (gas_limit) |text| if (!std.mem.eql(u8, text, "null")) {
+                const limit = try quantity_of(u64, text);
+                if (limit > base_gas_limit and limit > eth.rpc_gas_cap) {
+                    return call.fail(code_gas_limit_reached, gas_limit_reached);
+                }
+            };
+        }
+        const overrides = json.find_path(block_raw, &.{"stateOverrides"}) catch
+            return error.InvalidParams;
+        if (overrides) |raw| if (!std.mem.eql(u8, raw, "null")) {
+            if (try both_state_and_diff(raw)) |address| {
+                return call.fail(rpc.code.invalid_params, both_state_message(buffer, address));
+            }
+        };
+        try precheck_fee_caps(call, block_raw);
+    }
+}
+
+/// Nethermind's OP pre-run check of each call's priority fee against its fee cap.
+fn precheck_fee_caps(call: *Call, block_raw: []const u8) HandlerError!void {
+    const calls = (json.find_path(block_raw, &.{"calls"}) catch return error.InvalidParams) orelse
+        return;
+    if (std.mem.eql(u8, calls, "null")) return;
+    var list = try Elements.init(calls);
+    while (try list.next(calls_max)) |call_raw| {
+        const fees = try call_fees.parse(call_raw);
+        const tip = fees.max_priority_fee orelse continue;
+        if (tip > (fees.max_fee orelse 0)) {
+            const text = "max priority fee per gas higher than max fee per gas";
+            return call.fail(call_error.code_transaction_rejected, text);
+        }
+    }
 }
 
 /// Checks the numbers and timestamps of every block (`sanitize_base_chain`) on a copy of
@@ -379,17 +429,8 @@ fn block_env(
             .extra_data = simulation.extra_data,
         }, planned.timestamp) catch parent.env.base_fee;
     }
-    if (overrides) |raw| {
-        // base/base refuses a gas limit above both the block's and the RPC gas cap.
-        const gas_limit = json.find_path(raw, &.{"gasLimit"}) catch return error.InvalidParams;
-        if (gas_limit) |text| if (!std.mem.eql(u8, text, "null")) {
-            const limit = try quantity_of(u64, text);
-            if (limit > env.gas_limit and limit > eth.rpc_gas_cap) {
-                return simulation.call.fail(code_gas_limit_reached, gas_limit_reached);
-            }
-        };
-        try apply_block_overrides(simulation.call, &env, raw);
-    }
+    // `precheck_blocks` refused a gas limit above the client limit.
+    if (overrides) |raw| try apply_block_overrides(simulation.call, &env, raw);
     assert(env.number == planned.number and env.timestamp == planned.timestamp);
     return env;
 }
