@@ -1451,14 +1451,46 @@ fn eth_call(api: *Api, call: *Call) HandlerError!void {
 /// (-32602 "invalid argument 0"). Params are left untouched.
 pub fn refuse_deposit(call: *Call) HandlerError!void {
     var peek = call.params;
-    const call_raw = try peek.raw();
+    if (try is_deposit(try peek.raw())) {
+        return call.fail(rpc.code.invalid_params, "invalid argument 0");
+    }
+}
+
+/// debug_traceCall and eth_simulateV1 take a deposit, but Nethermind's
+/// `DepositTransactionForRpc` needs its `sourceHash`, `from`, `value` and `input` (no `data`
+/// alias): the first one missing or null is refused with .NET's `ArgumentNullException`.
+pub fn refuse_incomplete_deposit(call: *Call) HandlerError!void {
+    var peek = call.params;
+    if (try incomplete_deposit(try peek.raw())) |message| {
+        return call.fail(rpc.code.invalid_params, message);
+    }
+}
+
+/// The refusal of a deposit call object missing a field Nethermind requires, else null.
+pub fn incomplete_deposit(call_raw: []const u8) HandlerError!?[]const u8 {
+    if (!try is_deposit(call_raw)) return null;
+    const required = [_][]const u8{ "sourceHash", "from", "value", "input" };
+    const messages = [_][]const u8{
+        "Value cannot be null. (Parameter 'SourceHash')",
+        "Value cannot be null. (Parameter 'From')",
+        "Value cannot be null. (Parameter 'Value')",
+        "Value cannot be null. (Parameter 'Input')",
+    };
+    comptime assert(required.len == messages.len);
+    for (required, messages) |field, message| {
+        const value = json.find_path(call_raw, &.{field}) catch return error.InvalidParams;
+        if (value == null or std.mem.eql(u8, value.?, "null")) return message;
+    }
+    return null;
+}
+
+fn is_deposit(call_raw: []const u8) HandlerError!bool {
     const value = (json.find_path(call_raw, &.{"type"}) catch return error.InvalidParams) orelse
-        return;
+        return false;
     // Any other malformed `type` is refused by `parse_call`.
-    if (value.len < 2 or value[0] != '"' or value[value.len - 1] != '"') return;
-    const tx_type = json.parse_quantity(u8, value[1 .. value.len - 1]) catch return;
-    if (tx_type == deposit_tx_type) return call.fail(rpc.code.invalid_params, "invalid argument 0");
-    assert(tx_type != deposit_tx_type);
+    if (value.len < 2 or value[0] != '"' or value[value.len - 1] != '"') return false;
+    const tx_type = json.parse_quantity(u8, value[1 .. value.len - 1]) catch return false;
+    return tx_type == deposit_tx_type;
 }
 
 const deposit_tx_type: u8 = 0x7e;

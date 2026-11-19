@@ -714,6 +714,7 @@ fn trace_block_by_hash(api: *Api, call: *Call) HandlerError!void {
 }
 
 fn trace_call(api: *Api, call: *Call) HandlerError!void {
+    try eth.refuse_incomplete_deposit(call);
     var request = try eth.parse_call_request(api, call);
     const config = try call.params.optional_raw();
     const deferred = try options_deferred(config);

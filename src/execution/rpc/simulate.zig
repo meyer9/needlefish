@@ -630,6 +630,9 @@ fn run_call(
 ) HandlerError!void {
     const call = simulation.call;
     const executor = simulation.api.chain.executor;
+    if (try eth.incomplete_deposit(raw)) |refusal| {
+        return call.fail(rpc.code.invalid_params, refusal);
+    }
     var message = try eth.parse_call(simulation.space, raw, executor.recoverer);
     try set_fees(simulation, &message, raw);
     const remaining = env.gas_limit - block.gas_used;

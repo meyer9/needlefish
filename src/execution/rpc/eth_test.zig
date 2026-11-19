@@ -1475,15 +1475,30 @@ test "eth: call requests read as Nethermind's transaction converters" {
     // Call data stays strict: an odd digit count is refused, as Nethermind's input.
     const odd_input = "[{\"to\":" ++ address_target ++ ",\"input\":\"0x123\"}]";
     try expect_contains(try h.request("eth_call", odd_input), "-32602");
-    // A deposit is no signable request; debug_traceCall still takes one.
+    // A deposit is no signable request; debug_traceCall takes a complete one only.
     const deposit = "[{\"to\":" ++ address_target ++ ",\"type\":\"0x7e\"}]";
     const refused = "{\"code\":-32602,\"message\":\"invalid argument 0\"";
     try expect_contains(try h.request("eth_call", deposit), refused);
     try expect_contains(try h.request("eth_estimateGas", deposit), refused);
     try expect_contains(try h.request("eth_createAccessList", deposit), refused);
-    const traced = try h.request("debug_traceCall", "[{\"to\":" ++ address_target ++
-        ",\"type\":\"0x7e\"},\"latest\",{\"tracer\":\"callTracer\"}]");
+    const tracer = "},\"latest\",{\"tracer\":\"callTracer\"}]";
+    const no_source = "{\"code\":-32602,\"message\":\"Value cannot be null. " ++
+        "(Parameter 'SourceHash')\"";
+    try expect_contains(try h.request("debug_traceCall", deposit[0 .. deposit.len - 2] ++
+        tracer), no_source);
+    const sourced = "[{\"to\":" ++ address_target ++ ",\"type\":\"0x7e\",\"sourceHash\":\"0x" ++
+        zeros_62 ++ "01\",\"from\":" ++ poor_sender;
+    const no_value = "\"message\":\"Value cannot be null. (Parameter 'Value')\"";
+    try expect_contains(try h.request("debug_traceCall", sourced ++ tracer), no_value);
+    const complete = sourced ++ ",\"value\":\"0x0\",\"input\":\"0x\"";
+    const traced = try h.request("debug_traceCall", complete ++ tracer);
     try expect_contains(traced, "\"result\":{\"type\":\"CALL\"");
+    // eth_simulateV1 converts its calls the same way.
+    const blocks = "[{\"blockStateCalls\":[{\"calls\":";
+    const simulated = blocks ++ deposit ++ "}]}]";
+    try expect_contains(try h.request("eth_simulateV1", simulated), no_source);
+    const whole = blocks ++ complete ++ "}]}]}]";
+    try expect_contains(try h.request("eth_simulateV1", whole), "\"status\":\"0x1\"");
     // A priced transfer from an unfunded sender exceeds its allowance (no 21000 shortcut).
     const unfunded = "[{\"from\":" ++ poor_sender ++ ",\"to\":" ++ address_target;
     const exceeds = "{\"code\":-32000,\"message\":\"gas required exceeds allowance (0)\"";
