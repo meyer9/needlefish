@@ -794,10 +794,13 @@ pub const State = struct {
 
     // ---------------------------------------------------------------- storage
 
-    /// The cached slot for the current incarnation and transaction. Does not warm.
-    fn slot_for(state: *State, account: *Account, slot: u256) Error!*Slot {
+    /// The cached slot for the current incarnation and transaction. Does not warm. Sets
+    /// `stamped` to whether the transaction had already read the slot (`original_tx`).
+    fn slot_for(state: *State, account: *Account, slot: u256, stamped: *bool) Error!*Slot {
         const key = StorageKey{ .address = account.address, .slot = slot };
+        stamped.* = false;
         if (state.slots.getPtr(key)) |cached| {
+            stamped.* = cached.original_tx == state.tx_id;
             if (cached.epoch != account.storage_epoch) {
                 try state.reincarnate(account, cached, slot);
             } else if (cached.original_tx != state.tx_id) {
@@ -850,7 +853,8 @@ pub const State = struct {
         if (state.slots.getPtr(key)) |cached| {
             if (cached.epoch == account.storage_epoch) return cached.present;
         }
-        const cached = try state.slot_for(account, slot);
+        var stamped: bool = undefined;
+        const cached = try state.slot_for(account, slot, &stamped);
         assert(cached.epoch == account.storage_epoch);
         assert(cached.original == cached.present);
         // No transaction has id 0: the next read in the transaction stamps it.
@@ -858,18 +862,35 @@ pub const State = struct {
         return cached.present;
     }
 
-    pub const SlotAccess = struct { slot: *Slot, is_cold: bool };
+    pub const SlotAccess = struct {
+        slot: *Slot,
+        is_cold: bool,
+        /// The transaction had read the slot before this access.
+        stamped: bool = true,
+    };
 
     /// Load and warm a storage slot of `account`.
     pub fn storage_access(state: *State, account: *Account, slot: u256) Error!SlotAccess {
-        const cached = try state.slot_for(account, slot);
+        var stamped: bool = undefined;
+        const cached = try state.slot_for(account, slot, &stamped);
         const is_cold = cached.warm_tx != state.tx_id and
             !state.is_listed(account.address, slot);
         if (is_cold) {
             try state.record(.slot_warmed, @intFromPtr(cached), 0, 0);
             cached.warm_tx = state.tx_id;
         }
-        return .{ .slot = cached, .is_cold = is_cold };
+        return .{ .slot = cached, .is_cold = is_cold, .stamped = stamped };
+    }
+
+    /// Takes back the transaction's first read of a slot whose instruction then failed
+    /// (an SSTORE out of gas): Nethermind's prestateTracer drops the slot. Execution is
+    /// unaffected: nothing was written, so the next read restamps the same original.
+    pub fn unstamp_slot(state: *State, slot_access: SlotAccess) void {
+        assert(slot_access.slot.original_tx == state.tx_id);
+        if (slot_access.stamped) return;
+        assert(slot_access.slot.original == slot_access.slot.present);
+        // No transaction has id 0, as in `storage_value`.
+        slot_access.slot.original_tx = 0;
     }
 
     pub fn storage_write(state: *State, account: *Account, slot: *Slot, value: u256) Error!void {

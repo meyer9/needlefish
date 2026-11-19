@@ -19,7 +19,8 @@
 //! As Nethermind's tracer, an account also gets its `codeHash`, every EIP-7702 authority
 //! with a valid signature is looked up, its authorization valid or not, and so is the
 //! block's beneficiary for every transaction (deposits included), and so is an account an
-//! instruction names but does not load because it fails first (`State.named`).
+//! instruction names but does not load because it fails first (`State.named`). A slot first
+//! read by an SSTORE that then runs out of gas is left out (`State.unstamp_slot`).
 
 const std = @import("std");
 const assert = std.debug.assert;

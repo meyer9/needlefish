@@ -3118,6 +3118,25 @@ test "eth: prestateTracer lists an account an instruction names before running o
     try expect_contains(called, "\"0x" ++ funded ++ "\":{\"balance\"");
 }
 
+test "eth: prestateTracer leaves out a slot whose SSTORE runs out of gas" {
+    const h = try Harness.create();
+    defer h.destroy();
+    // SLOAD 0xbc, then SSTORE 1 to the cold slot 0xbb: the frame can load 0xbb but not pay
+    // the 22100 for the write. The failed instruction's slot is not listed.
+    const request = "[{\"to\":" ++ override_target ++ ",\"gas\":\"0x7530\"},\"latest\"," ++
+        "{\"tracer\":\"prestateTracer\",\"stateOverrides\":{" ++ override_target ++
+        ":{\"code\":\"0x60";
+    const store_code = "5450600160bb5500\"}}}]";
+    const slot_bc = "\"0x" ++ zeros_62 ++ "bc\":\"0x" ++ zeros_62 ++ "00\"";
+    const slot_bb = "\"0x" ++ zeros_62 ++ "bb\":\"0x" ++ zeros_62 ++ "00\"";
+    const failed = try h.request("debug_traceCall", request ++ "bc" ++ store_code);
+    try expect_contains(failed, "\"storage\":{" ++ slot_bc ++ "}");
+    try testing.expect(std.mem.indexOf(u8, failed, slot_bb) == null);
+    // A slot read before the failing SSTORE stays listed.
+    const read_first = try h.request("debug_traceCall", request ++ "bb" ++ store_code);
+    try expect_contains(read_first, "\"storage\":{" ++ slot_bb ++ "}");
+}
+
 const override_target = "\"0x0000000000000000000000000000000000007777\"";
 
 test "eth: eth_call, eth_estimateGas and debug_traceCall apply state and block overrides" {

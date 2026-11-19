@@ -896,7 +896,10 @@ fn sstore(comptime fork: Fork, f: *Frame, evm: *Evm) ?Exit {
     const access = evm.state.storage_access(f.account, key) catch |err| return evm.fail(err);
     const slot = access.slot;
     const cost = gas.sstore(fork, slot.original, slot.present, value, access.is_cold);
-    if (f.gas < cost.cost) return .out_of_gas;
+    if (f.gas < cost.cost) {
+        evm.state.unstamp_slot(access);
+        return .out_of_gas;
+    }
     f.gas -= cost.cost;
     f.refund += cost.refund;
     evm.state.storage_write(f.account, slot, value) catch |err| return evm.fail(err);
