@@ -1647,6 +1647,51 @@ test "eth: Denim blocks, transactions and logs report millisecond timestamps" {
     try testing.expect(std.mem.indexOf(u8, genesis_block, "timestampMs") == null);
 }
 
+test "eth: prestateTracer lists the beneficiary for a deposit" {
+    const h = try Harness.create_for(&denim_rpc_spec);
+    defer h.destroy();
+    var store = try meter_history();
+    defer store.deinit(testing.allocator);
+    try h.node.db.trie().track_changes(testing.allocator);
+    try h.node.chain.attach_history(&store);
+    // The beneficiary is not empty; a deposit pays it nothing, yet Nethermind looks it up.
+    try h.node.db.put_account(@splat(0xfe), 1, 0, &.{});
+    _ = try h.mine(2);
+    const deposit: consensus.Envelope = .{ .deposit = .{
+        .source_hash = .{ .bytes = @splat(0x22) },
+        .from = .{ .bytes = @splat(0xd0) },
+        .to = .{ .call = .{ .bytes = @splat(0x33) } },
+        .mint = 0,
+        .value = 0,
+        .gas_limit = 100_000,
+        .is_system_transaction = false,
+        .input = &.{},
+    } };
+    var encoded: [256]u8 = undefined;
+    const forced = [1][]const u8{deposit.encode_to(&encoded)};
+    var attrs = fixture.attributes_l2(4, 0xfe);
+    attrs.transactions = &forced;
+    const node = h.node;
+    const head: primitives.B256 = .{ .bytes = node.chain.head_hash() };
+    const version = engine_types.forkchoice_version(node.spec, 4);
+    const updated = try node.engine.forkchoice_updated(version, fixture.forkchoice(head), &attrs);
+    const get_version = engine_types.get_payload_version(node.spec, 4);
+    const built = try node.engine.get_payload(get_version, updated.payload_id.?);
+    _ = try node.engine.forkchoice_updated(version, fixture.forkchoice(built.block_hash), null);
+    _ = try h.mine(6);
+    const coinbase = "\"0xfefefefefefefefefefefefefefefefefefefefe\":{\"balance\":\"0x1\"}";
+    const plain = "{\"tracer\":\"prestateTracer\"}";
+    const traced = try trace_request(h, "debug_traceBlockByHash", &built.block_hash.bytes, plain);
+    try testing.expectEqual(@as(usize, 1), count_of(traced, "\"txHash\""));
+    try expect_contains(traced, coinbase);
+    const hash = primitives.keccak256(forced[0]).bytes;
+    try expect_contains(try trace_request(h, "debug_traceTransaction", &hash, plain), coinbase);
+    // Unchanged, it is not in a diff.
+    const diff = "{\"tracer\":\"prestateTracer\",\"tracerConfig\":{\"diffMode\":true}}";
+    const changes = try trace_request(h, "debug_traceTransaction", &hash, diff);
+    try testing.expect(std.mem.indexOf(u8, changes, "0xfefefefe") == null);
+}
+
 test "eth: pre-Denim blocks carry no millisecond timestamps" {
     const h = try Harness.create();
     defer h.destroy();

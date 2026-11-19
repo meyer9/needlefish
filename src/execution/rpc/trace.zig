@@ -1266,6 +1266,8 @@ fn run_prestate(
         if (!traced) continue;
         collected.collect(executor.state);
         add_authorities(collected, executor, raw);
+        // Nethermind's tracer looks up the beneficiary for every transaction.
+        collected.add_account(executor.state, env.beneficiary);
         if (collected.full) return error.TraceFull;
         if (collected.failed) return error.StateReadFailed;
         if (only == null) {
@@ -1293,7 +1295,7 @@ fn add_authorities(
     var count: u32 = 0;
     while (authorizations.next()) |authorization| : (count += 1) {
         const authority = authorization.recover_authority(executor.recoverer) orelse continue;
-        collected.add_authority(executor.state, authority.bytes);
+        collected.add_account(executor.state, authority.bytes);
     }
     assert(count == envelope.eip7702.tx.authorization_list.count);
 }

@@ -16,8 +16,9 @@
 //! `geth_prestate_diff_traces`: only changed accounts and changed non-zero slots, `pre`
 //! without accounts empty before (Nethermind), `post` without destroyed ones and with only
 //! changed fields.
-//! As Nethermind's tracer, an account also gets its `codeHash`, and every EIP-7702 authority
-//! with a valid signature is looked up, its authorization valid or not.
+//! As Nethermind's tracer, an account also gets its `codeHash`, every EIP-7702 authority
+//! with a valid signature is looked up, its authorization valid or not, and so is the
+//! block's beneficiary for every transaction (deposits included).
 
 const std = @import("std");
 const assert = std.debug.assert;
@@ -196,10 +197,11 @@ pub const Collected = struct {
         sort(collected);
     }
 
-    /// Lists an EIP-7702 authority the transaction did not load (its authorization was
-    /// invalid: another chain id, a nonce of 2^64 - 1), as Nethermind's tracer lists every
-    /// authority with a valid signature. Call after `collect`; keeps the address order.
-    pub fn add_authority(collected: *Collected, state: *State, address: Address) void {
+    /// Lists an account the transaction may not have loaded, as Nethermind's tracer looks
+    /// it up: an EIP-7702 authority with a valid signature whose authorization was invalid
+    /// (another chain id, a nonce of 2^64 - 1), or the block's beneficiary (a deposit pays
+    /// it nothing). Call after `collect`; keeps the address order.
+    pub fn add_account(collected: *Collected, state: *State, address: Address) void {
         const accounts = collected.accounts[0..collected.account_count];
         var position: usize = 0;
         while (position < accounts.len) : (position += 1) {
@@ -277,7 +279,7 @@ pub const Collected = struct {
         collected.collect(state);
         for (collected.authorities) |authorization| {
             const authority = authorization.authority orelse continue;
-            collected.add_authority(state, authority);
+            collected.add_account(state, authority);
         }
     }
 };
