@@ -766,6 +766,14 @@ test "eth: eth_simulateV1 traceTransfers adds ERC-7528 transfer logs outside the
         "\"calls\":[{\"from\":" ++ poor_sender ++ ",\"to\":" ++ override_target ++
         ",\"value\":\"0x5\"}]}],\"traceTransfers\":true}]";
     try expect_contains(try h.request("eth_simulateV1", reverting), "\"logs\":[]");
+    // A call to a precompile with value logs one transfer.
+    const precompile = "[{\"blockStateCalls\":[{\"stateOverrides\":{" ++ poor_sender ++
+        ":{\"balance\":\"0x10\"}},\"calls\":[{\"from\":" ++ poor_sender ++ ",\"to\":" ++
+        "\"0x0000000000000000000000000000000000000004\",\"value\":\"0x7\"}]}]," ++
+        "\"traceTransfers\":true}]";
+    const identity = try h.request("eth_simulateV1", precompile);
+    try testing.expectEqual(@as(usize, 1), count_of(identity, "\"logIndex\""));
+    try expect_contains(identity, "\"data\":\"0x" ++ zeros_62 ++ "07\"");
 }
 
 /// Reverts with `Error("nope")`: CODECOPY the 100 bytes after the 10-byte prefix, REVERT.
