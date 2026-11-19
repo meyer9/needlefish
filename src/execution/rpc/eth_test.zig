@@ -4203,20 +4203,22 @@ test "eth: eth_createAccessList follows reth's access list inspector" {
     const h = try Harness.create();
     defer h.destroy();
     try put_access_list_contracts(h);
-    // The request's untouched 0x66 stays; its seeded slot 9 of the excluded `to` goes, the
-    // slot `to` reads stays; the reverted frame's accesses stay.
+    // The request's untouched 0x66 stays; its seeded slot 9 of the excluded `to` stays too
+    // (geth, Nethermind: only a slotless excluded account goes), as does the slot `to`
+    // reads; the reverted frame's accesses stay.
     const call = "[{\"to\":" ++ address_hex("41") ++ ",\"accessList\":[{\"address\":" ++
         address_hex("66") ++ ",\"storageKeys\":[" ++ slot_hex("01") ++ "]},{\"address\":" ++
         address_hex("41") ++ ",\"storageKeys\":[" ++ slot_hex("09") ++ "]}]}]";
-    // Second run: 21000 + 5 * 2400 + 3 * 1900 intrinsic; 0x41 runs 327 gas with every
+    // Second run: 21000 + 5 * 2400 + 4 * 1900 intrinsic; 0x41 runs 327 gas with every
     // access warm, 0x42 214 (PUSH1 3, SLOAD 100, POP 2, PUSH1 3, EXTCODESIZE 100, POP 2,
-    // PUSH0 PUSH0 4): 39241.
+    // PUSH0 PUSH0 4): 41141.
     const expected = "\"result\":{\"accessList\":[{\"address\":" ++ address_hex("41") ++
-        ",\"storageKeys\":[" ++ slot_hex("07") ++ "]},{\"address\":" ++ address_hex("42") ++
+        ",\"storageKeys\":[" ++ slot_hex("07") ++ "," ++ slot_hex("09") ++
+        "]},{\"address\":" ++ address_hex("42") ++
         ",\"storageKeys\":[" ++ slot_hex("01") ++ "]},{\"address\":" ++ address_hex("44") ++
         ",\"storageKeys\":[]},{\"address\":" ++ address_hex("55") ++
         ",\"storageKeys\":[]},{\"address\":" ++ address_hex("66") ++ ",\"storageKeys\":[" ++
-        slot_hex("01") ++ "]}],\"gasUsed\":\"0x9949\"}";
+        slot_hex("01") ++ "]}],\"gasUsed\":\"0xa0b5\"}";
     try testing.expectEqualStrings(expected, try h.request("eth_createAccessList", call));
 }
 
@@ -4234,6 +4236,24 @@ test "eth: eth_createAccessList converges past a failed run, with its gas and er
         ",\"storageKeys\":[]},{\"address\":" ++ address_hex("77") ++
         ",\"storageKeys\":[]}],\"gasUsed\":\"0x766a\",\"error\":\"execution reverted\"}";
     try testing.expectEqualStrings(expected, try h.request("eth_createAccessList", call));
+}
+
+test "eth: eth_createAccessList keeps the callee's slot when the next run stops sooner" {
+    const h = try Harness.create();
+    defer h.destroy();
+    // KECCAK256 of 6 KiB (1835 gas with its PUSHes and memory), POP, SLOAD(0), then loop
+    // until out of gas. The first run reads slot 0; with the list attached (4300 more
+    // intrinsic gas) the second runs out of gas before the SLOAD. As geth and Nethermind,
+    // the callee's listed slot stays, so the list converges on that run.
+    const code = [_]u8{ 0x61, 0x18, 0x00, 0x5f, 0x20, 0x50, 0x5f, 0x54, 0x5b, 0x60, 0x08, 0x56 };
+    var contract: [20]u8 = @splat(0);
+    contract[19] = 0x5a;
+    try h.node.db.put_account(contract, 0, 1, &code);
+    _ = try h.mine(1);
+    const call = "[{\"to\":" ++ address_hex("5a") ++ ",\"gas\":\"0x6590\"}]";
+    const expected = "\"result\":{\"accessList\":[{\"address\":" ++ address_hex("5a") ++
+        ",\"storageKeys\":[" ++ slot_hex("00") ++ "]}],\"gasUsed\":\"0x6590\",\"error\":";
+    try expect_contains(try h.request("eth_createAccessList", call), expected);
 }
 
 test "eth: base_meterBundle reports precompile opcodeGas" {

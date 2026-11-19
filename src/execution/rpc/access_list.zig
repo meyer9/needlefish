@@ -4,7 +4,8 @@
 //!   1. The call runs as eth_call would (its own `accessList` charged and pre-warmed) under
 //!      an `Inspector` seeded with that list. When the top frame starts, the inspector
 //!      excludes the sender, the recipient (or the created address) and the active
-//!      precompiles and native contracts, and drops seeded entries of those. Before each
+//!      precompiles and native contracts, and drops seeded bare entries of those (their
+//!      slots stay listed, as in geth). Before each
 //!      instruction it lists SLOAD/SSTORE slots under the executing account (excluded or
 //!      not), the address operand of BALANCE, EXTCODESIZE, EXTCODECOPY, EXTCODEHASH and
 //!      SELFDESTRUCT, and the callee of CALL, CALLCODE, DELEGATECALL and STATICCALL unless
@@ -166,9 +167,15 @@ pub const Inspector = struct {
         warm.coinbase = null;
         inspector.excluded = .{ .from = frame.from, .to = frame.to, .warm = warm };
         const excluded = &inspector.excluded.?;
+        // As geth's `NewAccessListTracer`: an excluded account's slots stay listed (with
+        // its account entry, which precedes them); only a bare excluded account goes. A
+        // run that stops before reading those slots again keeps the list it ran with.
         var kept: u32 = 0;
-        for (inspector.entries[0..inspector.len]) |entry| {
-            if (excluded.contains(entry.address)) continue;
+        const entries = inspector.entries[0..inspector.len];
+        for (entries, 0..) |entry, index| {
+            const has_slots = entry.slot != null or (index + 1 < entries.len and
+                std.mem.eql(u8, &entries[index + 1].address, &entry.address));
+            if (excluded.contains(entry.address) and !has_slots) continue;
             inspector.entries[kept] = entry;
             kept += 1;
         }
@@ -233,27 +240,31 @@ fn create_access_list(api: *Api, call: *Call) HandlerError!void {
     // attached, collect, and repeat until the run lists nothing new; the gas and error are
     // those of that last run, the list's intrinsic cost included and its accesses warm.
     var rounds: u32 = 0;
-    var converged: ?Executed = null;
-    while (converged == null and rounds < rounds_max) : (rounds += 1) {
-        converged = try run_round(api, call, &request, &inspector, buffers);
+    var last: Round = .{ .executed = undefined, .converged = false };
+    while (!last.converged and rounds < rounds_max) : (rounds += 1) {
+        last = try run_round(api, call, &request, &inspector, buffers);
     }
-    const last = converged orelse
-        return call.fail(rpc.code.server_error, "access list did not converge");
+    // Each round only grows the list, so it converges within the bound; were it not to,
+    // the last run's list, gas and error are reported, as on convergence.
+    assert(rounds > 0);
     // The last run is done with the items and keys: the error text goes there.
     const text_buffer = std.mem.sliceAsBytes(buffers.keys);
-    const failure = if (last.success) null else failure_text(text_buffer, last);
-    try write_result(call.writer, inspector.slice(), last.gas_used, failure);
+    const executed = last.executed;
+    const failure = if (executed.success) null else failure_text(text_buffer, executed);
+    try write_result(call.writer, inspector.slice(), executed.gas_used, failure);
 }
 
-/// Runs the call with its current access list under the inspector; the run when it listed
-/// nothing new, else null with the request carrying the run's list.
+const Round = struct { executed: Executed, converged: bool };
+
+/// Runs the call with its current access list under the inspector; converged when it listed
+/// nothing new, else the request carries the run's list.
 fn run_round(
     api: *Api,
     call: *Call,
     request: *eth.CallRequest,
     inspector: *Inspector,
     buffers: Buffers,
-) HandlerError!?Executed {
+) HandlerError!Round {
     const executor = api.chain.executor;
     inspector.len = 0;
     inspector.excluded = null;
@@ -269,10 +280,12 @@ fn run_round(
     if (inspector.overflow) return call.fail(rpc.code.server_error, "access list too large");
     // The run's list holds the attached one's entries, less the excluded addresses and
     // duplicates: the same count means the same list.
-    if (inspector.len == entry_count(request.message.access_list)) return executed;
+    if (inspector.len == entry_count(request.message.access_list)) {
+        return .{ .executed = executed, .converged = true };
+    }
     request.message.access_list = to_items(inspector.slice(), buffers.items, buffers.keys) catch
         unreachable; // Proof: items and keys hold as many as the entry buffer.
-    return null;
+    return .{ .executed = executed, .converged = false };
 }
 
 /// Each run that does not converge adds an entry (or drops excluded ones and duplicates
