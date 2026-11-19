@@ -3039,6 +3039,19 @@ test "eth: prestateTracer diff lists a looked-up missing account with a zero cod
     try testing.expectEqual(@as(usize, 1), count_of(diff, identity));
     const plain = try h.request("debug_traceCall", call ++ "}]");
     try testing.expect(std.mem.indexOf(u8, plain, identity) == null);
+    // An unused address the call touches never exists in Nethermind's state: not listed.
+    // A state override creates it (empty), and the call's touch deletes it (EIP-161).
+    const unused = "\"0x00000000000000000000000000000000000000cc\"";
+    const to_unused = "[{\"from\":\"0x7e5f4552091a69125d5dfcb7b8c2659029395bdf\",\"to\":" ++
+        unused ++ "},\"latest\",{\"tracer\":\"prestateTracer\"" ++ ",\"tracerConfig\":" ++
+        "{\"diffMode\":true}";
+    const untouched = try h.request("debug_traceCall", to_unused ++ "}]");
+    try testing.expect(std.mem.indexOf(u8, untouched, unused) == null);
+    const overridden = try h.request("debug_traceCall", to_unused ++
+        ",\"stateOverrides\":{" ++ unused ++ ":{\"balance\":\"0x0\"}}}]");
+    const overridden_post = overridden[std.mem.indexOf(u8, overridden, "\"post\"").?..];
+    try expect_contains(overridden_post, unused ++ ":{\"codeHash\":\"0x" ++ zeros_62 ++ "00\"}");
+    try testing.expectEqual(@as(usize, 1), count_of(overridden, unused));
 }
 
 /// keccak256(0x00), the code hash of the one-byte code `0x00`.

@@ -53,10 +53,16 @@ pub const Info = struct {
     }
 };
 
-/// The `post` code hash of an account missing after the transaction: Nethermind (as geth)
-/// reads a zero hash for it, so a diff lists every account the transaction looked up that
-/// does not exist afterwards (a precompile it called, say) with `codeHash` zero in `post`.
+/// The `post` code hash Nethermind reads for an account that does not exist after the
+/// transaction but did exist in its world state during it: one that existed before (a
+/// state override creates one, even empty), or a precompile, which Nethermind creates when
+/// it is called. A diff lists such an account with `codeHash` zero in `post`. An account
+/// that never existed (a zero-value call to an unused address) is not listed.
 const missing_code_hash: Hash = @splat(0);
+
+fn lists_missing(state: *const State, address: Address, existed: bool) bool {
+    return existed or state.static_warm.contains(address);
+}
 
 pub const AccountEntry = struct {
     address: Address,
@@ -82,7 +88,14 @@ pub const Config = struct {
     storage: bool = true,
 };
 
-const Snapshot = std.AutoHashMapUnmanaged(Address, evm.state.AccountInfo);
+const Snapshot = std.AutoHashMapUnmanaged(Address, Snapshotted);
+
+/// A cached account at the transaction's start: its fields and whether it existed (in the
+/// database, or written this block, as by a state override).
+const Snapshotted = struct { info: evm.state.AccountInfo, existed: bool };
+
+/// An account's pre-transaction fields and whether it existed then.
+const Pre = struct { info: Info, existed: bool };
 
 pub const Collected = struct {
     accounts: []AccountEntry,
@@ -135,7 +148,11 @@ pub const Collected = struct {
         };
         var accounts = state.accounts.iterator();
         while (accounts.next()) |item| {
-            collected.snapshot.putAssumeCapacity(item.key_ptr.*, item.value_ptr.info);
+            const account = item.value_ptr;
+            collected.snapshot.putAssumeCapacity(item.key_ptr.*, .{
+                .info = account.info,
+                .existed = account.in_database or account.dirty,
+            });
         }
         assert(collected.snapshot.count() == count);
     }
@@ -193,9 +210,12 @@ pub const Collected = struct {
                 collected.full = true;
                 return;
             }
-            const pre = collected.pre_of(state, account.address);
+            const found = collected.pre_of(state, account.address);
+            const pre = found.info;
             var post = collected.info_of(state, account.info, &pre);
-            if (!account.in_database) post.code_hash = missing_code_hash;
+            if (!account.in_database and lists_missing(state, account.address, found.existed)) {
+                post.code_hash = missing_code_hash;
+            }
             collected.accounts[collected.account_count] = .{
                 .address = account.address,
                 .pre = pre,
@@ -257,17 +277,16 @@ pub const Collected = struct {
             collected.full = true;
             return null;
         }
-        const pre = collected.pre_of(state, address);
+        const found = collected.pre_of(state, address);
+        const pre = found.info;
         var post = pre;
-        if (state.accounts.get(address)) |account| {
+        // An account the state never loaded is as it was before.
+        const missing = if (state.accounts.get(address)) |account| missing: {
             post = collected.info_of(state, account.info, &pre);
-            if (!account.in_database) post.code_hash = missing_code_hash;
-        } else {
-            const found = state.database.basic(address) catch blk: {
-                collected.failed = true;
-                break :blk null;
-            };
-            if (found == null) post.code_hash = missing_code_hash;
+            break :missing !account.in_database;
+        } else !found.existed;
+        if (missing and lists_missing(state, address, found.existed)) {
+            post.code_hash = missing_code_hash;
         }
         const count = collected.account_count;
         std.mem.copyBackwards(
@@ -281,15 +300,17 @@ pub const Collected = struct {
         return &collected.accounts[position];
     }
 
-    fn pre_of(collected: *Collected, state: *State, address: Address) Info {
-        if (collected.snapshot.get(address)) |info| {
-            return collected.info_of(state, info, null);
-        }
+    fn pre_of(collected: *Collected, state: *State, address: Address) Pre {
+        if (collected.snapshot.get(address)) |cached| return .{
+            .info = collected.info_of(state, cached.info, null),
+            .existed = cached.existed,
+        };
         const found = state.database.basic(address) catch {
             collected.failed = true;
-            return .{};
+            return .{ .info = .{}, .existed = false };
         };
-        return collected.info_of(state, found orelse .{}, null);
+        const info = collected.info_of(state, found orelse .{}, null);
+        return .{ .info = info, .existed = found != null };
     }
 
     /// The slots the transaction read or wrote (stamped `original_tx`).
