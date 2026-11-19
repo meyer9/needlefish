@@ -1805,6 +1805,15 @@ fn failing_deposit_harness(store: *history_module.Store) !*Harness {
 
 /// Mines `deposit`, checks it failed with its whole gas limit and returns its prestate.
 fn failed_deposit_prestate(h: *Harness, deposit: consensus.Envelope) ![]const u8 {
+    return failed_deposit_trace(h, deposit, "{\"tracer\":\"prestateTracer\"}");
+}
+
+/// Mines `deposit`, checks it failed with its whole gas limit and traces it with `config`.
+fn failed_deposit_trace(
+    h: *Harness,
+    deposit: consensus.Envelope,
+    config: []const u8,
+) ![]const u8 {
     var raw: [256]u8 = undefined;
     _ = try mine_deposit(h, deposit, &raw);
     const hash = primitives.keccak256(deposit.encode_to(&raw)).bytes;
@@ -1817,7 +1826,7 @@ fn failed_deposit_prestate(h: *Harness, deposit: consensus.Envelope) ![]const u8
     const gas_limit = deposit.deposit.gas_limit;
     const gas_used_text = "\"gasUsed\":\"0x{x}\"";
     try expect_contains(receipt, try std.fmt.bufPrint(&gas_used, gas_used_text, .{gas_limit}));
-    return trace_request(h, "debug_traceTransaction", &hash, "{\"tracer\":\"prestateTracer\"}");
+    return trace_request(h, "debug_traceTransaction", &hash, config);
 }
 
 test "eth: prestateTracer lists the beneficiary for a deposit" {
@@ -1873,6 +1882,44 @@ test "eth: prestateTracer lists the callee of a deposit that cannot pay its valu
     const traced = try failed_deposit_prestate(h, deposit);
     try expect_contains(traced, callee_pre);
     try expect_contains(traced, delegate_pre);
+}
+
+test "eth: callTracer gives a failed deposit revm-inspectors' top frame" {
+    var store = try meter_history();
+    defer store.deinit(testing.allocator);
+    const h = try failing_deposit_harness(&store);
+    defer h.destroy();
+    // The first frame starts and fails its transfer (geth's top frame, as base gives it):
+    // gas and gasUsed are the gas limit, the receipt's.
+    var deposit = deposit_to(@splat(0x55), 100_000);
+    deposit.deposit.mint = 1;
+    deposit.deposit.value = 2;
+    deposit.deposit.input = &.{ 0x82, 0x4b, 0xb8, 0x45, 0x01, 0x02 };
+    const call_tracer = "{\"tracer\":\"callTracer\"}";
+    const unfunded = try failed_deposit_trace(h, deposit, call_tracer);
+    try expect_contains(unfunded, "\"result\":{\"type\":\"CALL\",\"from\":\"0x" ++
+        "d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0\",\"to\":\"0x" ++
+        "5555555555555555555555555555555555555555\",\"value\":\"0x2\",\"gas\":\"0x186a0\"," ++
+        "\"gasUsed\":\"0x186a0\",\"input\":\"0x824bb8450102\",\"error\":" ++
+        "\"insufficient balance for transfer\"}");
+    var raw: [256]u8 = undefined;
+    const hash = primitives.keccak256(deposit.encode_to(&raw)).bytes;
+    const four_byte = "{\"tracer\":\"4byteTracer\"}";
+    const selectors = try trace_request(h, "debug_traceTransaction", &hash, four_byte);
+    try expect_contains(selectors, "\"result\":{\"0x824bb845-2\":1}");
+}
+
+test "eth: callTracer gives a deposit below its intrinsic gas alloy's default frame" {
+    var store = try meter_history();
+    defer store.deinit(testing.allocator);
+    const h = try failing_deposit_harness(&store);
+    defer h.destroy();
+    // Nothing runs, so revm-inspectors has no frame and writes `CallFrame::default()`.
+    const call_tracer = "{\"tracer\":\"callTracer\"}";
+    const empty = try failed_deposit_trace(h, deposit_to(@splat(0x55), 20_000), call_tracer);
+    try expect_contains(empty, "\"result\":{\"type\":\"\",\"from\":\"0x" ++
+        "0000000000000000000000000000000000000000\",\"gas\":\"0x0\",\"gasUsed\":\"0x0\"," ++
+        "\"input\":\"0x\"}");
 }
 
 test "eth: prestateTracer lists the callee of a deposit below its intrinsic gas" {

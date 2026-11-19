@@ -983,6 +983,22 @@ const Block = struct { hash: Hash, number: u64 };
 pub const Range = struct { first: u32, end: u32 };
 
 /// Writes one transaction's result for the tracers built from call frames.
+/// alloy's `CallFrame::default()`: an empty type, the zero sender, no gas, empty input.
+fn write_empty_frame(w: *json.Writer) json.Writer.WriteError!void {
+    try w.begin_object();
+    try w.key("type");
+    try w.string("");
+    try w.key("from");
+    try w.data(&@as(Address, @splat(0)));
+    try w.key("gas");
+    try w.quantity(@as(u64, 0));
+    try w.key("gasUsed");
+    try w.quantity(@as(u64, 0));
+    try w.key("input");
+    try w.data(&.{});
+    try w.end_object();
+}
+
 fn write_frames(
     w: *json.Writer,
     recorder: *const Recorder,
@@ -994,8 +1010,9 @@ fn write_frames(
     assert(range.first <= range.end and range.end <= recorder.frame_count);
     switch (options.tracer) {
         .call => {
-            // A transaction that made no call (an invalid one never applies) has no frames.
-            if (range.first == range.end) return w.null_value();
+            // Only a deposit failing before execution (a system deposit, gas below intrinsic)
+            // applies with no frame: revm-inspectors then writes alloy's default frame.
+            if (range.first == range.end) return write_empty_frame(w);
             try write_tree(w, recorder, range.first, range.end, top, options.only_top_call);
         },
         .four_byte => try flat_call.write_four_byte(w, recorder.frames[range.first..range.end]),

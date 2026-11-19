@@ -482,6 +482,14 @@ fn transact_deposit(comptime fork: Fork, evm: *Evm, tx: *const TxEnv) evm_module
         // revm's first frame loads the callee (and its EIP-7702 delegate) before the transfer
         // fails, and the failed deposit keeps them loaded.
         if (tx.to) |to| _ = try evm.resolve_code_address(fork, to);
+        evm.trace_unfunded(fork, .{
+            .kind = if (tx.to == null) .create else .call,
+            .caller = tx.caller,
+            .target = tx.to orelse primitives.address_zero,
+            .value = tx.value,
+            .input = tx.data,
+            .gas_limit = tx.gas_limit - intrinsic.gas,
+        }, sender.info.nonce);
         return .{ .executed = try fail_deposit(fork, evm, tx, .revert) };
     }
     if (tx.to != null) try evm.state.set_nonce(sender, sender.info.nonce +| 1);

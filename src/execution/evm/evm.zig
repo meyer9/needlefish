@@ -435,6 +435,33 @@ pub const Evm = struct {
         return evm.start_create(fork, request, parent);
     }
 
+    /// Reports a top-level frame whose value transfer fails before it runs (a deposit whose
+    /// sender cannot pay `value`): revm's first frame starts, so its tracer sees the frame,
+    /// which ends with OutOfFunds and all its gas left. `nonce` names a created address.
+    pub fn trace_unfunded(evm: *Evm, comptime fork: Fork, message: Message, nonce: u64) void {
+        const tracer = evm.tracer orelse return;
+        const is_create = message.kind == .create;
+        tracer.enter(tracer.context, .{
+            .kind = if (is_create) .create else .call,
+            .from = message.caller,
+            .to = if (is_create) create_address(message.caller, nonce) else message.target,
+            .value = message.value,
+            .gas = message.gas_limit,
+            .input = message.input,
+            .depth = 0,
+            .precompile = !is_create and
+                (precompiles.lookup(fork, evm.op_upgrade(), message.target) != null or
+                    native.lookup(evm.op_upgrade(), message.target) != null),
+        });
+        tracer.exit(tracer.context, .{
+            .status = .halt,
+            .exit = .out_of_funds,
+            .gas_remaining = message.gas_limit,
+            .gas_refund = 0,
+            .output = &.{},
+        });
+    }
+
     /// EIP-7702: a top-level call to a delegated EOA runs the delegate's code. The delegate
     /// is loaded and warmed but not stamped as read: Nethermind's prestateTracer looks up
     /// the callee's delegate as it was before the authorizations applied (the collector
